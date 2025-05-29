@@ -11,7 +11,7 @@
     "job_id": "example-job-guid",
     "catalog_path": "/SDNA/cache/ProjectB/JobDevoee/V2/videos/Belvedere_du_Chalet.mp4",
     "link_ip_port": "127.0.0.1:8080",
-    "originial_file_size_limit": 10,
+    "original_file_size_limit": 10,
     "framio_project_id": "",
     "cloud_config_name": "sdna-frameio",
     "jobId": "vdfn-fdgd-fdgdf-sfsf",
