@@ -172,23 +172,23 @@ def update_asset(token, asset_id, properties_file):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("-s", "--source-filename", required=True, help="Source filename to look for")
-    parser.add_argument("-c", "--config-filename", required=True, help="JSON config file path")
+    parser.add_argument("-m", "--mode", required=True, help="mode of Operation proxy or original upload")
+    parser.add_argument("-p","--proxy_directory", help="Proxy location to look for matching proxy file")
+    parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
+    parser.add_argument("-j","--jobId", help="Job Id of SDNA job")
+    parser.add_argument("-cp", "--catalog-path", required=True, help="Path where catalog resides")
+    parser.add_argument("-sp", "--source-path", required=True, help="Source path of file to look for original upload")
+    parser.add_argument("-mp","--metadata-file", help="path where property bag for file resides")
+    parser.add_argument("-up", "--upload-path", required=True, help="Path where file will be uploaded to frameIO")
+    parser.add_argument("-sl","--size-limit", help="source file size limit for original file upload")
+    parser.add_argument("-exts", "--extensions", help="Extensions to look for searching file")
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")
     args = parser.parse_args()
 
     setup_logging(args.log_level)
 
-    # Load file_config.json
-    if not os.path.exists(args.config_filename):
-        logging.error(f"Config file not found: {args.config_filename}")
-        sys.exit(1)
-
-    with open(args.config_filename) as f:
-        file_config = json.load(f)
-
-    mode = file_config.get("mode")
+    mode = args.mode
     if mode not in VALID_MODES:
         logging.error(f"Only allowed modes: {VALID_MODES}")
         sys.exit(1)
@@ -200,19 +200,15 @@ if __name__ == '__main__':
 
     cloud_config = ConfigParser()
     cloud_config.read(cloud_config_path)
-    cloud_config_name = file_config.get("cloud_config_name")
+    cloud_config_name = args.config_name
     if cloud_config_name not in cloud_config:
         logging.error(f"Missing cloud config section: {cloud_config_name}")
         sys.exit(1)
 
     cloud_config_data = cloud_config[cloud_config_name]
     token = cloud_config_data['FrameIODevKey']
-    project_id = file_config.get("frameio_project_id") or cloud_config_data['project_id']
+    project_id = cloud_config_data['project_id']
     print(f"project Id ----------------------->{project_id}")
-
-    if file_config.get("frameio_project_id") and file_config.get("frameio_project_id") != cloud_config_data['project_id']:
-        logging.error(f"Project ID mismatch. Config: {cloud_config_data['project_id']} vs Input: {file_config.get('frameio_project_id')}")
-        sys.exit(1)
 
     client = FrameioClient(token)
 
@@ -221,20 +217,20 @@ if __name__ == '__main__':
 
     if mode == "proxy":
         # -- File match via pattern for proxy
-        search_dir = file_config.get("proxy_directory")
-        source_name = os.path.splitext(args.source_filename)[0]
-        pattern = file_config.get("search_pattern", f"{args.source_filename}*").replace("{orig}", source_name)
-        file_name_for_url = extract_file_name(file_config.get("catalog_path"))
-        matched_file = find_matching_file(search_dir, pattern, file_config.get("extensions"))
+        search_dir = args.proxy_directory
+        # Extract base name without extension for pattern
+        source_basename = os.path.basename(args.source_path)
+        source_name_no_ext = os.path.splitext(source_basename)[0]
+        pattern = f"{source_name_no_ext}*.*"
+        extensions = args.extensions.split(',') if args.extensions else []
+        file_name_for_url = extract_file_name(args.catalog_path)
+        matched_file = find_matching_file(search_dir, pattern, extensions)
 
     elif mode == "original":
         # -- File match via exact file name for original
-        search_dir = file_config.get("source_directory")
-        if not search_dir:
-            logging.error("No Source Directory provided.")
-            sys.exit(4)
-        file_name_for_url = extract_file_name(args.source_filename)
-        matched_file = find_exact_file(search_dir, args.source_filename)
+        matched_file = args.source_path
+        source_filename= matched_file.split("/").pop()
+        file_name_for_url = extract_file_name(source_filename)
 
     if not matched_file:
         logging.error("No matching file found.")
@@ -242,7 +238,7 @@ if __name__ == '__main__':
     
     # Check for size limit for original file upload mode
     matched_file_size = os.stat(matched_file).st_size
-    file_size_limit = file_config.get("original_file_size_limit")
+    file_size_limit = args.size_limit
     if mode == "original" and file_size_limit:
         try:
             size_limit_bytes = float(file_size_limit) * 1024 * 1024
@@ -257,37 +253,31 @@ if __name__ == '__main__':
     catalog_path = remove_file_name_from_path(matched_file)
     catalog_url = urllib.parse.quote(catalog_path)
     filename_enc = urllib.parse.quote(file_name_for_url)
-    jobId = file_config.get("jobId")
-    client_ip, client_port = (
-        file_config.get("link_ip_port", "").split(":")
-        if file_config.get("link_ip_port") else get_link_address_and_port()
-    )
+    jobId = args.jobId
+    client_ip, client_port = get_link_address_and_port()
+    
     url = f"https://{client_ip}:{client_port}/dashboard/projects/{jobId}/browse&search?path={catalog_url}&filename={filename_enc}"
 
     if args.dry_run:
         logging.info("[DRY RUN] Upload skipped.")
         logging.info(f"[DRY RUN] File to upload: {matched_file}")
-        logging.info(f"[DRY RUN] Upload path: {file_config.get('upload_path')} => Frame.io")
-        if file_config.get("upload_properties"):
-            meta_file = file_config.get("metadata_file") or file_config.get("property_file_path")
-            if meta_file:
-                logging.info(f"[DRY RUN] Metadata would be applied from: {meta_file}")
-            else:
-                logging.warning("[DRY RUN] Metadata upload enabled but no metadata file specified.")
+        logging.info(f"[DRY RUN] Upload path: {args.upload_path} => Frame.io")
+        meta_file = args.metadata_file
+        if meta_file:
+            logging.info(f"[DRY RUN] Metadata would be applied from: {meta_file}")
+        else:
+            logging.warning("[DRY RUN] Metadata upload enabled but no metadata file specified.")
         sys.exit(0)
 
     # Find upload folder ID and upload file
-    upload_path = file_config.get("upload_path")
+    upload_path = args.upload_path
     up_id = find_upload_id(upload_path, project_id, token) if '/' in upload_path else upload_path
     asset_id = upload_file(client, matched_file, up_id, url)
     print(f"uploaded Asset ------------------------------------> {asset_id}")
 
-    # Upload associated metadata file (if applicable)
-    if file_config.get("upload_properties"):
-        meta_file = file_config.get("metadata_file") or file_config.get("property_file_path")
-        if not meta_file:
-            logging.error("Metadata file path not provided.")
-            sys.exit(1)
+    # Upload associated metadata file (if provided)
+    meta_file = args.metadata_file
+    if meta_file:
         response = update_asset(token, asset_id, meta_file)
         parsed = response.json()
         print(json.dumps(parsed, indent=4))
