@@ -4,29 +4,26 @@ import subprocess
 import logging
 import time
 import json
+import sys
+import argparse
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
-from flask import Flask, request, jsonify
 
-app = Flask(__name__)
+# Constants
+DEBUG_PRINT = True
+DEBUG_TO_FILE = True
 
 PROVIDER_SCRIPTS = {
     "frameio": "providerScripts/framIO/frameIO_complete.py",
     "tessac": "providerScripts/tessac/tessac_uploader.py"
 }
 
-# Constants
-DEBUG_PRINT = True
-DEBUG_TO_FILE = True
-
 def debug_print(log_path, text_string):
     if not DEBUG_PRINT:
         return
-
     current_datetime = datetime.now()
     formatted_datetime = current_datetime.strftime("%Y-%m-%d %H:%M:%S")
     output = f"{formatted_datetime} {text_string}"
-
     if DEBUG_TO_FILE:
         with open(log_path, "a") as debug_file:
             debug_file.write(f"{output}\n")
@@ -46,30 +43,30 @@ def send_progress(progressDetails, request_id):
 
     avg_bandwidth = 232
     xml_str = f"""<update-job-progress duration=\"{duration}'\" avg_bandwidth=\"{avg_bandwidth}\">
-            <progress jobid=\"{job_id}\" cur_bandwidth=\"0\" stguid=\"{run_guid}\" requestid=\"{request_id}\">
-                <scanning>false</scanning>
-                <scanned>{num_files_scanned}</scanned>
-                <run-status>{status}</run-status>
-                <quick-index>true</quick-index>
-                <is_hyper>false</is_hyper>
-                <session>
-                    <selected-files>{num_files_scanned}</selected-files>
-                    <selected-bytes>{num_bytes_scanned}</selected-bytes>
-                    <deleted-files>0</deleted-files>
-                    <processed-files>{num_files_processed}</processed-files>
-                    <processed-bytes>{num_bytes_processed}</processed-bytes>
-                </session>
-            </progress>
-            <transfers>
-            </transfers>
-            <transferred/>
-            <deleted/>
-        </update-job-progress>"""
+    <progress jobid=\"{job_id}\" cur_bandwidth=\"0\" stguid=\"{run_guid}\" requestid=\"{request_id}\">
+        <scanning>false</scanning>
+        <scanned>{num_files_scanned}</scanned>
+        <run-status>{status}</run-status>
+        <quick-index>true</quick-index>
+        <is_hyper>false</is_hyper>
+        <session>
+            <selected-files>{num_files_scanned}</selected-files>
+            <selected-bytes>{num_bytes_scanned}</selected-bytes>
+            <deleted-files>0</deleted-files>
+            <processed-files>{num_files_processed}</processed-files>
+            <processed-bytes>{num_bytes_processed}</processed-bytes>
+        </session>
+    </progress>
+    <transfers>
+    </transfers>
+    <transferred/>
+    <deleted/>
+</update-job-progress>"""
 
     with open(progress_path, "w") as file:
         file.write(xml_str)
 
-def upload_asset(record, config):
+def upload_asset(record, config, dry_run=False):
     source_path, catalog_path, metadata_path = record
     cmd = [
         "python3", config["script_path"],
@@ -86,11 +83,13 @@ def upload_asset(record, config):
     ]
     if metadata_path:
         cmd.extend(["--metadata-file", metadata_path])
+    if dry_run:
+        cmd.append("--dry-run")
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result
 
-def process_csv_and_upload(config):
+def process_csv_and_upload(config, dry_run=False):
     records = []
     with open(config["files_list"], 'r') as f:
         reader = csv.reader(f, delimiter='|')
@@ -114,7 +113,7 @@ def process_csv_and_upload(config):
     send_progress(progressDetails, config["repo_guid"])
 
     def task(record):
-        result = upload_asset(record, config)
+        result = upload_asset(record, config, dry_run)
         progressDetails["processedFiles"] += 1
         if result.returncode == 0:
             debug_print(config["logging_path"], f"Upload success: {record[0]}")
@@ -128,24 +127,40 @@ def process_csv_and_upload(config):
     progressDetails["status"] = "complete"
     send_progress(progressDetails, config["repo_guid"])
 
-@app.route('/upload', methods=['POST'])
-def handle_upload():
-    try:
-        request_data = request.get_json()
-
-        provider = request_data.get("provider")
-        script_path = PROVIDER_SCRIPTS.get(provider)
-        if not script_path:
-            return jsonify({"status": "error", "message": f"No script path found for provider: {provider}"}), 400
-
-        request_data["script_path"] = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), script_path
-        )
-
-        process_csv_and_upload(request_data)
-        return jsonify({"status": "success", "message": "Upload job started and processed."})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    parser = argparse.ArgumentParser(description="Uploader Script Backup")
+    parser.add_argument("json_path", help="Path to JSON config file")
+    parser.add_argument("--dry-run", action="store_true", help="Run in dry mode without uploading")
+    args = parser.parse_args()
+
+    config_path = args.json_path
+
+    if not os.path.exists(config_path):
+        print(f"Config file not found: {config_path}")
+        sys.exit(1)
+
+    with open(config_path) as f:
+        request_data = json.load(f)
+
+    required_keys = [
+        "provider", "progress_path", "logging_path", "thread_count", 
+        "files_list", "config_file", "cloud_config_name", "jobId",
+        "proxy_directory", "original_file_size_limit", "upload_path",
+        "extensions", "mode", "job_guid", "repo_guid"
+    ]
+    for key in required_keys:
+        if key not in request_data:
+            print(f"Missing required field in config: {key}")
+            sys.exit(1)
+
+    provider = request_data.get("provider")
+    script_path = PROVIDER_SCRIPTS.get(provider)
+    if not script_path:
+        print(f"No script path found for provider: {provider}")
+        sys.exit(1)
+
+    request_data["script_path"] = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), script_path
+    )
+
+    process_csv_and_upload(request_data, args.dry_run)
