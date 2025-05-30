@@ -224,7 +224,7 @@ if __name__ == '__main__':
         search_dir = file_config.get("proxy_directory")
         source_name = os.path.splitext(args.source_filename)[0]
         pattern = file_config.get("search_pattern", f"{args.source_filename}*").replace("{orig}", source_name)
-        file_name_for_url = extract_file_name(args.catalog_path)
+        file_name_for_url = extract_file_name(file_config.get("catalog_path"))
         matched_file = find_matching_file(search_dir, pattern, file_config.get("extensions"))
 
     elif mode == "original":
@@ -243,10 +243,15 @@ if __name__ == '__main__':
     # Check for size limit for original file upload mode
     matched_file_size = os.stat(matched_file).st_size
     file_size_limit = file_config.get("original_file_size_limit")
-    size_limit_bytes = float(file_size_limit) * 1024 * 1024
-    if mode == "original" and matched_file_size > file_size_limit:
-        logging.error(f"File too large: {matched_file_size / (1024 * 1024):.2f} MB > limit of {file_size_limit} MB to be Uploaded as Original")
-        sys.exit(4)
+    if mode == "original" and file_size_limit:
+        try:
+            size_limit_bytes = float(file_size_limit) * 1024 * 1024
+            if matched_file_size > size_limit_bytes:
+                logging.error(f"File too large: {matched_file_size / (1024 * 1024):.2f} MB > limit of {file_size_limit} MB")
+                sys.exit(4)
+        except Exception as e:
+            logging.warning(f"Could not validate size limit: {e}")
+
 
     # Generate description link (StorageDNA URL)
     catalog_path = remove_file_name_from_path(matched_file)
