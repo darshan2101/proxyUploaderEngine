@@ -70,25 +70,35 @@ def send_progress(progressDetails, request_id):
         file.write(xml_str)
 
 def upload_asset(record, config):
-    source_path, catalog_path, metadata_path = record
+    original_source_path, catalog_path, metadata_path = record
+
+    # Extract upload subpath and sanitize source path
+    if "/./" in original_source_path:
+        prefix, sub_path = original_source_path.split("/./", 1)
+        source_path = os.path.join(prefix, sub_path)
+        upload_path = os.path.join(config["upload_path"], sub_path)
+    else:
+        source_path = original_source_path
+        upload_path = config["upload_path"]
+
     cmd = [
         "python3", config["script_path"],
         "--mode", config["mode"],
         "--source-path", source_path,
         "--catalog-path", catalog_path,
         "--config-name", config["cloud_config_name"],
-        "--upload-path", config["upload_path"],
+        "--upload-path", upload_path,
         "--jobId", config["jobId"],
         "--proxy_directory", config["proxy_directory"],
         "--size-limit", str(config["original_file_size_limit"]),
         "--extensions", ','.join(config["extensions"]),
-        "--log-level", "info"
+        "--log-level", "debug"
     ]
     if metadata_path:
         cmd.extend(["--metadata-file", metadata_path])
 
     result = subprocess.run(cmd, capture_output=True, text=True)
-    return result
+    return result, source_path
 
 def process_csv_and_upload(config):
     records = []
@@ -99,13 +109,20 @@ def process_csv_and_upload(config):
                 records.append(tuple(row))
 
     total_files = len(records)
+    total_size = 0
+    for r in records:
+        src = r[0].split("/./")[-1] if "/./" in r[0] else r[0]
+        full_path = os.path.join(r[0].split("/./")[0], src) if "/./" in r[0] else src
+        if os.path.exists(full_path):
+            total_size += os.path.getsize(full_path)
+
     progressDetails = {
-        "run_id": config["job_guid"],
+        "run_id": config["runId"],
         "job_id": config["jobId"],
         "progress_path": config["progress_path"],
         "duration": int(time.time()),
         "totalFiles": total_files,
-        "totalSize": 0,
+        "totalSize": total_size,
         "processedFiles": 0,
         "processedBytes": 0,
         "status": "in-progress"
@@ -114,12 +131,14 @@ def process_csv_and_upload(config):
     send_progress(progressDetails, config["repo_guid"])
 
     def task(record):
-        result = upload_asset(record, config)
+        result, cleaned_path = upload_asset(record, config)
         progressDetails["processedFiles"] += 1
         if result.returncode == 0:
-            debug_print(config["logging_path"], f"Upload success: {record[0]}")
+            file_size = os.path.getsize(cleaned_path) if os.path.exists(cleaned_path) else 0
+            progressDetails["processedBytes"] += file_size
+            debug_print(config["logging_path"], f"Upload success: {cleaned_path} ({file_size} bytes)")
         else:
-            debug_print(config["logging_path"], f"Upload failed: {record[0]}\n{result.stderr}")
+            debug_print(config["logging_path"], f"Upload failed: {cleaned_path}\n{result.stderr}")
         send_progress(progressDetails, config["repo_guid"])
 
     with ThreadPoolExecutor(max_workers=config["thread_count"]) as executor:
