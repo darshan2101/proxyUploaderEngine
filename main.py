@@ -7,15 +7,17 @@ import json
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify
+from pathlib import Path
 
 app = Flask(__name__)
 
+# Mapping provider names to their respective upload scripts
 PROVIDER_SCRIPTS = {
     "frameio": "providerScripts/framIO/frameIO_complete.py",
     "tessac": "providerScripts/tessac/tessac_uploader.py"
 }
 
-# Constants
+# Debug configuration
 DEBUG_PRINT = True
 DEBUG_TO_FILE = True
 
@@ -33,6 +35,7 @@ def debug_print(log_path, text_string):
     else:
         print(output)
 
+# Writes job progress details to an XML file at specified path
 def send_progress(progressDetails, request_id):
     duration = (int(time.time()) - int(progressDetails["duration"])) * 1000
     run_guid = progressDetails["run_id"]
@@ -69,17 +72,57 @@ def send_progress(progressDetails, request_id):
     with open(progress_path, "w") as file:
         file.write(xml_str)
 
+# Locates proxy file by filename pattern and extension inside a directory tree
+def resolve_proxy_file(directory, pattern, extensions):
+    logging.debug(f"Searching for file using pattern in: {directory}")
+    try:
+        base_path = Path(directory)
+        if not base_path.exists():
+            logging.error(f"Directory does not exist: {directory}")
+            return None
+
+        if not base_path.is_dir() or not os.access(directory, os.R_OK):
+            logging.error(f"No read permission for directory: {directory}")
+            return None
+
+        for matched_file in base_path.rglob(pattern):
+            if matched_file.is_file():
+                if extensions and not any(matched_file.name.lower().endswith(ext.lower()) for ext in extensions):
+                    logging.debug(f"File {matched_file.name} does not match extensions")
+                    continue
+                logging.debug(f"Found matching file: {str(matched_file)}")
+                return str(matched_file)
+
+        return None
+    except PermissionError as e:
+        logging.error(f"Permission denied accessing directory: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"Error during file search: {e}")
+        return None
+
+# Launches the provider script with file arguments
 def upload_asset(record, config):
     original_source_path, catalog_path, metadata_path = record
 
-    # Extract upload subpath and sanitize source path
     if "/./" in original_source_path:
         prefix, sub_path = original_source_path.split("/./", 1)
-        source_path = os.path.join(prefix, sub_path)
+        base_source_path = os.path.join(prefix, sub_path)
         upload_path = os.path.join(config["upload_path"], sub_path)
     else:
-        source_path = original_source_path
+        base_source_path = original_source_path
         upload_path = config["upload_path"]
+
+    if config["mode"] == "proxy":
+        base_name = os.path.splitext(os.path.basename(base_source_path))[0]
+        pattern = f"{base_name}*"
+        resolved_path = resolve_proxy_file(config["proxy_directory"], pattern, config["extensions"])
+        if not resolved_path:
+            debug_print(config["logging_path"], f"Proxy not found for: {base_source_path}")
+            return None, base_source_path
+        source_path = resolved_path
+    else:
+        source_path = base_source_path
 
     cmd = [
         "python3", config["script_path"],
@@ -89,9 +132,7 @@ def upload_asset(record, config):
         "--config-name", config["cloud_config_name"],
         "--upload-path", upload_path,
         "--jobId", config["jobId"],
-        "--proxy_directory", config["proxy_directory"],
         "--size-limit", str(config["original_file_size_limit"]),
-        "--extensions", ','.join(config["extensions"]),
         "--log-level", "debug"
     ]
     if metadata_path:
@@ -100,6 +141,7 @@ def upload_asset(record, config):
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result, source_path
 
+# Reads CSV, calculates size, triggers parallel upload
 def process_csv_and_upload(config):
     records = []
     with open(config["files_list"], 'r') as f:
@@ -111,9 +153,18 @@ def process_csv_and_upload(config):
     total_files = len(records)
     total_size = 0
     for r in records:
-        src = r[0].split("/./")[-1] if "/./" in r[0] else r[0]
-        full_path = os.path.join(r[0].split("/./")[0], src) if "/./" in r[0] else src
-        if os.path.exists(full_path):
+        if "/./" in r[0]:
+            src = r[0].split("/./")[-1]
+            full_path = os.path.join(r[0].split("/./")[0], src)
+        else:
+            full_path = r[0]
+        if config["mode"] == "proxy":
+            base_name = os.path.splitext(os.path.basename(full_path))[0]
+            pattern = f"{base_name}*"
+            proxy = resolve_proxy_file(config["proxy_directory"], pattern, config["extensions"])
+            if proxy and os.path.exists(proxy):
+                total_size += os.path.getsize(proxy)
+        elif os.path.exists(full_path):
             total_size += os.path.getsize(full_path)
 
     progressDetails = {
@@ -131,14 +182,14 @@ def process_csv_and_upload(config):
     send_progress(progressDetails, config["repo_guid"])
 
     def task(record):
-        result, cleaned_path = upload_asset(record, config)
+        result, resolved_path = upload_asset(record, config)
         progressDetails["processedFiles"] += 1
-        if result.returncode == 0:
-            file_size = os.path.getsize(cleaned_path) if os.path.exists(cleaned_path) else 0
+        if result and result.returncode == 0:
+            file_size = os.path.getsize(resolved_path) if os.path.exists(resolved_path) else 0
             progressDetails["processedBytes"] += file_size
-            debug_print(config["logging_path"], f"Upload success: {cleaned_path} ({file_size} bytes)")
+            debug_print(config["logging_path"], f"Upload success: {resolved_path} ({file_size} bytes)")
         else:
-            debug_print(config["logging_path"], f"Upload failed: {cleaned_path}\n{result.stderr}")
+            debug_print(config["logging_path"], f"Upload failed: {resolved_path}\n{result.stderr if result else 'No result'})")
         send_progress(progressDetails, config["repo_guid"])
 
     with ThreadPoolExecutor(max_workers=config["thread_count"]) as executor:
@@ -147,6 +198,7 @@ def process_csv_and_upload(config):
     progressDetails["status"] = "complete"
     send_progress(progressDetails, config["repo_guid"])
 
+# API entrypoint for triggering upload from external clients
 @app.route('/upload', methods=['POST'])
 def handle_upload():
     try:
