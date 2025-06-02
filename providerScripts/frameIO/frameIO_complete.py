@@ -29,52 +29,12 @@ def setup_logging(level):
     logging.basicConfig(level=numeric_level, format='%(asctime)s %(levelname)s: %(message)s')
     logging.info(f"Log level set to: {level.upper()}")
 
-# Util: find file by pattern and extension
-def find_matching_file(directory, pattern, extensions):
-    logging.debug(f"Searching for file using pattern in: {directory}")
-    try:
-        base_path = Path(directory)
-        if not base_path.exists():
-            logging.error(f"Directory does not exist: {directory}")
-            return None
-        
-        if not base_path.is_dir() or not os.access(directory, os.R_OK):
-            logging.error(f"No read permission for directory: {directory}")
-            return None
-
-        for matched_file in base_path.rglob(pattern):
-            if matched_file.is_file():
-                if extensions and not any(matched_file.name.lower().endswith(ext.lower()) for ext in extensions):
-                    logging.debug(f"File {matched_file.name} does not match extensions")
-                    continue
-                logging.debug(f"Found matching file: {str(matched_file)}")
-                return str(matched_file)
-
-        return None
-    except PermissionError as e:
-        logging.error(f"Permission denied accessing directory: {e}")
-        return None
-    except Exception as e:
-        logging.error(f"Error during file search: {e}")
-        return None
-
-# Util: find exact file name recursively
-def find_exact_file(directory, target_name):
-    logging.debug(f"Searching for exact match: {target_name} in {directory}")
-    for root, _, files in os.walk(directory):
-        if target_name in files:
-            return os.path.join(root, target_name)
-    return None
-
-# Util: extract base file name
 def extract_file_name(path):
     return os.path.basename(path)
 
-# Util: remove file name to get directory path
 def remove_file_name_from_path(path):
     return os.path.dirname(path)
 
-# Reads platform-specific DNA client config and returns cloud config path
 def get_cloud_config_path():
     if IS_LINUX:
         parser = ConfigParser()
@@ -84,7 +44,6 @@ def get_cloud_config_path():
         with open(DNA_CLIENT_SERVICES, 'rb') as fp:
             return plistlib.load(fp)["CloudConfigFolder"] + "/cloud_targets.conf"
 
-# Reads IP and port from DNA Server config
 def get_link_address_and_port():
     ip, port = "", ""
     try:
@@ -111,7 +70,6 @@ def get_link_address_and_port():
 
     return ip, port
 
-# Creates folder structure in Frame.io project and returns upload folder ID
 def find_upload_id(path, project_id, token):
     client = FrameioClient(token)
     current_id = client.projects.get(project_id)['root_asset_id']
@@ -123,7 +81,6 @@ def find_upload_id(path, project_id, token):
         current_id = next_id
     return current_id
 
-# Uploads file to Frame.io folder
 def upload_file(client, source_path, up_id, description):
     asset = client.assets.create(
         parent_asset_id=up_id,
@@ -132,13 +89,10 @@ def upload_file(client, source_path, up_id, description):
         description=description,
         filesize=os.stat(source_path).st_size
     )
-    # parsed = response.json()
-    # print(json.dumps(parsed, indent=4))
     with open(source_path, 'rb') as f:
         client.assets._upload(asset, f)
     return asset['id']
 
-# Updates asset metadata using key,value pairs from file
 def update_asset(token, asset_id, properties_file):
     if not os.path.exists(properties_file):
         logging.error(f"Properties file not found: {properties_file}")
@@ -161,7 +115,6 @@ def update_asset(token, asset_id, properties_file):
         logging.error(f"Failed to parse metadata file: {e}")
         sys.exit(1)
 
-
     headers = {
         'Content-Type': 'application/json',
         'Authorization': f'Bearer {token}'
@@ -173,15 +126,13 @@ def update_asset(token, asset_id, properties_file):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--mode", required=True, help="mode of Operation proxy or original upload")
-    parser.add_argument("-p","--proxy_directory", help="Proxy location to look for matching proxy file")
     parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
-    parser.add_argument("-j","--jobId", help="Job Id of SDNA job")
+    parser.add_argument("-j", "--jobId", help="Job Id of SDNA job")
     parser.add_argument("-cp", "--catalog-path", required=True, help="Path where catalog resides")
     parser.add_argument("-sp", "--source-path", required=True, help="Source path of file to look for original upload")
-    parser.add_argument("-mp","--metadata-file", help="path where property bag for file resides")
+    parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
     parser.add_argument("-up", "--upload-path", required=True, help="Path where file will be uploaded to frameIO")
-    parser.add_argument("-sl","--size-limit", help="source file size limit for original file upload")
-    parser.add_argument("-exts", "--extensions", help="Extensions to look for searching file")
+    parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")
     args = parser.parse_args()
@@ -212,31 +163,14 @@ if __name__ == '__main__':
 
     client = FrameioClient(token)
 
-    matched_file = None
-    file_name_for_url = ""
+    matched_file = args.source_path
+    catalog_path = args.catalog_path
+    file_name_for_url = extract_file_name(matched_file) if mode == "original" else extract_file_name(catalog_path)
 
-    if mode == "proxy":
-        # -- File match via pattern for proxy
-        search_dir = args.proxy_directory
-        # Extract base name without extension for pattern
-        source_basename = os.path.basename(args.source_path)
-        source_name_no_ext = os.path.splitext(source_basename)[0]
-        pattern = f"{source_name_no_ext}*.*"
-        extensions = args.extensions.split(',') if args.extensions else []
-        file_name_for_url = extract_file_name(args.catalog_path)
-        matched_file = find_matching_file(search_dir, pattern, extensions)
-
-    elif mode == "original":
-        # -- File match via exact file name for original
-        matched_file = args.source_path
-        source_filename= matched_file.split("/").pop()
-        file_name_for_url = extract_file_name(source_filename)
-
-    if not matched_file:
-        logging.error("No matching file found.")
+    if not os.path.exists(matched_file):
+        logging.error(f"File not found: {matched_file}")
         sys.exit(4)
-    
-    # Check for size limit for original file upload mode
+
     matched_file_size = os.stat(matched_file).st_size
     file_size_limit = args.size_limit
     if mode == "original" and file_size_limit:
@@ -248,14 +182,12 @@ if __name__ == '__main__':
         except Exception as e:
             logging.warning(f"Could not validate size limit: {e}")
 
-
-    # Generate description link (StorageDNA URL)
     catalog_path = remove_file_name_from_path(matched_file)
     catalog_url = urllib.parse.quote(catalog_path)
     filename_enc = urllib.parse.quote(file_name_for_url)
     jobId = args.jobId
     client_ip, client_port = get_link_address_and_port()
-    
+
     url = f"https://{client_ip}:{client_port}/dashboard/projects/{jobId}/browse&search?path={catalog_url}&filename={filename_enc}"
 
     if args.dry_run:
@@ -269,13 +201,11 @@ if __name__ == '__main__':
             logging.warning("[DRY RUN] Metadata upload enabled but no metadata file specified.")
         sys.exit(0)
 
-    # Find upload folder ID and upload file
     upload_path = args.upload_path
     up_id = find_upload_id(upload_path, project_id, token) if '/' in upload_path else upload_path
     asset_id = upload_file(client, matched_file, up_id, url)
     print(f"uploaded Asset ------------------------------------> {asset_id}")
 
-    # Upload associated metadata file (if provided)
     meta_file = args.metadata_file
     if meta_file:
         response = update_asset(token, asset_id, meta_file)
