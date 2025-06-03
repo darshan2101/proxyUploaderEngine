@@ -13,7 +13,7 @@ app = Flask(__name__)
 
 # Mapping provider names to their respective upload scripts
 PROVIDER_SCRIPTS = {
-    "frameio": "providerScripts/framIO/frameIO_complete.py",
+    "frameio": "providerScripts/frameIO/frameIO_complete.py",
     "tessac": "providerScripts/tessac/tessac_uploader.py"
 }
 

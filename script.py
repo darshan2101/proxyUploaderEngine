@@ -16,7 +16,7 @@ DEBUG_TO_FILE = True
 
 # Mapping provider names to their respective upload scripts
 PROVIDER_SCRIPTS = {
-    "frameio": "providerScripts/framIO/frameIO_complete.py",
+    "frameio": "providerScripts/frameIO/frameIO_complete.py",
     "tessac": "providerScripts/tessac/tessac_uploader.py"
 }
 
@@ -68,6 +68,7 @@ def send_progress(progressDetails, request_id):
     <deleted/>
 </update-job-progress>"""
 
+    os.makedirs(os.path.dirname(progress_path), exist_ok=True)
     with open(progress_path, "w") as file:
         file.write(xml_str)
 
@@ -168,8 +169,15 @@ def process_csv_and_upload(config, dry_run=False):
         elif os.path.exists(full_path):
             total_size += os.path.getsize(full_path)
 
+    job_time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    config["logging_path"] = os.path.join(config["logging_path"], f"{job_time_str}_{config['mode']}_log.txt")
+    config["progress_path"] = os.path.join(config["progress_path"], f"{job_time_str}_{config['mode']}_progress.xml")
+
+    os.makedirs(os.path.dirname(config["logging_path"]), exist_ok=True)
+    os.makedirs(os.path.dirname(config["progress_path"]), exist_ok=True)
+
     progressDetails = {
-        "run_id": config["job_guid"],
+        "run_id": config["runId"],
         "job_id": config["jobId"],
         "progress_path": config["progress_path"],
         "duration": int(time.time()),
@@ -201,7 +209,7 @@ def process_csv_and_upload(config, dry_run=False):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Uploader Script Backup")
-    parser.add_argument("json_path", help="Path to JSON config file")
+    parser.add_argument("-c","--json-path", help="Path to JSON config file")
     parser.add_argument("--dry-run", action="store_true", help="Run in dry mode without uploading")
     args = parser.parse_args()
 
@@ -216,9 +224,9 @@ if __name__ == '__main__':
 
     required_keys = [
         "provider", "progress_path", "logging_path", "thread_count",
-        "files_list", "config_file", "cloud_config_name", "jobId",
+        "files_list", "cloud_config_name", "jobId",
         "proxy_directory", "original_file_size_limit", "upload_path",
-        "extensions", "mode", "job_guid", "repo_guid"
+        "extensions", "mode", "runId", "repo_guid"
     ]
     for key in required_keys:
         if key not in request_data:
