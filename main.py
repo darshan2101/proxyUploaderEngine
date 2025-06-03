@@ -206,6 +206,7 @@ def process_csv_and_upload(config):
     progressDetails["status"] = "complete"
     send_progress(progressDetails, config["repo_guid"])
 
+# API entrypoint for triggering upload from external clients
 @app.route('/upload', methods=['POST'])
 def handle_upload():
     try:
