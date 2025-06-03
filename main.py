@@ -49,26 +49,27 @@ def send_progress(progressDetails, request_id):
 
     avg_bandwidth = 232
     xml_str = f"""<update-job-progress duration=\"{duration}'\" avg_bandwidth=\"{avg_bandwidth}\">
-            <progress jobid=\"{job_id}\" cur_bandwidth=\"0\" stguid=\"{run_guid}\" requestid=\"{request_id}\">
-                <scanning>false</scanning>
-                <scanned>{num_files_scanned}</scanned>
-                <run-status>{status}</run-status>
-                <quick-index>true</quick-index>
-                <is_hyper>false</is_hyper>
-                <session>
-                    <selected-files>{num_files_scanned}</selected-files>
-                    <selected-bytes>{num_bytes_scanned}</selected-bytes>
-                    <deleted-files>0</deleted-files>
-                    <processed-files>{num_files_processed}</processed-files>
-                    <processed-bytes>{num_bytes_processed}</processed-bytes>
-                </session>
-            </progress>
-            <transfers>
-            </transfers>
-            <transferred/>
-            <deleted/>
-        </update-job-progress>"""
+        <progress jobid=\"{job_id}\" cur_bandwidth=\"0\" stguid=\"{run_guid}\" requestid=\"{request_id}\">
+            <scanning>false</scanning>
+            <scanned>{num_files_scanned}</scanned>
+            <run-status>{status}</run-status>
+            <quick-index>true</quick-index>
+            <is_hyper>false</is_hyper>
+            <session>
+                <selected-files>{num_files_scanned}</selected-files>
+                <selected-bytes>{num_bytes_scanned}</selected-bytes>
+                <deleted-files>0</deleted-files>
+                <processed-files>{num_files_processed}</processed-files>
+                <processed-bytes>{num_bytes_processed}</processed-bytes>
+            </session>
+        </progress>
+        <transfers>
+        </transfers>
+        <transferred/>
+        <deleted/>
+    </update-job-progress>"""
 
+    os.makedirs(os.path.dirname(progress_path), exist_ok=True)
     with open(progress_path, "w") as file:
         file.write(xml_str)
 
@@ -167,6 +168,13 @@ def process_csv_and_upload(config):
         elif os.path.exists(full_path):
             total_size += os.path.getsize(full_path)
 
+    job_time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    config["logging_path"] = os.path.join(config["logging_path"], f"{job_time_str}_{config['mode']}_log.txt")
+    config["progress_path"] = os.path.join(config["progress_path"], f"{job_time_str}_{config['mode']}_progress.xml")
+
+    os.makedirs(os.path.dirname(config["logging_path"]), exist_ok=True)
+    os.makedirs(os.path.dirname(config["progress_path"]), exist_ok=True)
+
     progressDetails = {
         "run_id": config["runId"],
         "job_id": config["jobId"],
@@ -198,7 +206,6 @@ def process_csv_and_upload(config):
     progressDetails["status"] = "complete"
     send_progress(progressDetails, config["repo_guid"])
 
-# API entrypoint for triggering upload from external clients
 @app.route('/upload', methods=['POST'])
 def handle_upload():
     try:

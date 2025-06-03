@@ -133,7 +133,7 @@ def upload_asset(record, config, dry_run=False):
         "--upload-path", upload_path,
         "--jobId", config["jobId"],
         "--size-limit", str(config["original_file_size_limit"]),
-        "--log-level", "debug"
+        "--log-level", "error"
     ]
     if metadata_path:
         cmd.extend(["--metadata-file", metadata_path])
