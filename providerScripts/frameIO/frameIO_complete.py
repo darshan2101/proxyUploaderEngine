@@ -36,19 +36,24 @@ def remove_file_name_from_path(path):
     return os.path.dirname(path)
 
 def get_cloud_config_path():
+    logging.debug("Determining cloud config path based on platform")
     if IS_LINUX:
         parser = ConfigParser()
         parser.read(DNA_CLIENT_SERVICES)
-        return parser.get('General', 'cloudconfigfolder', fallback='') + "/cloud_targets.conf"
+        path = parser.get('General', 'cloudconfigfolder', fallback='') + "/cloud_targets.conf"
     else:
         with open(DNA_CLIENT_SERVICES, 'rb') as fp:
-            return plistlib.load(fp)["CloudConfigFolder"] + "/cloud_targets.conf"
+            path = plistlib.load(fp)["CloudConfigFolder"] + "/cloud_targets.conf"
+    logging.info(f"Using cloud config path: {path}")
+    return path
 
 def get_link_address_and_port():
+    logging.debug(f"Reading server configuration from: {SERVERS_CONF_PATH}")
     ip, port = "", ""
     try:
         with open(SERVERS_CONF_PATH) as f:
             lines = f.readlines()
+            logging.debug(f"Successfully read {len(lines)} lines from config")
 
         if IS_LINUX:
             for line in lines:
@@ -68,42 +73,61 @@ def get_link_address_and_port():
         logging.error(f"Error reading {SERVERS_CONF_PATH}: {e}")
         sys.exit(5)
 
+    logging.info(f"Server connection details - Address: {ip}, Port: {port}")
     return ip, port
 
 def find_upload_id(path, project_id, token):
+    logging.info(f"Finding upload location for path: {path}")
     client = FrameioClient(token)
     current_id = client.projects.get(project_id)['root_asset_id']
+    logging.debug(f"Starting from root asset ID: {current_id}")
+
     for segment in path.strip('/').split('/'):
+        logging.debug(f"Processing path segment: {segment}")
         children = client.assets.get_children(current_id, type='folder')
         next_id = next((child['id'] for child in children if child['name'] == segment), None)
         if not next_id:
+            logging.info(f"Creating new folder: {segment}")
             next_id = client.assets.create(parent_asset_id=current_id, name=segment, type="folder", filesize=0)['id']
         current_id = next_id
+        logging.debug(f"Current folder ID: {current_id}")
     return current_id
 
 def upload_file(client, source_path, up_id, description):
+    file_size = os.stat(source_path).st_size
+    logging.info(f"Starting upload for file: {source_path} ({file_size/1024/1024:.2f} MB)")
+    
+    logging.debug("Creating asset in Frame.io")
     asset = client.assets.create(
         parent_asset_id=up_id,
         name=extract_file_name(source_path),
         type="file",
         description=description,
-        filesize=os.stat(source_path).st_size
+        filesize=file_size
     )
+    logging.debug(f"Asset created with ID: {asset['id']}")
+
+    logging.info("Uploading file content...")
     with open(source_path, 'rb') as f:
         client.assets._upload(asset, f)
+    logging.info("File upload completed successfully")
     return asset['id']
 
 def update_asset(token, asset_id, properties_file):
+    logging.info(f"Updating asset {asset_id} with properties from {properties_file}")
+    
     if not os.path.exists(properties_file):
         logging.error(f"Properties file not found: {properties_file}")
         sys.exit(1)
 
     props = {}
+    logging.debug(f"Reading properties from: {properties_file}")
 
     try:
         if properties_file.endswith(".json"):
             with open(properties_file, 'r') as f:
                 props = json.load(f)
+                logging.debug(f"Loaded JSON properties: {props}")
         else:
             with open(properties_file, 'r') as f:
                 for line in f:
@@ -111,6 +135,7 @@ def update_asset(token, asset_id, properties_file):
                     if len(parts) == 2:
                         key, value = parts[0].strip(), parts[1].strip()
                         props[key] = value
+                logging.debug(f"Loaded CSV properties: {props}")
     except Exception as e:
         logging.error(f"Failed to parse metadata file: {e}")
         sys.exit(1)
@@ -119,8 +144,9 @@ def update_asset(token, asset_id, properties_file):
         'Content-Type': 'application/json',
         'Authorization': f'Bearer {token}'
     }
-
+    logging.debug("Sending asset update request to Frame.io API")
     response = request('PUT', f'https://api.frame.io/v2/assets/{asset_id}', headers=headers, data=dumps({'properties': props}))
+    logging.info(f"Asset update completed with status code: {response.status_code}")
     return response
 
 if __name__ == '__main__':
@@ -161,6 +187,12 @@ if __name__ == '__main__':
     project_id = cloud_config_data['project_id']
     print(f"project Id ----------------------->{project_id}")
 
+    logging.info(f"Starting Frame.io upload process in {mode} mode")
+    logging.debug(f"Using cloud config: {cloud_config_path}")
+    logging.debug(f"Source path: {args.source_path}")
+    logging.debug(f"Upload path: {args.upload_path}")
+    
+    logging.info(f"Initializing Frame.io client for project: {project_id}")
     client = FrameioClient(token)
 
     matched_file = args.source_path
@@ -189,6 +221,7 @@ if __name__ == '__main__':
     client_ip, client_port = get_link_address_and_port()
 
     url = f"https://{client_ip}:{client_port}/dashboard/projects/{jobId}/browse&search?path={catalog_url}&filename={filename_enc}"
+    logging.debug(f"Generated dashboard URL: {url}")
 
     if args.dry_run:
         logging.info("[DRY RUN] Upload skipped.")
@@ -201,13 +234,17 @@ if __name__ == '__main__':
             logging.warning("[DRY RUN] Metadata upload enabled but no metadata file specified.")
         sys.exit(0)
 
+    logging.info(f"Starting upload process to Frame.io")
     upload_path = args.upload_path
     up_id = find_upload_id(upload_path, project_id, token) if '/' in upload_path else upload_path
+    logging.info(f"Upload location ID: {up_id}")
+    
     asset_id = upload_file(client, matched_file, up_id, url)
-    print(f"uploaded Asset ------------------------------------> {asset_id}")
+    logging.info(f"File uploaded successfully. Asset ID: {asset_id}")
 
     meta_file = args.metadata_file
     if meta_file:
+        logging.info("Applying metadata to uploaded asset...")
         response = update_asset(token, asset_id, meta_file)
         parsed = response.json()
         print(json.dumps(parsed, indent=4))
