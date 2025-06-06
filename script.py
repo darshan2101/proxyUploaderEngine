@@ -17,22 +17,18 @@ DEBUG_TO_FILE = True
 # Mapping provider names to their respective upload scripts
 PROVIDER_SCRIPTS = {
     "frameio": "providerScripts/frameIO/frameIO_complete.py",
-    "tessac": "providerScripts/tessac/tessac_uploader.py"
+    "tessact": "providerScripts/tessact/tessact_uploader.py"
 }
 
 def debug_print(log_path, text_string):
-    if not DEBUG_PRINT:
-        return
-
     current_datetime = datetime.now()
     formatted_datetime = current_datetime.strftime("%Y-%m-%d %H:%M:%S")
     output = f"{formatted_datetime} {text_string}"
+    logging.info(output)
 
-    if DEBUG_TO_FILE:
+    if DEBUG_PRINT and DEBUG_TO_FILE:
         with open(log_path, "a") as debug_file:
             debug_file.write(f"{output}\n")
-    else:
-        print(output)
 
 # Writes job progress details to an XML file at specified path
 def send_progress(progressDetails, request_id):
@@ -139,11 +135,16 @@ def upload_asset(record, config, dry_run=False):
         cmd.extend(["--metadata-file", metadata_path])
     if dry_run:
         cmd.append("--dry-run")
-
+    print(f" Command block copy ---------------------> {cmd}")
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result, source_path
 
-# Reads CSV, calculates size, triggers parallel upload
+def write_csv_row(file_path, row):
+    with open(file_path, mode="a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(row)
+
+# Reads input CSV fileList, calculates size, triggers parallel upload
 def process_csv_and_upload(config, dry_run=False):
     records = []
     with open(config["files_list"], 'r') as f:
@@ -173,6 +174,18 @@ def process_csv_and_upload(config, dry_run=False):
     config["logging_path"] = os.path.join(config["logging_path"], f"{job_time_str}_{config['mode']}_log.txt")
     config["progress_path"] = os.path.join(config["progress_path"], f"{job_time_str}_{config['mode']}_progress.xml")
 
+    log_prefix = config.get("log_prefix")
+    if log_prefix:
+        os.makedirs(os.path.dirname(log_prefix), exist_ok=True)
+        transferred_log = f"{log_prefix}-uploader-transferred.csv"
+        issues_log = f"{log_prefix}-uploader-issues.csv"
+        client_log = f"{log_prefix}-uploader-client.csv"
+        for log in [transferred_log, issues_log, client_log]:
+            with open(log, "w", newline="") as f:
+                csv.writer(f).writerow(["Status","Filename", "Size", "Detail"] if "issues" not in log else ["Status", "Filename","Timestamp", "Issue"])
+    else:
+        transferred_log = issues_log = client_log = None
+
     os.makedirs(os.path.dirname(config["logging_path"]), exist_ok=True)
     os.makedirs(os.path.dirname(config["progress_path"]), exist_ok=True)
 
@@ -197,8 +210,18 @@ def process_csv_and_upload(config, dry_run=False):
             file_size = os.path.getsize(resolved_path) if os.path.exists(resolved_path) else 0
             progressDetails["processedBytes"] += file_size
             debug_print(config["logging_path"], f"Upload success: {resolved_path} ({file_size} bytes)")
+            if transferred_log:
+                write_csv_row(transferred_log, ["Success" ,resolved_path, file_size, ""])
+            if client_log:
+                write_csv_row(client_log, ["Success", resolved_path, file_size, "Client"])
         else:
-            debug_print(config["logging_path"], f"Upload failed: {resolved_path}\n{result.stderr if result else 'No result'})")
+            debug_print(config["logging_path"], f"Upload failed: {resolved_path}\n{result.stderr if result else 'No result'}")
+            if issues_log:
+                stderr_cleaned = result.stderr.replace("\n", " ").replace("\r", " ").strip() if result and result.stderr else "No result"
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                write_csv_row(issues_log, ["Error", resolved_path, timestamp, stderr_cleaned])
+            else:
+                write_csv_row(issues_log, ["Error", resolved_path, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "No result"])
         send_progress(progressDetails, config["repo_guid"])
 
     with ThreadPoolExecutor(max_workers=config["thread_count"]) as executor:
@@ -211,6 +234,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Uploader Script Backup")
     parser.add_argument("-c","--json-path", help="Path to JSON config file")
     parser.add_argument("--dry-run", action="store_true", help="Run in dry mode without uploading")
+    parser.add_argument("--log-prefix", help="Prefix path for transfer/client/issues CSV logs")
     args = parser.parse_args()
 
     config_path = args.json_path
@@ -232,6 +256,9 @@ if __name__ == '__main__':
         if key not in request_data:
             print(f"Missing required field in config: {key}")
             sys.exit(1)
+
+    if args.log_prefix:
+        request_data["log_prefix"] = args.log_prefix
 
     provider = request_data.get("provider")
     script_path = PROVIDER_SCRIPTS.get(provider)

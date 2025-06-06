@@ -1,0 +1,20 @@
+{
+    "mode": "original",
+    "provider": "tessact",
+    "proxy_directory": "/SDNA/PROXIES",
+    "logging_path": "logs/proxyUploaderEngine/tessact",
+    "progress_path": "logs/proxyUploaderEngine/tessact/progresses",
+    "thread_count": 2,
+    "extensions": [
+        ".mov",
+        ".mp4"
+    ],
+    "original_file_size_limit": 10,
+    "upload_path": "PROXIES/7539-5185-2456",
+    "cloud_config_name": "sdna-tessact",
+    "jobId": "vdfn-fdgd-fdgdf-sfsf",
+    "upload_properties": true,
+    "files_list": "/mnt/SDNA/jobs/file_list.csv",
+    "runId": "run-1234",
+    "repo_guid": "repo-5678"
+}
