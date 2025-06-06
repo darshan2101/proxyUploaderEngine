@@ -225,7 +225,7 @@ def finalize_upload(base_url, token, payload):
     response = requests.post(url, headers=headers, data=json.dumps(payload))
     logging.info("Finalize upload response: %s", response.text)
 
-def upload_metadata_to_asset(base_url, token, asset_id, properties_file):
+def upload_metadata_to_asset(base_url, token, backlink_url, asset_id, properties_file):
     logging.info(f"Updating asset {asset_id} with properties from {properties_file}")
     
     if not os.path.exists(properties_file):
@@ -257,7 +257,13 @@ def upload_metadata_to_asset(base_url, token, asset_id, properties_file):
         'Authorization': f'Bearer {token}'
     }
     logging.debug("Sending asset update request to Tessact API")
-    metadata = []
+    metadata = [
+        {
+            "field_name": "fabric URL",
+            "field_type": "text",
+            "value": backlink_url
+        }
+    ]
     for k, v in props.items():
         metadata.append(
             {
@@ -354,8 +360,8 @@ if __name__ == '__main__':
     jobId = args.jobId
     client_ip, client_port = get_link_address_and_port()
 
-    url = f"https://{client_ip}:{client_port}/dashboard/projects/{jobId}/browse&search?path={catalog_url}&filename={filename_enc}"
-    logging.debug(f"Generated dashboard URL: {url}")
+    backlink_url = f"https://{client_ip}:{client_port}/dashboard/projects/{jobId}/browse&search?path={catalog_url}&filename={filename_enc}"
+    logging.debug(f"Generated dashboard URL: {backlink_url}")
 
     if args.dry_run:
         logging.info("[DRY RUN] Upload skipped.")
@@ -399,7 +405,7 @@ if __name__ == '__main__':
     meta_file = args.metadata_file
     if meta_file:
         logging.info("Applying metadata to uploaded asset...")
-        response = upload_metadata_to_asset(cloud_config_data['base_url'] ,token, file_id, meta_file)
+        response = upload_metadata_to_asset(cloud_config_data['base_url'] ,token, backlink_url, file_id, meta_file)
         if response is not None:
             parsed = response
             print(json.dumps(parsed, indent=4))
