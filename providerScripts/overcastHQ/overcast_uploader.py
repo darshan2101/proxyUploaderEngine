@@ -78,9 +78,88 @@ def get_link_address_and_port():
         sys.exit(5)
 
     logging.info(f"Server connection details - Address: {ip}, Port: {port}")
-    return ip, port   
+    return ip, port 
+  
+def create_folder(config_data, name, project_id, parent_id=None):
+    logging.info(f"Creating folder: {name}, project: {project_id}, parent: {parent_id}")
+    url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/folders"
+
+    headers = {
+        'x-api-key': config_data["api_key"]
+    }
+
+    payload = {
+        "name": name,
+        "project": project_id,
+    }
+    if parent_id is not None:
+        payload["parent"] = parent_id
+    print(f"data payload (form-data) -------------------------> {payload}")
+    response = requests.post(url, headers=headers, data=payload)
+    logging.info(f"Response for folder creation: {response.text}")
+
+    if response.status_code in (200, 201):
+        resp_json = response.json()
+        uuid = resp_json.get("uuid") or resp_json.get("result", {}).get("uuid")
+        if uuid:
+            return uuid
+        else:
+            logging.error("UUID not found in folder creation response")
+            raise RuntimeError("UUID not found in folder creation response")
+    else:
+        logging.error(f"Failed to create Folder: {response.status_code} {response.text}")
+        raise RuntimeError(f"Failed to create Folder: {response.status_code} {response.text}")
+
+def list_all_folders(config_data, project_id, parent_id):
+    print(f"parameter to get folder tree =================> {parent_id}")
+    headers = { 'x-api-key': config_data["api_key"]}
+    url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/folders"
+    all_folders = []
+
+    params = {
+        "project": project_id
+    }
+    if parent_id is not None:
+        params["parent"] = parent_id
+    logging.debug(f"Fetching folders from: {url}")
+    response = requests.get( url, headers=headers, params=params)
+    # 
+    if response.status_code in (200, 201):
+        logging.info("File Tree Successfully")
+        data = response.json().get("result", {})
+    else:
+        logging.error("Failed to get File Tree")
+
+    all_folders.extend(data['items'])
+    return all_folders
+
+def get_folder_id(config_data, upload_path):
+    project_id = config_data['project_id']
+    current_parent_id = None
+
+    # Remove the filename from the upload_path
+    folder_path = os.path.dirname(upload_path)
+    logging.info(f"Finding or creating folder path: '{folder_path}'")
+
+    for segment in folder_path.strip("/").split("/"):
+        if not segment:
+            continue
+        logging.debug(f"Looking for folder '{segment}' under parent '{current_parent_id}'")
+
+        folders = list_all_folders(config_data, project_id, current_parent_id)
+        matched = next((f for f in folders if f.get("name") == segment), None)
+
+        if matched:
+            current_parent_id = matched["uuid"]
+            logging.debug(f"Found existing folder '{segment}' (ID: {current_parent_id})")
+        else:
+            current_parent_id = create_folder(config_data, segment, project_id, current_parent_id)
+            logging.debug(f"Created folder '{segment}' (ID: {current_parent_id})")
+    print(f"UUID  after tree traversal/creation ---------------> {current_parent_id}")
+    return current_parent_id
 
 def create_asset(config_data, project_id, folder_id, file_path):
+    print(f"Folder ID check 2-------------------------> {folder_id}")
     url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/assets"
 
     headers = {
@@ -297,26 +376,25 @@ def upload_metadata_to_asset(hostname, api_key, backlink_url, asset_id, properti
         sys.exit(1)
 
     headers = {
-        'Content-Type': 'application/json',
         'x-api-key': api_key
     }
-    logging.debug("Sending asset update request to Overcast API")
+    logging.debug("Sending asset update request to Overcast API (form-data)")
 
     url = f"https://api-{hostname}.overcasthq.com/v1/assets/{asset_id}/metadata"
-    for key,value in metadata.items():
-        payload = { 
-             "key" : key,
-            "value" : value
+    for key, value in metadata.items():
+        payload = {
+            "key": key,
+            "value": value
         }
-        response = requests.post(url, headers=headers, data=json.dumps(payload))
+        response = requests.post(url, headers=headers, data=payload)
         if response.status_code in (200, 201):
-            response = response.json()
-            logging.info(f"added data successfully  {response}")
+            response_json = response.json()
+            logging.info(f"Added data successfully: {response_json}")
         else:
             print(f"Response error. Status - {response.status_code}, Error - {response.text}")
-            logging.error("Failed to upload Metadata file: %s",response.text)
-        
-    logging.info(f"Asset metadata insertion completed")
+            logging.error("Failed to upload Metadata file: %s", response.text)
+
+    logging.info("Asset metadata insertion completed")
 
 
 
@@ -326,8 +404,6 @@ if __name__ == '__main__':
     parser.add_argument("-m", "--mode", required=True, help="mode of Operation proxy or original upload")
     parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
     parser.add_argument("-j", "--jobId", help="Job Id of SDNA job")
-    parser.add_argument("-p", "--project-id", required=True, help="Project Id")
-    parser.add_argument("-f", "--folder-id", required=True, help="Folder id")
     parser.add_argument("-cp", "--catalog-path", required=True, help="Path where catalog resides")
     parser.add_argument("-sp", "--source-path", required=True, help="Source path of file to look for original upload")
     parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
@@ -358,15 +434,15 @@ if __name__ == '__main__':
 
     cloud_config_data = cloud_config[cloud_config_name]
 
-    project_id = args.project_id
+    project_id = cloud_config_data['project_id']
     print(f"Project id ----------------------->{project_id}")
 
-    logging.info(f"Starting Tessact upload process in {mode} mode")
+    logging.info(f"Starting OvercastHQ upload process in {mode} mode")
     logging.debug(f"Using cloud config: {cloud_config_path}")
     logging.debug(f"Source path: {args.source_path}")
     logging.debug(f"Upload path: {args.upload_path}")
     
-    logging.info(f"Initializing Tessact client for workspace: {project_id}")
+    logging.info(f"Initialized OvercastHQ client for project: {project_id}")
     
     matched_file = args.source_path
     catalog_path = args.catalog_path
@@ -410,7 +486,8 @@ if __name__ == '__main__':
     logging.info(f"Starting upload process to Frame.io")
     upload_path = args.upload_path
 
-    folder_id = args.folder_id
+    folder_id = get_folder_id(cloud_config_data, upload_path)
+    print(f"Folder ID check -------------------------> {folder_id}")
 
     asset = create_asset(cloud_config_data, project_id, folder_id, args.source_path)
     asset_id = asset['result']['uuid']
@@ -423,14 +500,6 @@ if __name__ == '__main__':
     if meta_file:
         logging.info("Applying metadata to uploaded asset...")
 
-        response = upload_metadata_to_asset(cloud_config_data['hostname'] ,cloud_config_data['api_key'], backlink_url, asset_id, meta_file)
-        if response is not None:
-            parsed = response
-            print(json.dumps(parsed, indent=4))
-        else:
-            logging.error("Failed to upload metadata or no response received.")
-
+        upload_metadata_to_asset(cloud_config_data['hostname'] ,cloud_config_data['api_key'], backlink_url, asset_id, meta_file)
+        
     sys.exit(0)
-    
-
-    
