@@ -1,9 +1,9 @@
 {
     "mode": "original",
-    "provider": "frameio",
+    "provider": "overcasthq",
     "proxy_directory": "/SDNA/PROXIES",
-    "logging_path": "logs/proxyUploaderEngine",
-    "progress_path": "logs/proxyUploaderEngine/progresses",
+    "logging_path": "logs/proxyUploaderEngine/overcastHQ",
+    "progress_path": "logs/proxyUploaderEngine/overcastHQ/progresses",
     "thread_count": 2,
     "extensions": [
         ".mov",
@@ -11,10 +11,12 @@
     ],
     "original_file_size_limit": 10,
     "upload_path": "PROXIES/7539-5185-2456",
-    "cloud_config_name": "sdna-frameio",
+    "cloud_config_name": "sdna-overcasthq",
     "jobId": "vdfn-fdgd-fdgdf-sfsf",
     "upload_properties": true,
     "files_list": "/mnt/SDNA/jobs/file_list.csv",
     "runId": "run-1234",
-    "repo_guid": "repo-5678"
+    "repo_guid": "repo-5678",
+    "project_id": "5453D0A4-FDD8-C982-DEB4-6A2B67447071",
+    "folder_id": "5453D0A4-FDD8-C982"
 }

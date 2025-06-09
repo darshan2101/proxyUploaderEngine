@@ -16,8 +16,10 @@ DEBUG_TO_FILE = True
 
 # Mapping provider names to their respective upload scripts
 PROVIDER_SCRIPTS = {
-    "frameio": "providerScripts/frameIO/frameIO_complete.py",
-    "tessact": "providerScripts/tessact/tessact_uploader.py"
+    "frameio_v2": "providerScripts/frameIO/frameIO_v2.py",
+    "frameio_v4": "providerScripts/frameIO/frameIO_v4.py",
+    "tessact": "providerScripts/tessact/tessact_uploader.py",
+    "overcast": "providerScripts/overcastHQ/overcast_uploader.py"
 }
 
 def debug_print(log_path, text_string):
@@ -135,6 +137,14 @@ def upload_asset(record, config, dry_run=False):
         cmd.extend(["--metadata-file", metadata_path])
     if dry_run:
         cmd.append("--dry-run")
+    if config['provider'] == "overcasthq":
+        project_id = config.get("project_id")
+        folder_id = config.get("folder_id")
+        if project_id:
+            cmd.extend(["-p", project_id])
+        if folder_id:
+            cmd.extend(["-f", folder_id])
+        
     print(f" Command block copy ---------------------> {cmd}")
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result, source_path
