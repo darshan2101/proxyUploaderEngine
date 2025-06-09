@@ -78,23 +78,7 @@ def get_link_address_and_port():
         sys.exit(5)
 
     logging.info(f"Server connection details - Address: {ip}, Port: {port}")
-    return ip, port
-
-def get_access_token(config):
-    url = f"https://api-{config['hostname']}.overcasthq.com/v1/auth/login"
-    logging.info(f"url check -------------------------------> {url}")
-    payload = {
-        "email": f"{config['email']}",
-        "password": f"{config['password']}"
-    }
-    logging.info("Requesting JWT token for user %s", config['email'])
-    response = requests.post(url, json=payload)
-    if response.status_code == 200:
-        logging.info("JWT token received successfully")
-        return response.json()['access']
-    else:
-        logging.error("Failed to get JWT token: %s", response.text)
-        response.raise_for_status()        
+    return ip, port   
 
 def create_asset(config_data, project_id, folder_id, file_path):
     url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/assets"
@@ -341,14 +325,14 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--mode", required=True, help="mode of Operation proxy or original upload")
     parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
-    parser.add_argument("-j", "--jobId", help="Job Id of SDNA job")
-    parser.add_argument("-p", "--project-id", required=True, help="Project Id")
-    parser.add_argument("-f", "--folder-id", required=True, help="Folder id")
-    parser.add_argument("-cp", "--catalog-path", required=True, help="Path where catalog resides")
-    parser.add_argument("-sp", "--source-path", required=True, help="Source path of file to look for original upload")
-    parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
-    parser.add_argument("-up", "--upload-path", required=True, help="Path where file will be uploaded to frameIO")
-    parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
+    # parser.add_argument("-j", "--jobId", help="Job Id of SDNA job")
+    # parser.add_argument("-p", "--project-id", required=True, help="Project Id")
+    # parser.add_argument("-f", "--folder-id", required=True, help="Folder id")
+    # parser.add_argument("-cp", "--catalog-path", required=True, help="Path where catalog resides")
+    # parser.add_argument("-sp", "--source-path", required=True, help="Source path of file to look for original upload")
+    # parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
+    # parser.add_argument("-up", "--upload-path", required=True, help="Path where file will be uploaded to frameIO")
+    # parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")
     args = parser.parse_args()
@@ -383,72 +367,68 @@ if __name__ == '__main__':
     logging.debug(f"Upload path: {args.upload_path}")
     
     logging.info(f"Initializing Tessact client for workspace: {project_id}")
-    token = get_access_token(cloud_config_data)
-    if not token:
-        logging.error("Failed to get Token. Exiting.")
-        sys.exit(1)
     
-    # matched_file = args.source_path
-    # catalog_path = args.catalog_path
-    # file_name_for_url = extract_file_name(matched_file) if mode == "original" else extract_file_name(catalog_path)
+    matched_file = args.source_path
+    catalog_path = args.catalog_path
+    file_name_for_url = extract_file_name(matched_file) if mode == "original" else extract_file_name(catalog_path)
 
-    # if not os.path.exists(matched_file):
-    #     logging.error(f"File not found: {matched_file}")
-    #     sys.exit(4)
+    if not os.path.exists(matched_file):
+        logging.error(f"File not found: {matched_file}")
+        sys.exit(4)
 
-    # matched_file_size = os.stat(matched_file).st_size
-    # file_size_limit = args.size_limit
-    # if mode == "original" and file_size_limit:
-    #     try:
-    #         size_limit_bytes = float(file_size_limit) * 1024 * 1024
-    #         if matched_file_size > size_limit_bytes:
-    #             logging.error(f"File too large: {matched_file_size / (1024 * 1024):.2f} MB > limit of {file_size_limit} MB")
-    #             sys.exit(4)
-    #     except Exception as e:
-    #         logging.warning(f"Could not validate size limit: {e}")
+    matched_file_size = os.stat(matched_file).st_size
+    file_size_limit = args.size_limit
+    if mode == "original" and file_size_limit:
+        try:
+            size_limit_bytes = float(file_size_limit) * 1024 * 1024
+            if matched_file_size > size_limit_bytes:
+                logging.error(f"File too large: {matched_file_size / (1024 * 1024):.2f} MB > limit of {file_size_limit} MB")
+                sys.exit(4)
+        except Exception as e:
+            logging.warning(f"Could not validate size limit: {e}")
 
-    # catalog_path = remove_file_name_from_path(matched_file)
-    # catalog_url = urllib.parse.quote(catalog_path)
-    # filename_enc = urllib.parse.quote(file_name_for_url)
-    # jobId = args.jobId
-    # client_ip, client_port = get_link_address_and_port()
+    catalog_path = remove_file_name_from_path(matched_file)
+    catalog_url = urllib.parse.quote(catalog_path)
+    filename_enc = urllib.parse.quote(file_name_for_url)
+    jobId = args.jobId
+    client_ip, client_port = get_link_address_and_port()
 
-    # backlink_url = f"https://{client_ip}:{client_port}/dashboard/projects/{jobId}/browse&search?path={catalog_url}&filename={filename_enc}"
-    # logging.debug(f"Generated dashboard URL: {backlink_url}")
+    backlink_url = f"https://{client_ip}:{client_port}/dashboard/projects/{jobId}/browse&search?path={catalog_url}&filename={filename_enc}"
+    logging.debug(f"Generated dashboard URL: {backlink_url}")
 
-    # if args.dry_run:
-    #     logging.info("[DRY RUN] Upload skipped.")
-    #     logging.info(f"[DRY RUN] File to upload: {matched_file}")
-    #     logging.info(f"[DRY RUN] Upload path: {args.upload_path} => Frame.io")
-    #     meta_file = args.metadata_file
-    #     if meta_file:
-    #         logging.info(f"[DRY RUN] Metadata would be applied from: {meta_file}")
-    #     else:
-    #         logging.warning("[DRY RUN] Metadata upload enabled but no metadata file specified.")
-    #     sys.exit(0)
+    if args.dry_run:
+        logging.info("[DRY RUN] Upload skipped.")
+        logging.info(f"[DRY RUN] File to upload: {matched_file}")
+        logging.info(f"[DRY RUN] Upload path: {args.upload_path} => Frame.io")
+        meta_file = args.metadata_file
+        if meta_file:
+            logging.info(f"[DRY RUN] Metadata would be applied from: {meta_file}")
+        else:
+            logging.warning("[DRY RUN] Metadata upload enabled but no metadata file specified.")
+        sys.exit(0)
 
-    # logging.info(f"Starting upload process to Frame.io")
-    # upload_path = args.upload_path
+    logging.info(f"Starting upload process to Frame.io")
+    upload_path = args.upload_path
 
-    # folder_id = args.folder_id
+    folder_id = args.folder_id
 
-    # asset = create_asset(cloud_config_data, project_id, folder_id, args.source_path)
-    # asset_id = asset['result']['uuid']
-    # logging.info(f"Asset upload Initiated. Asset id: {asset_id}")
+    asset = create_asset(cloud_config_data, project_id, folder_id, args.source_path)
+    asset_id = asset['result']['uuid']
+    logging.info(f"Asset upload Initiated. Asset id: {asset_id}")
 
-    # multipart_upload_to_s3(asset['result'], cloud_config_data, args.source_path)
-    # logging.info(f"asset upload completed")
+    multipart_upload_to_s3(asset['result'], cloud_config_data, args.source_path)
+    logging.info(f"asset upload completed")
 
-    # meta_file = args.metadata_file
-    # if meta_file:
-    #     logging.info("Applying metadata to uploaded asset...")
+    meta_file = args.metadata_file
+    if meta_file:
+        logging.info("Applying metadata to uploaded asset...")
 
-    #     response = upload_metadata_to_asset(cloud_config_data['hostname'] ,cloud_config_data['api_key'], backlink_url, asset_id, meta_file)
-    #     if response is not None:
-    #         parsed = response
-    #         print(json.dumps(parsed, indent=4))
-    #     else:
-    #         logging.error("Failed to upload metadata or no response received.")
+        response = upload_metadata_to_asset(cloud_config_data['hostname'] ,cloud_config_data['api_key'], backlink_url, asset_id, meta_file)
+        if response is not None:
+            parsed = response
+            print(json.dumps(parsed, indent=4))
+        else:
+            logging.error("Failed to upload metadata or no response received.")
 
     sys.exit(0)
     
