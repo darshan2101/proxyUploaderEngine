@@ -142,13 +142,14 @@ def list_all_folders(config_data, token, workspace_id, parent_id):
         params = None  # Only used on first call
     return all_folders
 
-def find_upload_id_tessact(path, token, config_data):
+def find_upload_id_tessact(upload_path, token, config_data):
     workspace_id = config_data['workspace_id']
     current_parent_id = None
 
-    logging.info(f"Finding or creating folder path: '{path}'")
+    folder_path = os.path.dirname(upload_path)
+    logging.info(f"Finding or creating folder path: '{folder_path}'")
 
-    for segment in path.strip("/").split("/"):
+    for segment in folder_path.strip("/").split("/"):
         logging.debug(f"Looking for folder '{segment}' under parent '{current_parent_id}'")
 
         folders = list_all_folders(config_data, token, workspace_id, current_parent_id)
