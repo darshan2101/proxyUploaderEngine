@@ -137,13 +137,13 @@ def upload_asset(record, config, dry_run=False):
         cmd.extend(["--metadata-file", metadata_path])
     if dry_run:
         cmd.append("--dry-run")
-    if config['provider'] == "overcasthq":
-        project_id = config.get("project_id")
-        folder_id = config.get("folder_id")
-        if project_id:
-            cmd.extend(["-p", project_id])
-        if folder_id:
-            cmd.extend(["-f", folder_id])
+    # if config['provider'] == "overcasthq":
+    #     project_id = config.get("project_id")
+    #     folder_id = config.get("folder_id")
+    #     if project_id:
+    #         cmd.extend(["-p", project_id])
+    #     if folder_id:
+    #         cmd.extend(["-f", folder_id])
         
     print(f" Command block copy ---------------------> {cmd}")
     result = subprocess.run(cmd, capture_output=True, text=True)
