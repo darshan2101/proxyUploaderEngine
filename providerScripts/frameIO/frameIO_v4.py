@@ -147,19 +147,23 @@ def find_upload_id(upload_path, config_data):
 
         if matched:
             current_parent_id = matched["id"]
+            logging.info(f"Folder '{segment}' already exists (ID: {matched['id']}) under parent ID {current_parent_id}")
             logging.debug(f"Found existing folder '{segment}' (ID: {current_parent_id})")
         else:
             current_parent_id = create_folder(config_data, segment, current_parent_id)
+            logging.info(f"Created new folder '{segment}' under parent ID {current_parent_id}, new ID: {current_parent_id}")
             logging.debug(f"Created folder '{segment}' (ID: {current_parent_id})")
 
+    logging.info(f"Final destination folder ID for upload: {current_parent_id}")
     return current_parent_id
 
 def crete_asset(config_data,folder_id,file_path):
     url = f"{config_data['domain']}/v4/accounts/{config_data['account_id']}/folders/{folder_id}/files/local_upload"
+    file_name = extract_file_name(file_path)
 
     payload = {
     "data": {
-        "name": os.path.basename(file_path),
+        "name": file_name,
         "file_size": os.path.getsize(file_path)
     }
     }
@@ -169,8 +173,10 @@ def crete_asset(config_data,folder_id,file_path):
     }
     response = requests.post(url, headers=headers, json=payload)
     if response.status_code == 201:
+        logging.info(f"Created asset '{file_name}' with size {os.path.getsize(file_path)} bytes in folder ID {folder_id}")
         return response.json()
     else:
+        logging.error(f"Failed to create asset for file '{file_path}'. Status: {response.status_code}, Response: {response.text}")
         print(f"Response error. Status - {response.status_code}, Error - {response.text}")
         
 def upload_parts(file_path, asset_info):
@@ -183,6 +189,7 @@ def upload_parts(file_path, asset_info):
             part_data = f.read(part_size)
             
             print(f"Uploading part {i + 1} to {part_url[:80]}...")
+            logging.info(f"Uploading part {i + 1}/{len(upload_urls)} of file '{file_path}' to Frame.io")
 
             response = requests.put(
                 part_url,
@@ -192,8 +199,10 @@ def upload_parts(file_path, asset_info):
 
             if response.status_code == 200:
                 print(f"Part {i + 1} uploaded successfully.")
+                logging.info(f"Successfully uploaded part {i + 1}")
             else:
                 print(f"Failed to upload part {i + 1}: {response.status_code} - {response.text}")
+                logging.error(f"Failed to upload part {i + 1}: HTTP {response.status_code} - {response.text}")
                 break
 
 
@@ -301,3 +310,4 @@ if __name__ == '__main__':
 
     asset_info = crete_asset(cloud_config_data,folder_id,args.source_path)
     upload_parts(args.source_path, asset_info)
+    logging.info(f"Upload completed for file: {args.source_path}")
