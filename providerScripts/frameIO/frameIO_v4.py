@@ -96,7 +96,6 @@ def get_folders_list(config_data, folder_id):
         }
     logger.debug(f"URL :------------------------------------------->  {url}")
     response = requests.get(url, headers=headers)
-    logger.debug(f"asset tree fetch response :--------------------> {response.text}")
     if response.status_code not in (200, 201):
         logger.info(f"Response error. Status - {response.status_code}, Error - {response.text}")
         exit(1)
