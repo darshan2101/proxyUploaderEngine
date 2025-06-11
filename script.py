@@ -19,7 +19,8 @@ PROVIDER_SCRIPTS = {
     "frameio_v2": "providerScripts/frameIO/frameIO_v2.py",
     "frameio_v4": "providerScripts/frameIO/frameIO_v4.py",
     "tessact": "providerScripts/tessact/tessact_uploader.py",
-    "overcast": "providerScripts/overcastHQ/overcast_uploader.py"
+    "overcast": "providerScripts/overcastHQ/overcast_uploader.py",
+    "s3": "providerScripts/s3/s3_uploder.py"
 }
 
 def debug_print(log_path, text_string):
