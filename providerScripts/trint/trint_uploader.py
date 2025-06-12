@@ -169,7 +169,7 @@ def get_folder_id(config_data, upload_path):
     logging.info(f"Resolved final folder ID for '{folder_path}': {current_parent_id}")
     return current_parent_id
 
-def create_asset(config_data, file_path, backlink_url=None, folder_id=None, workspace_id=None, language="en", detect_speaker_change=True, use_custom_dictionary=False):
+def create_asset(config_data, file_path, backlink_url=None, folder_id=None, workspace_id=None, language="en"):
     key_id = config_data.get("api_key_id")
     key_secret = config_data.get("api_key_secret")
     base_upload_url = config_data.get("upload_url") or "https://upload.trint.com"
@@ -186,9 +186,7 @@ def create_asset(config_data, file_path, backlink_url=None, folder_id=None, work
     # Prepare form fields
     data = {
         "filename": file_name,
-        "language": language,
-        "detect-speaker-change": str(detect_speaker_change).lower(),
-        "custom-dictionary": str(use_custom_dictionary).lower()
+        "language": language
     }
 
     if backlink_url:
@@ -314,6 +312,7 @@ if __name__ == '__main__':
     asset = create_asset(cloud_config_data, args.source_path, backlink_url, folder_id)    
     if asset and 'trintId' in asset:
         logging.info(f"asset upload completed ==============================> {asset['trintId']}")
+        logging.debug(f"asset upload completed ==============================> {asset}")
     else:
         logging.error("Asset upload failed or 'trintId' not found in response.")
         
