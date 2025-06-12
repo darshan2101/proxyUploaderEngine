@@ -176,50 +176,53 @@ def create_asset(config_data, file_path, backlink_url=None, folder_id=None, work
 
     file_name = os.path.basename(file_path)
 
-    # Detect MIME type
+    # Detect MIME type using python-magic
     mime_type = magic.from_file(file_path, mime=True)
     if not mime_type:
         raise ValueError("Could not detect MIME type of file")
-    # mime_type, _ = mimetypes.guess_type(file_path)
-    print(f"[INFO] Detected MIME type: {mime_type}")
+
+    logger.info(f"Detected MIME type for '{file_name}': {mime_type}")
 
     # Prepare form fields
     data = {
         "filename": file_name,
         "language": language,
-        "metadata": backlink_url,
         "detect-speaker-change": str(detect_speaker_change).lower(),
         "custom-dictionary": str(use_custom_dictionary).lower()
     }
 
+    if backlink_url:
+        data["metadata"] = backlink_url
     if folder_id:
         data["folder-id"] = folder_id
     if workspace_id:
         data["workspace-id"] = workspace_id
 
-    # Do not set content-type header manually — let requests handle it for multipart/form-data
+    # Upload file using multipart/form-data
     with open(file_path, "rb") as file_data:
-        file = {
+        files = {
             "file": (file_name, file_data, mime_type)
         }
 
-        print(f"[INFO] Uploading '{file_name}' to Trint...")
+        logger.info(f"Uploading file '{file_name}' to Trint...")
+        logger.debug(f"Upload URL: {base_upload_url}")
+        logger.debug(f"Form Data: {data}")
+
         response = requests.post(
             base_upload_url,
             auth=HTTPBasicAuth(key_id, key_secret),
             data=data,
-            files=file
+            files=files
         )
 
     if response.status_code == 200:
-        print("[✅] Upload successful.")
-        print("Response:", response.json())
+        logger.info("Upload successful.")
+        logger.debug(f"Response: {response.json()}")
         return response.json()
     else:
-        print(f"[❌] Upload failed with status: {response.status_code}")
-        print("Response:", response.text)
+        logger.error(f"Upload failed with status: {response.status_code}")
+        logger.error(f"Response: {response.text}")
         response.raise_for_status()
-        
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
