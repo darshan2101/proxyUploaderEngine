@@ -169,7 +169,7 @@ def get_folder_id(config_data, upload_path):
     logging.info(f"Resolved final folder ID for '{folder_path}': {current_parent_id}")
     return current_parent_id
 
-def create_asset(config_data, file_path, folder_id=None, workspace_id=None, language="en", detect_speaker_change=True, use_custom_dictionary=True):
+def create_asset(config_data, file_path, backlink_url=None, folder_id=None, workspace_id=None, language="en", detect_speaker_change=True, use_custom_dictionary=False):
     key_id = config_data.get("api_key_id")
     key_secret = config_data.get("api_key_secret")
     base_upload_url = config_data.get("upload_url") or "https://upload.trint.com"
@@ -180,47 +180,46 @@ def create_asset(config_data, file_path, folder_id=None, workspace_id=None, lang
     mime_type = magic.from_file(file_path, mime=True)
     if not mime_type:
         raise ValueError("Could not detect MIME type of file")
-
+    # mime_type, _ = mimetypes.guess_type(file_path)
     print(f"[INFO] Detected MIME type: {mime_type}")
 
-    # Build query parameters
-    query_params = {
+    # Prepare form fields
+    data = {
         "filename": file_name,
         "language": language,
+        "metadata": backlink_url,
         "detect-speaker-change": str(detect_speaker_change).lower(),
-        "custom-dictionary": str(use_custom_dictionary).lower(),
+        "custom-dictionary": str(use_custom_dictionary).lower()
     }
 
     if folder_id:
-        query_params["folder-id"] = folder_id
+        data["folder-id"] = folder_id
     if workspace_id:
-        query_params["workspace-id"] = workspace_id
+        data["workspace-id"] = workspace_id
 
-    # Build final upload URL
-    url = f"{base_upload_url}/?{urlencode(query_params)}"
+    # Do not set content-type header manually — let requests handle it for multipart/form-data
+    with open(file_path, "rb") as file_data:
+        file = {
+            "file": (file_name, file_data, mime_type)
+        }
 
-    headers = {
-        "accept": "application/json",
-        "content-type": mime_type,
-    }
-
-    with open(file_path, 'rb') as file_data:
         print(f"[INFO] Uploading '{file_name}' to Trint...")
         response = requests.post(
-            url,
+            base_upload_url,
             auth=HTTPBasicAuth(key_id, key_secret),
-            headers=headers,
-            data=file_data
+            data=data,
+            files=file
         )
 
     if response.status_code == 200:
-        logger.info("Upload successful.")
-        logger.debug(f"Response: {response.json()}")
+        print("[✅] Upload successful.")
+        print("Response:", response.json())
         return response.json()
     else:
-        logger.error(f"Upload failed with status: {response.status_code}")
-        logger.error(f"Response: {response.text}")
+        print(f"[❌] Upload failed with status: {response.status_code}")
+        print("Response:", response.text)
         response.raise_for_status()
+        
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -230,7 +229,7 @@ if __name__ == '__main__':
     parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
     parser.add_argument("-sp", "--source-path", help="Source path of file to look for original upload")
     parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
-    parser.add_argument("-up", "--upload-path", help="Path where file will be uploaded to frameIO")
+    parser.add_argument("-up", "--upload-path", help="Path where file will be uploaded to Trint")
     parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")
@@ -293,7 +292,7 @@ if __name__ == '__main__':
     if args.dry_run:
         logging.info("[DRY RUN] Upload skipped.")
         logging.info(f"[DRY RUN] File to upload: {matched_file}")
-        logging.info(f"[DRY RUN] Upload path: {args.upload_path} => Frame.io")
+        logging.info(f"[DRY RUN] Upload path: {args.upload_path} => Trint")
         meta_file = args.metadata_file
         if meta_file:
             logging.info(f"[DRY RUN] Metadata would be applied from: {meta_file}")
@@ -301,15 +300,18 @@ if __name__ == '__main__':
             logging.warning("[DRY RUN] Metadata upload enabled but no metadata file specified.")
         sys.exit(0)
 
-    logging.info(f"Starting upload process to Frame.io")
+    logging.info(f"Starting upload process to Trint")
     upload_path = args.upload_path
 
     
     # folder_id = create_folder(cloud_config_data, "Test2/v3")
-    folder_id = get_folder_id(cloud_config_data, "/sdna_fs/ADMINISTRATORDROPBOX/primary/SystemGuide/guide.mp4")
+    folder_id = get_folder_id(cloud_config_data, args.upload_path)
     print(f"Folder ID check -------------------------> {folder_id}")
 
-    asset = create_asset(cloud_config_data, args.source_path, folder_id)    
-    logging.info(f"asset upload completed")
+    asset = create_asset(cloud_config_data, args.source_path, backlink_url, folder_id)    
+    if asset and 'trintId' in asset:
+        logging.info(f"asset upload completed ==============================> {asset['trintId']}")
+    else:
+        logging.error("Asset upload failed or 'trintId' not found in response.")
         
     sys.exit(0)
