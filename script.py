@@ -20,7 +20,9 @@ PROVIDER_SCRIPTS = {
     "frameio_v4": "providerScripts/frameIO/frameIO_v4.py",
     "tessact": "providerScripts/tessact/tessact_uploader.py",
     "overcast": "providerScripts/overcastHQ/overcast_uploader.py",
-    "s3": "providerScripts/s3/s3_uploder.py"
+    "s3": "providerScripts/s3/s3_uploder.py",
+    "trint": "providerScripts/trint/trint_uploder.py",
+    "twelvelabs": "providerScripts/twelvelabs/twelvelab_uploader.py"
 }
 
 def debug_print(log_path, text_string):
