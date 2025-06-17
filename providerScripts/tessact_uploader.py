@@ -8,8 +8,8 @@ import urllib.parse
 import requests
 from json import dumps
 from configparser import ConfigParser
-import xml.etree.ElementTree as ET
 import plistlib
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 # Constants
@@ -304,7 +304,6 @@ def upload_metadata_to_asset(base_url, token, backlink_url, asset_id, properties
         return response.json()
     else:
         logging.error("Failed to upload Metadata file: %s", response.text)
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
