@@ -357,12 +357,28 @@ def upload_metadata_to_asset(hostname, api_key, backlink_url, asset_id, properti
         "fabric URL": backlink_url
     }
     logging.debug(f"Reading properties from: {properties_file}")
-    
+    file_ext = properties_file.lower()
     try:
-        if properties_file.endswith(".json"):
+        if file_ext.endswith(".json"):
             with open(properties_file, 'r') as f:
                 metadata = json.load(f)
                 logging.debug(f"Loaded JSON properties: {metadata}")
+
+        elif file_ext.endswith(".xml"):
+            tree = ET.parse(properties_file)
+            root = tree.getroot()
+            metadata_node = root.find("meta-data")
+            if metadata_node is not None:
+                for data_node in metadata_node.findall("data"):
+                    key = data_node.get("name")
+                    value = data_node.text.strip() if data_node.text else ""
+                    if key:
+                        metadata[key] = value
+                logging.debug(f"Loaded XML properties: {metadata}")
+            else:
+                logging.error("No <meta-data> section found in XML.")
+                sys.exit(1)
+                
         else:
             with open(properties_file, 'r') as f:
                 for line in f:

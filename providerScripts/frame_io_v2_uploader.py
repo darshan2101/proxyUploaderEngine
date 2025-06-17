@@ -7,6 +7,7 @@ import urllib.parse
 from json import dumps
 from requests import request
 from configparser import ConfigParser
+import xml.etree.ElementTree as ET
 from frameioclient import FrameioClient
 import plistlib
 from pathlib import Path
@@ -122,12 +123,28 @@ def update_asset(token, asset_id, properties_file):
 
     props = {}
     logging.debug(f"Reading properties from: {properties_file}")
-
+    file_ext = properties_file.lower()
     try:
-        if properties_file.endswith(".json"):
+        if file_ext.endswith(".json"):
             with open(properties_file, 'r') as f:
                 props = json.load(f)
                 logging.debug(f"Loaded JSON properties: {props}")
+
+        elif file_ext.endswith(".xml"):
+            tree = ET.parse(properties_file)
+            root = tree.getroot()
+            metadata_node = root.find("meta-data")
+            if metadata_node is not None:
+                for data_node in metadata_node.findall("data"):
+                    key = data_node.get("name")
+                    value = data_node.text.strip() if data_node.text else ""
+                    if key:
+                        props[key] = value
+                logging.debug(f"Loaded XML properties: {props}")
+            else:
+                logging.error("No <meta-data> section found in XML.")
+                sys.exit(1)
+                
         else:
             with open(properties_file, 'r') as f:
                 for line in f:

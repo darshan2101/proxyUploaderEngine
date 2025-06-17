@@ -236,14 +236,14 @@ def upload_metadata_to_asset(base_url, token, backlink_url, asset_id, properties
 
     props = {}
     logging.debug(f"Reading properties from: {properties_file}")
-
+    file_ext = properties_file.lower()
     try:
-        if properties_file.endswith(".json"):
+        if file_ext.endswith(".json"):
             with open(properties_file, 'r') as f:
                 props = json.load(f)
                 logging.debug(f"Loaded JSON properties: {props}")
 
-        elif properties_file.endswith(".xml"):
+        elif file_ext.endswith(".xml"):
             tree = ET.parse(properties_file)
             root = tree.getroot()
             metadata_node = root.find("meta-data")

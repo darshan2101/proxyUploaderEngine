@@ -1,0 +1,81 @@
+<clip typeid="generic" type="application/mxf" clipid="da91b13aaef2f9a0b9cd21c8a1362abc" name="AVC_Intra1080i50">
+ <media-path><![CDATA[/mnt/SNS-TDM/automation_source/02-disk-copy/e-MXF footage/AVC Intra]]></media-path>
+ <meta-data>
+  <data name="Application Name"><![CDATA[MXF4mac GC Export FCP]]></data>
+  <data name="Application Supplier Name"><![CDATA[Hamburg Pro Media GmbH]]></data>
+  <data name="Application Version String"><![CDATA[1.5.1]]></data>
+  <data name="Audio Sample Rate"><![CDATA[48000]]></data>
+  <data name="Average Bytes Per Second"><![CDATA[144000]]></data>
+  <data name="Bits Per Audio Sample"><![CDATA[24]]></data>
+  <data name="Black Reference Level"><![CDATA[16]]></data>
+  <data name="Block Align"><![CDATA[3]]></data>
+  <data name="Channel Count"><![CDATA[1]]></data>
+  <data name="Color Range Levels"><![CDATA[225]]></data>
+  <data name="Color Siting"><![CDATA[4]]></data>
+  <data name="Component Data Definition"><![CDATA[Sound Essence Track]]></data>
+  <data name="Component Depth"><![CDATA[10]]></data>
+  <data name="Container Last Modify Date"><![CDATA[2012:06:11 16:28:34.208]]></data>
+  <data name="Create Date"><![CDATA[2012:06:11 16:28:34.208]]></data>
+  <data name="Directory"><![CDATA[/mnt/SNS-TDM/automation_source/02-disk-copy/e-MXF footage/AVC Intra]]></data>
+  <data name="Display F2 Offset"><![CDATA[0]]></data>
+  <data name="Display Height"><![CDATA[540]]></data>
+  <data name="Display Width"><![CDATA[1920]]></data>
+  <data name="Display X Offset"><![CDATA[0]]></data>
+  <data name="Display Y Offset"><![CDATA[0]]></data>
+  <data name="Drop Frame"><![CDATA[False]]></data>
+  <data name="Duration"><![CDATA[10.20 s]]></data>
+  <data name="Edit Rate"><![CDATA[25]]></data>
+  <data name="Essence Stream ID"><![CDATA[1]]></data>
+  <data name="ExifTool Version Number"><![CDATA[12.70]]></data>
+  <data name="Field Dominance"><![CDATA[1]]></data>
+  <data name="File Access Date/Time"><![CDATA[2025:06:09 12:38:05-07:00]]></data>
+  <data name="File Inode Change Date/Time"><![CDATA[2013:06:14 08:45:47-07:00]]></data>
+  <data name="File Modification Date/Time"><![CDATA[2013:06:14 08:45:47-07:00]]></data>
+  <data name="File Name"><![CDATA[AVC_Intra1080i50.mxf]]></data>
+  <data name="File Permissions"><![CDATA[-rwxrwxrwx]]></data>
+  <data name="File Size"><![CDATA[158 MB]]></data>
+  <data name="File Type"><![CDATA[MXF]]></data>
+  <data name="File Type Extension"><![CDATA[mxf]]></data>
+  <data name="Frame Layout"><![CDATA[1]]></data>
+  <data name="Horizontal Subsampling"><![CDATA[2]]></data>
+  <data name="Image Alignment Offset"><![CDATA[0]]></data>
+  <data name="Image End Offset"><![CDATA[0]]></data>
+  <data name="Image Height"><![CDATA[540]]></data>
+  <data name="Image Size"><![CDATA[1920x540]]></data>
+  <data name="Image Start Offset"><![CDATA[0]]></data>
+  <data name="Image Width"><![CDATA[1920]]></data>
+  <data name="Index Stream ID"><![CDATA[2]]></data>
+  <data name="Linked Track ID"><![CDATA[10]]></data>
+  <data name="Locked Indicator"><![CDATA[True]]></data>
+  <data name="MIME Type"><![CDATA[application/mxf]]></data>
+  <data name="MXF Version"><![CDATA[1.2]]></data>
+  <data name="Megapixels"><![CDATA[1.0]]></data>
+  <data name="Modify Date"><![CDATA[2012:06:11 16:28:34.208]]></data>
+  <data name="Origin"><![CDATA[0 s]]></data>
+  <data name="Package Last Modify Date"><![CDATA[2012:06:11 16:28:34.208]]></data>
+  <data name="Padding Bits"><![CDATA[0]]></data>
+  <data name="Presentation Aspect Ratio"><![CDATA[1.777777778]]></data>
+  <data name="Reversed Byte Order"><![CDATA[False]]></data>
+  <data name="Rounded Timecode Timebase"><![CDATA[25]]></data>
+  <data name="SDK Version"><![CDATA[1.2]]></data>
+  <data name="Sample Rate"><![CDATA[25]]></data>
+  <data name="Sampled Height"><![CDATA[540]]></data>
+  <data name="Sampled Width"><![CDATA[1920]]></data>
+  <data name="Sampled X Offset"><![CDATA[0]]></data>
+  <data name="Sampled Y Offset"><![CDATA[0]]></data>
+  <data name="Start Timecode"><![CDATA[0 s]]></data>
+  <data name="Stored F2 Offset"><![CDATA[0]]></data>
+  <data name="Toolkit Version"><![CDATA[3.2.0.32 released]]></data>
+  <data name="Track ID"><![CDATA[10]]></data>
+  <data name="Track Number"><![CDATA[369623815]]></data>
+  <data name="Vertical Sub-sampling"><![CDATA[1]]></data>
+  <data name="Video Coding Scheme ID"><![CDATA[060e2b34-0401-010a-0401-020201323102]]></data>
+  <data name="Video Line Map"><![CDATA[2 4 21 584]]></data>
+  <data name="White Reference Level"><![CDATA[235]]></data>
+  <data name="extension"><![CDATA[MXF]]></data>
+  <data name="sdna-time-code"><![CDATA[00:00:00:00]]></data>
+ </meta-data>
+ <files>
+  <file tapeserial="DNA910" type="audiovideo"><![CDATA[/mnt/SNS-TDM/automation_source/02-disk-copy/e-MXF footage/AVC Intra/AVC_Intra1080i50.mxf]]></file>
+ </files>
+</clip>
