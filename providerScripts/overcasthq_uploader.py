@@ -11,7 +11,6 @@ import xml.etree.ElementTree as ET
 import plistlib
 import hashlib
 import urllib.parse
-import xml.etree.ElementTree as ET
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
