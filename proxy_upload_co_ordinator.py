@@ -104,6 +104,18 @@ def resolve_proxy_file(directory, pattern, extensions):
         logging.error(f"Error during file search: {e}")
         return None
 
+# validate params per mode for proxy_generation
+def validate_proxy_params(mode, params):
+    required_keys = {
+        "generate_video_proxy": ["proxy_params"],
+        "generate_video_frame_proxy": ["frame_formate", "proxy_params"],
+        "generate_intelligence_proxy": [],
+        "generate_video_to_spritesheet": ["frame_formate", "tile_layout", "image_geometry"]
+    }
+    missing = [k for k in required_keys.get(mode, []) if not params.get(k)]
+    if missing:
+        raise ValueError(f"Missing required proxy parameters for mode '{mode}': {', '.join(missing)}")
+
 #payload generation for proxy job creation
 def build_payload_for_proxy_mode(mode, input_path, output_path, config_params):
     payload = {
@@ -141,6 +153,7 @@ def generate_proxy_asset(config_mode, input_path, output_path, extra_params, gen
         raise ValueError(f"Unsupported proxy generation mode: {config_mode}")
 
     url = base_url + mode_url_map[config_mode]
+    validate_proxy_params(config_mode, extra_params)
     payload = build_payload_for_proxy_mode(config_mode, input_path, output_path, extra_params)
 
     try:

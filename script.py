@@ -104,6 +104,42 @@ def resolve_proxy_file(directory, pattern, extensions):
         logging.error(f"Error during file search: {e}")
         return None
 
+# validate params per mode for proxy_generation
+def validate_proxy_params(mode, params):
+    required_keys = {
+        "generate_video_proxy": ["proxy_params"],
+        "generate_video_frame_proxy": ["frame_formate", "proxy_params"],
+        "generate_intelligence_proxy": [],
+        "generate_video_to_spritesheet": ["frame_formate", "tile_layout", "image_geometry"]
+    }
+    missing = [k for k in required_keys.get(mode, []) if not params.get(k)]
+    if missing:
+        raise ValueError(f"Missing required proxy parameters for mode '{mode}': {', '.join(missing)}")
+
+#payload generation for proxy job creation
+def build_payload_for_proxy_mode(mode, input_path, output_path, config_params):
+    payload = {
+        "file_path": input_path,
+        "output_path": output_path
+    }
+    if mode == "generate_video_proxy":
+        required = ["proxy_params"]
+        payload.update({k: config_params[k] for k in required if k in config_params})
+    elif mode == "generate_video_frame_proxy":
+        required = ["frame_formate", "proxy_params"]
+        optional = ["frame_params"]
+        payload.update({k: config_params[k] for k in required if k in config_params})
+        payload.update({k: config_params[k] for k in optional if k in config_params})
+    elif mode == "generate_intelligence_proxy":
+        optional = ["proxy_params"]
+        payload.update({k: config_params[k] for k in optional if k in config_params})
+    elif mode == "generate_video_to_spritesheet":
+        required = ["frame_formate", "tile_layout", "image_geometry"]
+        optional = ["frame_params"]
+        payload.update({k: config_params[k] for k in required if k in config_params})
+        payload.update({k: config_params[k] for k in optional if k in config_params})
+    return payload
+
 # generate proxy asset according to options
 def generate_proxy_asset(config_mode, input_path, output_path, extra_params, generator_tool = "ffmpeg"):
     base_url = f"http://127.0.0.1/{generator_tool}/"
@@ -117,8 +153,8 @@ def generate_proxy_asset(config_mode, input_path, output_path, extra_params, gen
         raise ValueError(f"Unsupported proxy generation mode: {config_mode}")
 
     url = base_url + mode_url_map[config_mode]
-    payload = {"file_path": input_path, "output_path": output_path}
-    payload.update(extra_params or {})
+    validate_proxy_params(config_mode, extra_params)
+    payload = build_payload_for_proxy_mode(config_mode, input_path, output_path, extra_params)
 
     try:
         response = requests.post(url, json=payload, headers={"Content-Type": "application/json"})
@@ -286,7 +322,6 @@ def process_csv_and_upload(config, dry_run=False):
     send_progress(progressDetails, config["repo_guid"])
 
     def task(record):
-        
         result, resolved_path = upload_asset(record, config, dry_run)
         progressDetails["processedFiles"] += 1
         if result and result.returncode == 0:
