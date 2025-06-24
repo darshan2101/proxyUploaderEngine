@@ -1,3 +1,5 @@
+import requests
+import time
 import csv
 import os
 import subprocess
@@ -102,6 +104,79 @@ def resolve_proxy_file(directory, pattern, extensions):
         logging.error(f"Error during file search: {e}")
         return None
 
+#payload generation for proxy job creation
+def build_payload_for_proxy_mode(mode, input_path, output_path, config_params):
+    payload = {
+        "file_path": input_path,
+        "output_path": output_path
+    }
+    if mode == "generate_video_proxy":
+        required = ["proxy_params"]
+        payload.update({k: config_params[k] for k in required if k in config_params})
+    elif mode == "generate_video_frame_proxy":
+        required = ["frame_formate", "proxy_params"]
+        optional = ["frame_params"]
+        payload.update({k: config_params[k] for k in required if k in config_params})
+        payload.update({k: config_params[k] for k in optional if k in config_params})
+    elif mode == "generate_intelligence_proxy":
+        optional = ["proxy_params"]
+        payload.update({k: config_params[k] for k in optional if k in config_params})
+    elif mode == "generate_video_to_spritesheet":
+        required = ["frame_formate", "tile_layout", "image_geometry"]
+        optional = ["frame_params"]
+        payload.update({k: config_params[k] for k in required if k in config_params})
+        payload.update({k: config_params[k] for k in optional if k in config_params})
+    return payload
+
+# generate proxy asset according to options
+def generate_proxy_asset(config_mode, input_path, output_path, extra_params, generator_tool = "ffmpeg"):
+    base_url = f"http://127.0.0.1/{generator_tool}/"
+    mode_url_map = {
+        "generate_video_proxy": "generate_video_proxy",
+        "generate_video_frame_proxy": "generate_video_frame_proxy",
+        "generate_intelligence_proxy": "generate_intelligence_video_proxy",
+        "generate_video_to_spritesheet": "generate_video_to_sprite_sheet"
+    }
+    if config_mode not in mode_url_map:
+        raise ValueError(f"Unsupported proxy generation mode: {config_mode}")
+
+    url = base_url + mode_url_map[config_mode]
+    payload = build_payload_for_proxy_mode(config_mode, input_path, output_path, extra_params)
+
+    try:
+        response = requests.post(url, json=payload, headers={"Content-Type": "application/json"})
+        if response.status_code != 200:
+            raise Exception(f"API call failed with status {response.status_code}: {response.text}")
+
+        jobid = response.json().get("jobid")
+        if not jobid:
+            raise Exception("No jobid returned from proxy generation call")
+
+        # Poll job status
+        job_status_url = f"http://127.0.0.1/job_details/{jobid}"
+        start_time = time.time()
+        timeout = 600  # 10 minutes
+        poll_interval = 3
+
+        while time.time() - start_time < timeout:
+            job_resp = requests.get(job_status_url)
+            if job_resp.status_code != 200:
+                raise Exception(f"Failed to fetch job status: {job_resp.text}")
+            job_data = job_resp.json()
+            status = job_data.get("jobstatus")
+
+            if status == "Success":
+                return
+            elif status == "Failed":
+                raise RuntimeError(f"Proxy generation job {jobid} failed: {job_data.get('description')}")
+
+            time.sleep(poll_interval)
+
+        raise TimeoutError(f"Proxy generation job {jobid} timed out after {timeout} seconds")
+
+    except Exception as e:
+        raise RuntimeError(f"Proxy generation failed: {e}")
+
 # Launches the provider script with file arguments
 def upload_asset(record, config, dry_run=False):
     original_source_path, catalog_path, metadata_path = record
@@ -113,6 +188,23 @@ def upload_asset(record, config, dry_run=False):
     else:
         base_source_path = original_source_path
         upload_path = config["upload_path"]
+
+    if config["mode"] in [
+        "generate_video_proxy",
+        "generate_video_frame_proxy",
+        "generate_intelligence_proxy",
+        "generate_video_to_spritesheet"
+    ]:
+        file_name = os.path.basename(base_source_path)
+        name_wo_ext = os.path.splitext(file_name)[0]
+        proxy_ext = ".mp4" if "spritesheet" not in config["mode"] else ".png"
+        proxy_output_path = os.path.join(config["proxy_output_base_path"], name_wo_ext + proxy_ext)
+        try:
+            generate_proxy_asset(config["mode"], base_source_path, proxy_output_path, config.get("proxy_extra_params", {}))
+            base_source_path = proxy_output_path
+        except Exception as e:
+            debug_print(config["logging_path"], str(e))
+            return None, base_source_path
 
     if config["mode"] == "proxy":
         base_name = os.path.splitext(os.path.basename(base_source_path))[0]
@@ -265,10 +357,13 @@ if __name__ == '__main__':
         "proxy_directory", "original_file_size_limit", "upload_path",
         "extensions", "mode", "runId", "repo_guid"
     ]
+    optional_keys = ["proxy_output_base_path", "proxy_extra_params"]
     for key in required_keys:
         if key not in request_data:
             print(f"Missing required field in config: {key}")
             sys.exit(1)
+    for key in optional_keys:
+        request_data.setdefault(key, "" if key == "proxy_output_base_path" else {})
 
     if args.log_prefix:
         request_data["log_prefix"] = args.log_prefix

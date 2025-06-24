@@ -1,6 +1,6 @@
 {
     "mode": "original",
-    "provider": "frameio",
+    "provider": "frameio_v2",
     "proxy_directory": "/SDNA/PROXIES",
     "logging_path": "logs/proxyUploaderEngine/frameIO",
     "progress_path": "logs/proxyUploaderEngine/frameIO/progresses",
