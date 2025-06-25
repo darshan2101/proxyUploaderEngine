@@ -237,7 +237,7 @@ def upload_asset(record, config, dry_run=False):
         "--catalog-path", catalog_path,
         "--config-name", config["cloud_config_name"],
         "--upload-path", upload_path,
-        "--jobId", config["jobId"],
+        "--jobId", config["job_id"],
         "--size-limit", str(config["original_file_size_limit"]),
         "--log-level", "error"
     ]
@@ -308,8 +308,8 @@ def process_csv_and_upload(config, dry_run=False):
     os.makedirs(os.path.dirname(config["progress_path"]), exist_ok=True)
 
     progressDetails = {
-        "run_id": config["runId"],
-        "job_id": config["jobId"],
+        "run_id": config["run_id"],
+        "job_id": config["job_id"],
         "progress_path": config["progress_path"],
         "duration": int(time.time()),
         "totalFiles": total_files,
@@ -366,8 +366,8 @@ if __name__ == '__main__':
 
     required_keys = [
         "provider", "progress_path", "logging_path", "thread_count",
-        "files_list", "cloud_config_name", "jobId",
-        "upload_path", "extensions", "mode", "runId", "repo_guid"
+        "files_list", "cloud_config_name", "job_id",
+        "upload_path", "extensions", "mode", "run_id", "repo_guid"
     ]
     optional_keys = ["proxy_output_base_path", "proxy_extra_params"]
 
