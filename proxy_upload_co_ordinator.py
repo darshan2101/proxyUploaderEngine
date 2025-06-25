@@ -367,10 +367,18 @@ if __name__ == '__main__':
     required_keys = [
         "provider", "progress_path", "logging_path", "thread_count",
         "files_list", "cloud_config_name", "jobId",
-        "proxy_directory", "original_file_size_limit", "upload_path",
-        "extensions", "mode", "runId", "repo_guid"
+        "upload_path", "extensions", "mode", "runId", "repo_guid"
     ]
     optional_keys = ["proxy_output_base_path", "proxy_extra_params"]
+
+    mode = request_data.get("mode")
+
+    # Conditionally require proxy_directory and original_file_size_limit
+    if mode == "proxy":
+        required_keys.append("proxy_directory")
+    if mode == "original":
+        required_keys.append("original_file_size_limit")
+
     for key in required_keys:
         if key not in request_data:
             print(f"Missing required field in config: {key}")
