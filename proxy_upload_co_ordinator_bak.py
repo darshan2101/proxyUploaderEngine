@@ -1,5 +1,3 @@
-import requests
-import time
 import csv
 import os
 import subprocess
@@ -18,13 +16,13 @@ DEBUG_TO_FILE = True
 
 # Mapping provider names to their respective upload scripts
 PROVIDER_SCRIPTS = {
-    "frameio_v2": "providerScripts/frameIO/frameIO_v2.py",
-    "frameio_v4": "providerScripts/frameIO/frameIO_v4.py",
-    "tessact": "providerScripts/tessact/tessact_uploader.py",
-    "overcast": "providerScripts/overcastHQ/overcast_uploader.py",
-    "s3": "providerScripts/s3/s3_uploder.py",
-    "trint": "providerScripts/trint/trint_uploder.py",
-    "twelvelabs": "providerScripts/twelvelabs/twelvelab_uploader.py"
+    "frameio_v2": "frame_io_v2_uploader.py",
+    "frameio_v4": "frame_io_v4_uploader.py",
+    "tessact": "tessact_uploader.py",
+    "overcast": "overcasthq_uploader.py",
+    "s3": "s3_uploder.py",
+    "trint": "trint_uploder.py",
+    "twelvelabs": "twelvelabs_uploader.py"
 }
 
 def debug_print(log_path, text_string):
@@ -104,96 +102,10 @@ def resolve_proxy_file(directory, pattern, extensions):
         logging.error(f"Error during file search: {e}")
         return None
 
-# validate params per mode for proxy_generation
-def validate_proxy_params(mode, params):
-    required_keys = {
-        "generate_video_proxy": ["proxy_params"],
-        "generate_video_frame_proxy": ["frame_formate", "proxy_params"],
-        "generate_intelligence_proxy": [],
-        "generate_video_to_spritesheet": ["frame_formate", "tile_layout", "image_geometry"]
-    }
-    missing = [k for k in required_keys.get(mode, []) if not params.get(k)]
-    if missing:
-        raise ValueError(f"Missing required proxy parameters for mode '{mode}': {', '.join(missing)}")
-
-#payload generation for proxy job creation
-def build_payload_for_proxy_mode(mode, input_path, output_path, config_params):
-    payload = {
-        "file_path": input_path,
-        "output_path": output_path
-    }
-    if mode == "generate_video_proxy":
-        required = ["proxy_params"]
-        payload.update({k: config_params[k] for k in required if k in config_params})
-    elif mode == "generate_video_frame_proxy":
-        required = ["frame_formate", "proxy_params"]
-        optional = ["frame_params"]
-        payload.update({k: config_params[k] for k in required if k in config_params})
-        payload.update({k: config_params[k] for k in optional if k in config_params})
-    elif mode == "generate_intelligence_proxy":
-        optional = ["proxy_params"]
-        payload.update({k: config_params[k] for k in optional if k in config_params})
-    elif mode == "generate_video_to_spritesheet":
-        required = ["frame_formate", "tile_layout", "image_geometry"]
-        optional = ["frame_params"]
-        payload.update({k: config_params[k] for k in required if k in config_params})
-        payload.update({k: config_params[k] for k in optional if k in config_params})
-    return payload
-
-# generate proxy asset according to options
-def generate_proxy_asset(config_mode, input_path, output_path, extra_params, generator_tool = "ffmpeg"):
-    base_url = f"http://127.0.0.1/{generator_tool}/"
-    mode_url_map = {
-        "generate_video_proxy": "generate_video_proxy",
-        "generate_video_frame_proxy": "generate_video_frame_proxy",
-        "generate_intelligence_proxy": "generate_intelligence_video_proxy",
-        "generate_video_to_spritesheet": "generate_video_to_sprite_sheet"
-    }
-    if config_mode not in mode_url_map:
-        raise ValueError(f"Unsupported proxy generation mode: {config_mode}")
-
-    url = base_url + mode_url_map[config_mode]
-    validate_proxy_params(config_mode, extra_params)
-    payload = build_payload_for_proxy_mode(config_mode, input_path, output_path, extra_params)
-
-    try:
-        response = requests.post(url, json=payload, headers={"Content-Type": "application/json"})
-        if response.status_code != 200:
-            raise Exception(f"API call failed with status {response.status_code}: {response.text}")
-
-        jobid = response.json().get("jobid")
-        if not jobid:
-            raise Exception("No jobid returned from proxy generation call")
-
-        # Poll job status
-        job_status_url = f"http://127.0.0.1/job_details/{jobid}"
-        start_time = time.time()
-        timeout = 600  # 10 minutes
-        poll_interval = 3
-
-        while time.time() - start_time < timeout:
-            job_resp = requests.get(job_status_url)
-            if job_resp.status_code != 200:
-                raise Exception(f"Failed to fetch job status: {job_resp.text}")
-            job_data = job_resp.json()
-            status = job_data.get("jobstatus")
-
-            if status == "Success":
-                return
-            elif status == "Failed":
-                raise RuntimeError(f"Proxy generation job {jobid} failed: {job_data.get('description')}")
-
-            time.sleep(poll_interval)
-
-        raise TimeoutError(f"Proxy generation job {jobid} timed out after {timeout} seconds")
-
-    except Exception as e:
-        raise RuntimeError(f"Proxy generation failed: {e}")
-
 # Launches the provider script with file arguments
 def upload_asset(record, config, dry_run=False):
     original_source_path, catalog_path, metadata_path = record
-    print(f"[INFO] Processing record: {record}")
+
     if "/./" in original_source_path:
         prefix, sub_path = original_source_path.split("/./", 1)
         base_source_path = os.path.join(prefix, sub_path)
@@ -201,23 +113,6 @@ def upload_asset(record, config, dry_run=False):
     else:
         base_source_path = original_source_path
         upload_path = config["upload_path"]
-
-    if config["mode"] in [
-        "generate_video_proxy",
-        "generate_video_frame_proxy",
-        "generate_intelligence_proxy",
-        "generate_video_to_spritesheet"
-    ]:
-        file_name = os.path.basename(base_source_path)
-        name_wo_ext = os.path.splitext(file_name)[0]
-        proxy_ext = ".mp4" if "spritesheet" not in config["mode"] else ".png"
-        proxy_output_path = os.path.join(config["proxy_output_base_path"], name_wo_ext + proxy_ext)
-        try:
-            generate_proxy_asset(config["mode"], base_source_path, proxy_output_path, config.get("proxy_extra_params", {}))
-            base_source_path = proxy_output_path
-        except Exception as e:
-            debug_print(config["logging_path"], str(e))
-            return None, base_source_path
 
     if config["mode"] == "proxy":
         base_name = os.path.splitext(os.path.basename(base_source_path))[0]
@@ -238,10 +133,9 @@ def upload_asset(record, config, dry_run=False):
         "--config-name", config["cloud_config_name"],
         "--upload-path", upload_path,
         "--jobId", config["job_id"],
-        "--log-level", "debug"
+        "--size-limit", str(config["original_file_size_limit"]),
+        "--log-level", "error"
     ]
-    if config["mode"] == "original":
-        cmd.extend(["--size-limit", str(config["original_file_size_limit"])]) 
     if metadata_path:
         cmd.extend(["--metadata-file", metadata_path])
     if dry_run:
@@ -254,7 +148,6 @@ def upload_asset(record, config, dry_run=False):
     #     if folder_id:
     #         cmd.extend(["-f", folder_id])
         
-    print(f" Command block copy ---------------------> {cmd}")
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result, source_path
 
@@ -323,11 +216,7 @@ def process_csv_and_upload(config, dry_run=False):
     send_progress(progressDetails, config["repo_guid"])
 
     def task(record):
-        try:
-            result, resolved_path = upload_asset(record, config, dry_run)
-        except Exception as e:
-            print(f"[ERROR] upload_asset() failed: {e}")
-            return
+        result, resolved_path = upload_asset(record, config, dry_run)
         progressDetails["processedFiles"] += 1
         if result and result.returncode == 0:
             file_size = os.path.getsize(resolved_path) if os.path.exists(resolved_path) else 0
@@ -372,9 +261,8 @@ if __name__ == '__main__':
     required_keys = [
         "provider", "progress_path", "logging_path", "thread_count",
         "files_list", "cloud_config_name", "job_id",
-        "upload_path", "extensions", "mode", "run_id", "repo_guid"
+         "upload_path","extensions", "mode", "run_id", "repo_guid"
     ]
-    optional_keys = ["proxy_output_base_path", "proxy_extra_params"]
 
     mode = request_data.get("mode")
 
@@ -388,8 +276,6 @@ if __name__ == '__main__':
         if key not in request_data:
             print(f"Missing required field in config: {key}")
             sys.exit(1)
-    for key in optional_keys:
-        request_data.setdefault(key, "" if key == "proxy_output_base_path" else {})
 
     if args.log_prefix:
         request_data["log_prefix"] = args.log_prefix

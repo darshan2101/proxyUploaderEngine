@@ -1,6 +1,7 @@
 extra
 logs
 csv_logs
+proxyUploaderScripts
 providerScripts/framIO/test/
 providerScripts/frameIO/test/frame.py
 providerScripts/frameIO/test/frameIO.py

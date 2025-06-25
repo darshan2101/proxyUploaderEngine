@@ -193,7 +193,7 @@ def generate_proxy_asset(config_mode, input_path, output_path, extra_params, gen
 # Launches the provider script with file arguments
 def upload_asset(record, config, dry_run=False):
     original_source_path, catalog_path, metadata_path = record
-
+    print(f"[INFO] Processing record: {record}")
     if "/./" in original_source_path:
         prefix, sub_path = original_source_path.split("/./", 1)
         base_source_path = os.path.join(prefix, sub_path)
@@ -238,9 +238,10 @@ def upload_asset(record, config, dry_run=False):
         "--config-name", config["cloud_config_name"],
         "--upload-path", upload_path,
         "--jobId", config["job_id"],
-        "--size-limit", str(config["original_file_size_limit"]),
-        "--log-level", "error"
+        "--log-level", "debug"
     ]
+    if config["mode"] == "original":
+        cmd.extend(["--size-limit", str(config["original_file_size_limit"])]) 
     if metadata_path:
         cmd.extend(["--metadata-file", metadata_path])
     if dry_run:
@@ -322,7 +323,11 @@ def process_csv_and_upload(config, dry_run=False):
     send_progress(progressDetails, config["repo_guid"])
 
     def task(record):
-        result, resolved_path = upload_asset(record, config, dry_run)
+        try:
+            result, resolved_path = upload_asset(record, config, dry_run)
+        except Exception as e:
+            print(f"[ERROR] upload_asset() failed: {e}")
+            return
         progressDetails["processedFiles"] += 1
         if result and result.returncode == 0:
             file_size = os.path.getsize(resolved_path) if os.path.exists(resolved_path) else 0
@@ -400,3 +405,4 @@ if __name__ == '__main__':
     )
 
     process_csv_and_upload(request_data, args.dry_run)
+    sys.exit(0)

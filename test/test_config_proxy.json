@@ -1,0 +1,20 @@
+{
+    "mode": "proxy",
+    "provider": "tessact",
+    "proxy_directory": "/SDNA/PROXIES",
+    "logging_path": "logs/testEngine/proxy/tessact",
+    "progress_path": "logs/testEngine/proxy/tessact/progresses",
+    "thread_count": 2,
+    "extensions": [
+        ".mov",
+        ".mp4",
+        ".mkv"
+    ],
+    "upload_path": "HelloSDNATest/PROXIES/7539-5185-2456",
+    "cloud_config_name": "sdna-tessact",
+    "job_id": "job-proxy-test",
+    "upload_properties": true,
+    "files_list": "/home/darshan/Darshan/Dev/(python +node) Wrappers/proxyUploaderEngine/test/proxy_file_list.csv",
+    "run_id": "run-proxy-001",
+    "repo_guid": "repo-5678"
+}
