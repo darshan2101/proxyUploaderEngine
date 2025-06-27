@@ -13,7 +13,7 @@ import plistlib
 from pathlib import Path
 
 # Constants
-VALID_MODES = ["proxy", "original"]
+VALID_MODES = ["proxy", "original", "get_base_target"]
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
@@ -77,10 +77,10 @@ def get_link_address_and_port():
     logging.info(f"Server connection details - Address: {ip}, Port: {port}")
     return ip, port
 
-def find_upload_id(path, project_id, token):
+def find_upload_id(path, project_id, token, base_id=None):
     logging.info(f"Finding upload location for path: {path}")
     client = FrameioClient(token)
-    current_id = client.projects.get(project_id)['root_asset_id']
+    current_id = base_id or client.projects.get(project_id)['root_asset_id']
     logging.debug(f"Starting from root asset ID: {current_id}")
 
     for segment in path.strip('/').split('/'):
@@ -171,13 +171,16 @@ if __name__ == '__main__':
     parser.add_argument("-m", "--mode", required=True, help="mode of Operation proxy or original upload")
     parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
     parser.add_argument("-j", "--jobId", help="Job Id of SDNA job")
-    parser.add_argument("-cp", "--catalog-path", required=True, help="Path where catalog resides")
-    parser.add_argument("-sp", "--source-path", required=True, help="Source path of file to look for original upload")
+    parser.add_argument("--parent-id", help="Optional parent folder ID to resolve relative upload paths from")
+    parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
+    parser.add_argument("-sp", "--source-path", help="Source path of file to look for original upload")
     parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
     parser.add_argument("-up", "--upload-path", required=True, help="Path where file will be uploaded to frameIO")
     parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")
+    parser.add_argument("--resolved-upload-id", action="store_true", help="Pass if upload path is already resolved ID")
+
     args = parser.parse_args()
 
     setup_logging(args.log_level)
@@ -202,7 +205,7 @@ if __name__ == '__main__':
     cloud_config_data = cloud_config[cloud_config_name]
     token = cloud_config_data['FrameIODevKey']
     project_id = cloud_config_data['project_id']
-    print(f"project Id ----------------------->{project_id}")
+    logging.info(f"project Id ----------------------->{project_id}")
 
     logging.info(f"Starting Frame.io upload process in {mode} mode")
     logging.debug(f"Using cloud config: {cloud_config_path}")
@@ -211,6 +214,25 @@ if __name__ == '__main__':
     
     logging.info(f"Initializing Frame.io client for project: {project_id}")
     client = FrameioClient(token)
+    
+    if mode == "get_base_target":
+        upload_path = args.upload_path
+        if not upload_path:
+            logging.error("Upload path must be provided for get_base_target mode")
+            sys.exit(1)
+
+        logging.info(f"Fetching upload target ID for path: {upload_path}")
+        
+        if args.resolved_upload_id:
+            print(args.upload_path)
+            sys.exit(0)
+
+        logging.info(f"Fetching upload target ID for path: {upload_path}")
+        base_id = args.parent_id or None
+        up_id = find_upload_id(upload_path, project_id, token, base_id) if '/' in upload_path else upload_path
+        print(up_id)
+        sys.exit(0)
+        
 
     matched_file = args.source_path
     catalog_path = args.catalog_path
@@ -253,7 +275,10 @@ if __name__ == '__main__':
 
     logging.info(f"Starting upload process to Frame.io")
     upload_path = args.upload_path
-    up_id = find_upload_id(upload_path, project_id, token) if '/' in upload_path else upload_path
+    if args.resolved_upload_id:
+        up_id = upload_path
+    else:
+        up_id = find_upload_id(upload_path, project_id, token, args.parent_id)
     logging.info(f"Upload location ID: {up_id}")
     
     asset_id = upload_file(client, matched_file, up_id, url)

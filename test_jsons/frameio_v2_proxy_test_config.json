@@ -1,20 +1,21 @@
 {
-    "mode": "original",
+    "mode": "proxy",
     "provider": "frameio_v2",
     "proxy_directory": "/SDNA/PROXIES",
-    "logging_path": "logs/proxyUploaderEngine/frameIO",
-    "progress_path": "logs/proxyUploaderEngine/frameIO/progresses",
-    "thread_count": 2,
+    "logging_path": "logs/proxyUploaderEngine/frameIO/thread_sp",
+    "progress_path": "logs/proxyUploaderEngine/frameIO/thread_sp/progresses",
+    "thread_count": 3,
     "extensions": [
         ".mov",
-        ".mp4"
+        ".mp4",
+        ".mkv"
     ],
     "original_file_size_limit": 10,
     "upload_path": "SDNA-Test/7539-wasd-2456",
     "cloud_config_name": "sdna-frameio",
     "job_id": "vdfn-fdgd-fdgdf-sfsf",
     "upload_properties": true,
-    "files_list": "/mnt/SDNA/jobs/file_list.csv",
+    "files_list": "/home/darshan/Darshan/Dev/(python +node) Wrappers/proxyUploaderEngine/test/proxy_file_list.csv",
     "run_id": "run-1234",
     "repo_guid": "repo-5678"
 }
