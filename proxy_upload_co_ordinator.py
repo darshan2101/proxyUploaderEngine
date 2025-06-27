@@ -252,8 +252,11 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None):
         "generate_video_to_spritesheet"
     ]:
         file_name = os.path.basename(base_source_path)
-        name_wo_ext = os.path.splitext(file_name)[0]
-        proxy_ext = ".mp4" if "spritesheet" not in config["mode"] else ".png"
+        name_wo_ext, source_ext = os.path.splitext(file_name)
+        if "spritesheet" in config["mode"]:
+            proxy_ext = ".png"
+        else:
+            proxy_ext = source_ext
         proxy_output_path = os.path.join(config["proxy_output_base_path"], name_wo_ext + proxy_ext)
         try:
             generate_proxy_asset(config["mode"], base_source_path, proxy_output_path, config.get("proxy_extra_params", {}))
@@ -266,10 +269,12 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None):
         base_name = os.path.splitext(os.path.basename(base_source_path))[0]
         pattern = f"{base_name}*"
         resolved_path = resolve_proxy_file(config["proxy_directory"], pattern, config["extensions"])
-        if not resolved_path:
-            debug_print(config["logging_path"], f"Proxy not found for: {base_source_path}")
-            return None, base_source_path
-        source_path = resolved_path
+        if resolved_path:
+            source_path = resolved_path
+            debug_print(config["logging_path"], f"Using proxy file for upload: {resolved_path}")
+        else:
+            source_path = base_source_path
+            debug_print(config["logging_path"], f"[Fallback] Proxy not found. Uploading original file instead: {base_source_path}")
     else:
         source_path = base_source_path
 
@@ -450,7 +455,7 @@ def process_csv_and_upload(config, dry_run=False):
 
     send_progress(progressDetails, config["repo_guid"])
     resolved_ids = build_folder_id_map(records, config, config["logging_path"])
-
+    debug_print(config["logging_path"],f" Resolved ids directory ---------------------------> {resolved_ids}")
     with ThreadPoolExecutor(max_workers=config["thread_count"]) as executor:
         for record in records:
             executor.submit(upload_worker, record, config, resolved_ids, progressDetails, transferred_log, issues_log, client_log)
@@ -478,7 +483,7 @@ if __name__ == '__main__':
     required_keys = [
         "provider", "progress_path", "logging_path", "thread_count",
         "files_list", "cloud_config_name", "job_id",
-        "upload_path", "extensions", "mode", "run_id", "repo_guid"
+        "upload_path", "mode", "run_id", "repo_guid"
     ]
     optional_keys = ["proxy_output_base_path", "proxy_extra_params"]
 
@@ -487,8 +492,11 @@ if __name__ == '__main__':
     # Conditionally require proxy_directory and original_file_size_limit
     if mode == "proxy":
         required_keys.append("proxy_directory")
+        required_keys.append("extensions")
     if mode == "original":
         required_keys.append("original_file_size_limit")
+    if "generate" in mode:
+        required_keys.append("proxy_output_base_path")
 
     for key in required_keys:
         if key not in request_data:
