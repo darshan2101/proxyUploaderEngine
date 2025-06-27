@@ -8,7 +8,7 @@ import urllib.parse
 from configparser import ConfigParser
 
 # Constants
-VALID_MODES = ["proxy", "original", "buckets"]
+VALID_MODES = ["proxy", "original", "buckets", "get_base_target"]
 CHUNK_SIZE = 5 * 1024 * 1024 
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
@@ -132,8 +132,8 @@ def create_folder(config_data,folder_name,parent_id):
     response = response.json()
     return response['data']['id']
 
-def find_upload_id(upload_path, config_data):
-    current_parent_id = get_root_asset_id(config_data)
+def find_upload_id(upload_path, config_data, base_id = None):
+    current_parent_id = base_id or get_root_asset_id(config_data)
 
     folder_path = remove_file_name_from_path(upload_path)
     logging.info(f"Finding or creating folder path: '{folder_path}'")
@@ -176,7 +176,7 @@ def crete_asset(config_data,folder_id,file_path):
         return response.json()
     else:
         logging.error(f"Failed to create asset for file '{file_path}'. Status: {response.status_code}, Response: {response.text}")
-        print(f"Response error. Status - {response.status_code}, Error - {response.text}")
+        logging.debug(f"Response error. Status - {response.status_code}, Error - {response.text}")
         
 def upload_parts(file_path, asset_info):
     upload_urls = asset_info['data']['upload_urls']
@@ -187,7 +187,7 @@ def upload_parts(file_path, asset_info):
             part_size = part["size"]
             part_data = f.read(part_size)
             
-            print(f"Uploading part {i + 1} to {part_url[:80]}...")
+            logging.debug(f"Uploading part {i + 1} to {part_url[:80]}...")
             logging.info(f"Uploading part {i + 1}/{len(upload_urls)} of file '{file_path}' to Frame.io")
 
             response = requests.put(
@@ -197,10 +197,10 @@ def upload_parts(file_path, asset_info):
             )
 
             if response.status_code == 200:
-                print(f"Part {i + 1} uploaded successfully.")
+                logging.debug(f"Part {i + 1} uploaded successfully.")
                 logging.info(f"Successfully uploaded part {i + 1}")
             else:
-                print(f"Failed to upload part {i + 1}: {response.status_code} - {response.text}")
+                logging.debug(f"Failed to upload part {i + 1}: {response.status_code} - {response.text}")
                 logging.error(f"Failed to upload part {i + 1}: HTTP {response.status_code} - {response.text}")
                 break
 
@@ -211,7 +211,7 @@ if __name__ == '__main__':
     parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
     parser.add_argument("-j", "--jobId", help="Job Id of SDNA job")
     # parser.add_argument("-p", "--project-id", required=True, help="Project Id")
-    # parser.add_argument("-f", "--folder-id", required=True, help="Folder id")
+    parser.add_argument("--parent-id", help="Optional parent folder ID to resolve relative upload paths from")
     parser.add_argument("-cp", "--catalog-path", required=True, help="Path where catalog resides")
     parser.add_argument("-sp", "--source-path", required=True, help="Source path of file to look for original upload")
     parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
@@ -219,6 +219,8 @@ if __name__ == '__main__':
     parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")
+    parser.add_argument("--resolved-upload-id", action="store_true", help="Pass if upload path is already resolved ID")
+    
     args = parser.parse_args()
 
     setup_logging(args.log_level)
@@ -244,6 +246,24 @@ if __name__ == '__main__':
     
     project_id = cloud_config_data['project_id']
     logging.info(f"project Id ----------------------->{project_id}")
+    
+    if mode == "get_base_target":
+        upload_path = args.upload_path
+        if not upload_path:
+            logging.error("Upload path must be provided for get_base_target mode")
+            sys.exit(1)
+
+        logging.info(f"Fetching upload target ID for path: {upload_path}")
+        
+        if args.resolved_upload_id:
+            print(args.upload_path)
+            sys.exit(0)
+
+        logging.info(f"Fetching upload target ID for path: {upload_path}")
+        base_id = args.parent_id or None
+        up_id = find_upload_id(upload_path, cloud_config_data, base_id) if '/' in upload_path else upload_path
+        print(up_id)
+        sys.exit(0)
     
     if mode == 'buckets':
         asset_id = get_root_asset_id(cloud_config_data)
@@ -304,6 +324,11 @@ if __name__ == '__main__':
 
     logging.info(f"Starting upload process to Frame.io")
     upload_path = args.upload_path
+    
+    if args.resolved_upload_id:
+        folder_id = upload_path
+    else:
+        folder_id = find_upload_id(upload_path, cloud_config_data, args.parent_id)
 
     folder_id = find_upload_id(args.upload_path, cloud_config_data)
 

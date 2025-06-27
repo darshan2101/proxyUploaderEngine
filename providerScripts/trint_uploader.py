@@ -13,7 +13,7 @@ import plistlib
 from pathlib import Path
 
 # Constants
-VALID_MODES = ["proxy", "original"]
+VALID_MODES = ["proxy", "original", "get_base_target"]
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
@@ -125,7 +125,7 @@ def list_all_folders(config_data):
     return response.json()
 
 
-def get_folder_id(config_data, upload_path):
+def get_folder_id(config_data, upload_path, base_id = None):
     """
     Resolves or creates the folder hierarchy based on upload_path and returns the final folder ID.
     """
@@ -140,7 +140,7 @@ def get_folder_id(config_data, upload_path):
     folder_map = {folder["name"]: folder for folder in folders}
 
     # Try to find the deepest existing folder path
-    current_parent_id = None
+    current_parent_id = base_id
     current_path_parts = []
     matched_index = -1
 
@@ -227,6 +227,7 @@ if __name__ == '__main__':
     parser.add_argument("-m", "--mode", help="mode of Operation proxy or original upload")
     parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
     parser.add_argument("-j", "--jobId", help="Job Id of SDNA job")
+    parser.add_argument("--parent-id", help="Optional parent folder ID to resolve relative upload paths from")
     parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
     parser.add_argument("-sp", "--source-path", help="Source path of file to look for original upload")
     parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
@@ -234,6 +235,7 @@ if __name__ == '__main__':
     parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")
+    parser.add_argument("--resolved-upload-id", action="store_true", help="Pass if upload path is already resolved ID")
     args = parser.parse_args()
 
     setup_logging(args.log_level)
@@ -256,6 +258,24 @@ if __name__ == '__main__':
         sys.exit(1)
 
     cloud_config_data = cloud_config[cloud_config_name]
+        
+    if mode == "get_base_target":
+        upload_path = args.upload_path
+        if not upload_path:
+            logging.error("Upload path must be provided for get_base_target mode")
+            sys.exit(1)
+
+        logging.info(f"Fetching upload target ID for path: {upload_path}")
+        
+        if args.resolved_upload_id:
+            print(args.upload_path)
+            sys.exit(0)
+
+        logging.info(f"Fetching upload target ID for path: {upload_path}")
+        base_id = args.parent_id or None
+        up_id = get_folder_id(cloud_config_data, args.upload_path, base_id) if '/' in upload_path else upload_path
+        print(up_id)
+        sys.exit(0)
     
     logging.info(f"Starting Trint upload process in {mode} mode")
     logging.debug(f"Using cloud config: {cloud_config_path}")
@@ -304,10 +324,11 @@ if __name__ == '__main__':
     logging.info(f"Starting upload process to Trint")
     upload_path = args.upload_path
 
-    
-    # folder_id = create_folder(cloud_config_data, "Test2/v3")
-    folder_id = get_folder_id(cloud_config_data, args.upload_path)
-    print(f"Folder ID check -------------------------> {folder_id}")
+    if args.resolved_upload_id:
+        folder_id = upload_path
+    else:
+        folder_id = get_folder_id(cloud_config_data, args.upload_path)
+    logging.debug(f"Folder ID check -------------------------> {folder_id}")
 
     asset = create_asset(cloud_config_data, args.source_path, backlink_url, folder_id)    
     if asset and 'trintId' in asset:

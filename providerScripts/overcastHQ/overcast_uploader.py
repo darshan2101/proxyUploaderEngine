@@ -15,7 +15,7 @@ import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # Constants
-VALID_MODES = ["proxy", "original"]
+VALID_MODES = ["proxy", "original", "get_base_target"]
 CHUNK_SIZE = 5 * 1024 * 1024 
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
@@ -94,7 +94,7 @@ def create_folder(config_data, name, project_id, parent_id=None):
     }
     if parent_id is not None:
         payload["parent"] = parent_id
-    print(f"data payload (form-data) -------------------------> {payload}")
+    logging.debug(f"data payload (form-data) -------------------------> {payload}")
     response = requests.post(url, headers=headers, data=payload)
     logging.info(f"Response for folder creation: {response.text}")
 
@@ -111,7 +111,7 @@ def create_folder(config_data, name, project_id, parent_id=None):
         raise RuntimeError(f"Failed to create Folder: {response.status_code} {response.text}")
 
 def list_all_folders(config_data, project_id, parent_id):
-    print(f"parameter to get folder tree =================> {parent_id}")
+    logging.debug(f"parameter to get folder tree =================> {parent_id}")
     headers = { 'x-api-key': config_data["api_key"]}
     url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/folders"
     all_folders = []
@@ -133,9 +133,9 @@ def list_all_folders(config_data, project_id, parent_id):
     all_folders.extend(data['items'])
     return all_folders
 
-def get_folder_id(config_data, upload_path):
+def get_folder_id(config_data, upload_path, base_id = None):
     project_id = config_data['project_id']
-    current_parent_id = None
+    current_parent_id = base_id
 
     # Remove the filename from the upload_path
     folder_path = os.path.dirname(upload_path)
@@ -155,11 +155,11 @@ def get_folder_id(config_data, upload_path):
         else:
             current_parent_id = create_folder(config_data, segment, project_id, current_parent_id)
             logging.debug(f"Created folder '{segment}' (ID: {current_parent_id})")
-    print(f"UUID  after tree traversal/creation ---------------> {current_parent_id}")
+    logging.debug(f"UUID  after tree traversal/creation ---------------> {current_parent_id}")
     return current_parent_id
 
 def create_asset(config_data, project_id, folder_id, file_path):
-    print(f"Folder ID check 2-------------------------> {folder_id}")
+    logging.debug(f"Folder ID check 2-------------------------> {folder_id}")
     url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/assets"
 
     headers = {
@@ -176,7 +176,7 @@ def create_asset(config_data, project_id, folder_id, file_path):
     logging.debug(f"response from API: {response.text}")
     if response.status_code != 201:
         logging.error("failed to create asset")       
-        print(f"Response error. Status - {response.status_code}, Error - {response.text}")
+        logging.debug(f"Response error. Status - {response.status_code}, Error - {response.text}")
         exit(1)
     response = response.json()
     return response
@@ -222,7 +222,7 @@ def upload_file_to_s3(asset_res, config_data):
         logging.error("UploadId not found in S3 response: %s", res.text)
         raise RuntimeError("UploadId not found in S3 response")
     upload_id = upload_id_elem.text
-    print(upload_id)
+    logging.debug(upload_id)
     return upload_id
 
 def build_canonical_request(asset_res, d):
@@ -299,7 +299,7 @@ def get_sign(asset_res, d,string_to_sign, config_data):
     response = requests.get(url, headers=headers, params=params)
     logging.debug(f"Signing RESPONSE: {response.text}")
     if response.status_code != 200:
-        print(f"Signature request error: {response.status_code} {response.text}")
+        logging.debug(f"Signature request error: {response.status_code} {response.text}")
         exit(1)
     return response.text.strip()
 
@@ -319,7 +319,7 @@ def upload_part_to_s3(asset_res, part_number, upload_id, part_data, config_data)
     }
     response = requests.put(url, headers=headers, data=part_data)
     response.raise_for_status()
-    print(response.headers.get("ETag"))
+    logging.debug(response.headers.get("ETag"))
     return response.headers.get("ETag")
 
 
@@ -341,8 +341,8 @@ def complete_multipart_upload(asset_res, upload_id, etags, config_data):
     }
     response = requests.post(url, headers=headers, data=payload)
     response.raise_for_status()
-    print(response.status_code)
-    print(response.text)
+    logging.debug(response.status_code)
+    logging.debug(response.text)
 
 
 
@@ -407,7 +407,7 @@ def upload_metadata_to_asset(hostname, api_key, backlink_url, asset_id, properti
             response_json = response.json()
             logging.info(f"Added data successfully: {response_json}")
         else:
-            print(f"Response error. Status - {response.status_code}, Error - {response.text}")
+            logging.debug(f"Response error. Status - {response.status_code}, Error - {response.text}")
             logging.error("Failed to upload Metadata file: %s", response.text)
 
     logging.info("Asset metadata insertion completed")
@@ -420,6 +420,7 @@ if __name__ == '__main__':
     parser.add_argument("-m", "--mode", required=True, help="mode of Operation proxy or original upload")
     parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
     parser.add_argument("-j", "--jobId", help="Job Id of SDNA job")
+    parser.add_argument("--parent-id", help="Optional parent folder ID to resolve relative upload paths from")
     parser.add_argument("-cp", "--catalog-path", required=True, help="Path where catalog resides")
     parser.add_argument("-sp", "--source-path", required=True, help="Source path of file to look for original upload")
     parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
@@ -427,6 +428,7 @@ if __name__ == '__main__':
     parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")
+    parser.add_argument("--resolved-upload-id", action="store_true", help="Pass if upload path is already resolved ID")
     args = parser.parse_args()
 
     setup_logging(args.log_level)
@@ -451,7 +453,25 @@ if __name__ == '__main__':
     cloud_config_data = cloud_config[cloud_config_name]
 
     project_id = cloud_config_data['project_id']
-    print(f"Project id ----------------------->{project_id}")
+    logging.debug(f"Project id ----------------------->{project_id}")
+    
+    if mode == "get_base_target":
+        upload_path = args.upload_path
+        if not upload_path:
+            logging.error("Upload path must be provided for get_base_target mode")
+            sys.exit(1)
+
+        logging.info(f"Fetching upload target ID for path: {upload_path}")
+        
+        if args.resolved_upload_id:
+            print(args.upload_path)
+            sys.exit(0)
+
+        logging.info(f"Fetching upload target ID for path: {upload_path}")
+        base_id = args.parent_id or None
+        up_id = get_folder_id(upload_path, cloud_config_data, base_id) if '/' in upload_path else upload_path
+        print(up_id)
+        sys.exit(0)
 
     logging.info(f"Starting OvercastHQ upload process in {mode} mode")
     logging.debug(f"Using cloud config: {cloud_config_path}")
@@ -502,8 +522,11 @@ if __name__ == '__main__':
     logging.info(f"Starting upload process to Frame.io")
     upload_path = args.upload_path
 
-    folder_id = get_folder_id(cloud_config_data, upload_path)
-    print(f"Folder ID check -------------------------> {folder_id}")
+    if args.resolved_upload_id:
+        folder_id = upload_path
+    else:
+        folder_id = get_folder_id(cloud_config_data, upload_path)
+    logging.debug(f"Folder ID check -------------------------> {folder_id}")
 
     asset = create_asset(cloud_config_data, project_id, folder_id, args.source_path)
     asset_id = asset['result']['uuid']

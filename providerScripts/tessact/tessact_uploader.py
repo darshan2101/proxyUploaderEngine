@@ -13,7 +13,7 @@ import plistlib
 from pathlib import Path
 
 # Constants
-VALID_MODES = ["proxy", "original"]
+VALID_MODES = ["proxy", "original", "get_base_target"]
 CHUNK_SIZE = 5 * 1024 * 1024 
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
@@ -143,9 +143,9 @@ def list_all_folders(config_data, token, workspace_id, parent_id):
         params = None  # Only used on first call
     return all_folders
 
-def find_upload_id_tessact(upload_path, token, config_data):
+def find_upload_id_tessact(upload_path, token, config_data, base_id = None):
     workspace_id = config_data['workspace_id']
-    current_parent_id = None
+    current_parent_id = base_id
 
     folder_path = os.path.dirname(upload_path)
     logging.info(f"Finding or creating folder path: '{folder_path}'")
@@ -311,6 +311,7 @@ if __name__ == '__main__':
     parser.add_argument("-m", "--mode", required=True, help="mode of Operation proxy or original upload")
     parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
     parser.add_argument("-j", "--jobId", help="Job Id of SDNA job")
+    parser.add_argument("--parent-id", help="Optional parent folder ID to resolve relative upload paths from")    
     parser.add_argument("-cp", "--catalog-path", required=True, help="Path where catalog resides")
     parser.add_argument("-sp", "--source-path", required=True, help="Source path of file to look for original upload")
     parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
@@ -318,6 +319,7 @@ if __name__ == '__main__':
     parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")
+    parser.add_argument("--resolved-upload-id", action="store_true", help="Pass if upload path is already resolved ID")
     args = parser.parse_args()
 
     setup_logging(args.log_level)
@@ -342,7 +344,7 @@ if __name__ == '__main__':
     cloud_config_data = cloud_config[cloud_config_name]
 
     workspace_id = cloud_config_data['workspace_id']
-    print(f"Workspace Id ----------------------->{workspace_id}")
+    logging.debug(f"Workspace Id ----------------------->{workspace_id}")
 
     logging.info(f"Starting Tessact upload process in {mode} mode")
     logging.debug(f"Using cloud config: {cloud_config_path}")
@@ -354,6 +356,24 @@ if __name__ == '__main__':
     if not token:
         logging.error("Failed to get Token. Exiting.")
         sys.exit(1)
+        
+    if mode == "get_base_target":
+        upload_path = args.upload_path
+        if not upload_path:
+            logging.error("Upload path must be provided for get_base_target mode")
+            sys.exit(1)
+
+        logging.info(f"Fetching upload target ID for path: {upload_path}")
+        
+        if args.resolved_upload_id:
+            print(args.upload_path)
+            sys.exit(0)
+
+        logging.info(f"Fetching upload target ID for path: {upload_path}")
+        base_id = args.parent_id or None
+        up_id = find_upload_id_tessact(upload_path, token, cloud_config_data, base_id) if '/' in upload_path else upload_path
+        print(up_id)
+        sys.exit(0)
     
     matched_file = args.source_path
     catalog_path = args.catalog_path
@@ -397,11 +417,14 @@ if __name__ == '__main__':
     logging.info(f"Starting upload process to Frame.io")
     upload_path = args.upload_path
     
-    up_id = find_upload_id_tessact(upload_path, token,cloud_config_data)
-    logging.info(f"Upload location ID: {up_id}")
+    if args.resolved_upload_id:
+        folder_id = upload_path
+    else:
+        folder_id = find_upload_id_tessact(upload_path, token,cloud_config_data)
+    logging.info(f"Upload location ID: {folder_id}")
     
     # Initiate upload with chunks
-    upload_meta = initiate_upload(args.source_path, cloud_config_data, token, up_id)
+    upload_meta = initiate_upload(args.source_path, cloud_config_data, token, folder_id)
     if not upload_meta:
         logging.error("Failed to initiate upload. Exiting.")
         sys.exit(1)
@@ -428,7 +451,7 @@ if __name__ == '__main__':
         response = upload_metadata_to_asset(cloud_config_data['base_url'] ,token, backlink_url, file_id, meta_file)
         if response is not None:
             parsed = response
-            print(json.dumps(parsed, indent=4))
+            logging.debug(json.dumps(parsed, indent=4))
         else:
             logging.error("Failed to upload metadata or no response received.")
 
