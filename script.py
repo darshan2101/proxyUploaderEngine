@@ -15,6 +15,7 @@ from pathlib import Path
 # Debug configuration
 DEBUG_PRINT = True
 DEBUG_TO_FILE = True
+PROVIDERS_SUPPORTING_GET_BASE_TARGET = {"frameio_v2", "frameio_v4", "tessact", "overcast", "trint"}
 
 # Mapping provider names to their respective upload scripts
 PROVIDER_SCRIPTS = {
@@ -26,6 +27,26 @@ PROVIDER_SCRIPTS = {
     "trint": "providerScripts/trint/trint_uploder.py",
     "twelvelabs": "providerScripts/twelvelabs/twelvelab_uploader.py"
 }
+
+# class UploadPathResolver:
+#     def __init__(self, script_path, cloud_config_name):
+#         self.script_path = script_path
+#         self.cloud_config_name = cloud_config_name
+#         self.cache = {}
+#         self.lock = threading.Lock()
+
+#     def get_or_resolve(self, upload_path):
+#         with self.lock:
+#             if upload_path in self.cache:
+#                 return self.cache[upload_path]
+
+#             resolved_id = resolve_base_upload_id(
+#                 self.script_path,
+#                 self.cloud_config_name,
+#                 upload_path
+#             )
+#             self.cache[upload_path] = resolved_id
+#             return resolved_id
 
 def debug_print(log_path, text_string):
     current_datetime = datetime.now()
@@ -74,6 +95,27 @@ def send_progress(progressDetails, request_id):
     os.makedirs(os.path.dirname(progress_path), exist_ok=True)
     with open(progress_path, "w") as file:
         file.write(xml_str)
+
+# get base upload path's id to optimize upload progress
+def resolve_base_upload_id(script_path, cloud_config_name, upload_path, parent_id=None):
+    try:
+        cmd = [
+            "python3", script_path,
+            "--mode", "get_base_target",
+            "--config-name", cloud_config_name,
+            "--upload-path", upload_path
+        ]
+        if parent_id:
+            cmd.extend(["--parent-id", parent_id])
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return upload_path  # fallback
+        resolved_id = result.stdout.strip()
+        if resolved_id:
+            return resolved_id
+        return upload_path
+    except Exception as e:
+        return upload_path
 
 # Locates proxy file by filename pattern and extension inside a directory tree
 def resolve_proxy_file(directory, pattern, extensions):
@@ -191,17 +233,18 @@ def generate_proxy_asset(config_mode, input_path, output_path, extra_params, gen
         raise RuntimeError(f"Proxy generation failed: {e}")
 
 # Launches the provider script with file arguments
-def upload_asset(record, config, dry_run=False):
+def upload_asset(record, config, dry_run=False, upload_path_id=None):
     original_source_path, catalog_path, metadata_path = record
-    print(f"[INFO] Processing record: {record}")
+
     if "/./" in original_source_path:
         prefix, sub_path = original_source_path.split("/./", 1)
         base_source_path = os.path.join(prefix, sub_path)
-        upload_path = os.path.join(config["upload_path"], sub_path)
+        full_upload_path = os.path.join(config["upload_path"], sub_path)
     else:
         base_source_path = original_source_path
-        upload_path = config["upload_path"]
+        full_upload_path = config["upload_path"]
 
+    # Proxy/derivative asset generation logic
     if config["mode"] in [
         "generate_video_proxy",
         "generate_video_frame_proxy",
@@ -230,6 +273,12 @@ def upload_asset(record, config, dry_run=False):
     else:
         source_path = base_source_path
 
+    # Use the resolved upload path ID if provided, otherwise fallback
+    if upload_path_id:
+        upload_path = upload_path_id
+    else:
+        upload_path = full_upload_path
+
     cmd = [
         "python3", config["script_path"],
         "--mode", config["mode"],
@@ -240,21 +289,19 @@ def upload_asset(record, config, dry_run=False):
         "--jobId", config["job_id"],
         "--log-level", "debug"
     ]
+
     if config["mode"] == "original":
-        cmd.extend(["--size-limit", str(config["original_file_size_limit"])]) 
+        cmd.extend(["--size-limit", str(config["original_file_size_limit"])])
     if metadata_path:
         cmd.extend(["--metadata-file", metadata_path])
     if dry_run:
         cmd.append("--dry-run")
-    # if config['provider'] == "overcasthq":
-    #     project_id = config.get("project_id")
-    #     folder_id = config.get("folder_id")
-    #     if project_id:
-    #         cmd.extend(["-p", project_id])
-    #     if folder_id:
-    #         cmd.extend(["-f", folder_id])
-        
-    print(f" Command block copy ---------------------> {cmd}")
+
+    # Only add --resolved-upload-id if upload_path_id is used (i.e., it's an ID)
+    if upload_path_id:
+        cmd.append("--resolved-upload-id")
+
+    debug_print(config['logging_path'],f"Command block copy ---------------------> {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result, source_path
 
@@ -263,16 +310,41 @@ def write_csv_row(file_path, row):
         writer = csv.writer(f)
         writer.writerow(row)
 
-# Reads input CSV fileList, calculates size, triggers parallel upload
-def process_csv_and_upload(config, dry_run=False):
+def setup_log_and_progress_paths(config):
+    job_time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    config["logging_path"] = os.path.join(config["logging_path"], f"{job_time_str}_{config['mode']}_log.txt")
+    config["progress_path"] = os.path.join(config["progress_path"], f"{job_time_str}_{config['mode']}_progress.xml")
+    os.makedirs(os.path.dirname(config["logging_path"]), exist_ok=True)
+    os.makedirs(os.path.dirname(config["progress_path"]), exist_ok=True)
+
+def prepare_log_files(config):
+    log_prefix = config.get("log_prefix")
+    if not log_prefix:
+        return None, None, None
+
+    debug_print(config['logging_path'], f"[STEP] Preparing log files with prefix: {log_prefix}")
+    os.makedirs(os.path.dirname(log_prefix), exist_ok=True)
+    transferred_log = f"{log_prefix}-uploader-transferred.csv"
+    issues_log = f"{log_prefix}-uploader-issues.csv"
+    client_log = f"{log_prefix}-uploader-client.csv"
+    
+    for log in [transferred_log, issues_log, client_log]:
+        with open(log, "w", newline="") as f:
+            csv.writer(f).writerow(["Status","Filename", "Size", "Detail"] if "issues" not in log else ["Status", "Filename","Timestamp", "Issue"])
+    return transferred_log, issues_log, client_log
+
+def read_csv_records(csv_path, logging_path):
+    debug_print(logging_path, "[STEP] Reading records from CSV...")
     records = []
-    with open(config["files_list"], 'r') as f:
+    with open(csv_path, 'r') as f:
         reader = csv.reader(f, delimiter='|')
         for row in reader:
             if len(row) == 3:
                 records.append(tuple(row))
+    debug_print(logging_path, f"[STEP] Total records loaded: {len(records)}")
+    return records
 
-    total_files = len(records)
+def calculate_total_size(records, config):
     total_size = 0
     for r in records:
         if "/./" in r[0]:
@@ -280,6 +352,7 @@ def process_csv_and_upload(config, dry_run=False):
             full_path = os.path.join(r[0].split("/./")[0], src)
         else:
             full_path = r[0]
+
         if config["mode"] == "proxy":
             base_name = os.path.splitext(os.path.basename(full_path))[0]
             pattern = f"{base_name}*"
@@ -289,31 +362,86 @@ def process_csv_and_upload(config, dry_run=False):
         elif os.path.exists(full_path):
             total_size += os.path.getsize(full_path)
 
-    job_time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    config["logging_path"] = os.path.join(config["logging_path"], f"{job_time_str}_{config['mode']}_log.txt")
-    config["progress_path"] = os.path.join(config["progress_path"], f"{job_time_str}_{config['mode']}_progress.xml")
+    debug_print(config['logging_path'], f"[STEP] Total size to upload: {total_size} bytes")
+    return total_size
 
-    log_prefix = config.get("log_prefix")
-    if log_prefix:
-        os.makedirs(os.path.dirname(log_prefix), exist_ok=True)
-        transferred_log = f"{log_prefix}-uploader-transferred.csv"
-        issues_log = f"{log_prefix}-uploader-issues.csv"
-        client_log = f"{log_prefix}-uploader-client.csv"
-        for log in [transferred_log, issues_log, client_log]:
-            with open(log, "w", newline="") as f:
-                csv.writer(f).writerow(["Status","Filename", "Size", "Detail"] if "issues" not in log else ["Status", "Filename","Timestamp", "Issue"])
-    else:
-        transferred_log = issues_log = client_log = None
+def build_folder_id_map(records, config, logging_path):
+    resolved_ids = {}
+    base_upload_path = config["upload_path"]
+    debug_print(logging_path, f"[STEP] Resolving base upload path: {base_upload_path}")
+    base_id = resolve_base_upload_id(config["script_path"], config["cloud_config_name"], base_upload_path)
+    resolved_ids[base_upload_path] = base_id
 
-    os.makedirs(os.path.dirname(config["logging_path"]), exist_ok=True)
-    os.makedirs(os.path.dirname(config["progress_path"]), exist_ok=True)
+    for record in records:
+        original_source_path = record[0]
+        if "/./" in original_source_path:
+            _, sub_path = original_source_path.split("/./", 1)
+            path_segments = [seg for seg in sub_path.split(os.sep) if seg]
+            current_path = base_upload_path
+            current_id = base_id
+
+            for idx, segment in enumerate(path_segments):
+                if idx < len(path_segments) - 1:
+                    next_path = os.path.join(current_path, segment)
+                    if next_path not in resolved_ids:
+                        debug_print(logging_path, f"[STEP] Resolving segment: {segment} under {current_path}")
+                        resolved_id = resolve_base_upload_id(
+                            config["script_path"],
+                            config["cloud_config_name"],
+                            f"/{segment}",
+                            parent_id=current_id
+                        )
+                        resolved_ids[next_path] = resolved_id
+                    current_path = next_path
+                    current_id = resolved_ids[next_path]
+    return resolved_ids
+
+def upload_worker(record, config, resolved_ids, progressDetails, transferred_log, issues_log, client_log):
+    try:
+        debug_print(config['logging_path'], f"[STEP] Processing record: {record}")
+        original_source_path, catalog_path, metadata_path = record
+        if "/./" in original_source_path:
+            _, sub_path = original_source_path.split("/./", 1)
+            dir_path = os.path.dirname(sub_path)
+            parent_folder_rel_path = os.path.join(config["upload_path"], dir_path)
+        else:
+            parent_folder_rel_path = config["upload_path"]
+        
+        upload_path_id = resolved_ids.get(parent_folder_rel_path, resolved_ids[config["upload_path"]])
+        debug_print(config['logging_path'], f"[PATH-MATCH] {parent_folder_rel_path} -> using ID {upload_path_id}")
+
+        result, resolved_path = upload_asset(record, config, config.get("dry_run", False), upload_path_id)
+    
+        progressDetails["processedFiles"] += 1
+        if result and result.returncode == 0:
+            file_size = os.path.getsize(resolved_path) if os.path.exists(resolved_path) else 0
+            debug_print(config["logging_path"], f"Upload success: {resolved_path} ({file_size} bytes)")
+            if transferred_log:
+                write_csv_row(transferred_log, ["Success", resolved_path, file_size, ""])
+            if client_log:
+                write_csv_row(client_log, ["Success", resolved_path, file_size, "Client"])
+        else:
+            debug_print(config["logging_path"], f"Upload failed: {resolved_path}\n{result.stderr if result else 'No result'}")
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            stderr_cleaned = result.stderr.replace("\n", " ").replace("\r", " ").strip() if result and result.stderr else "No result"
+            write_csv_row(issues_log, ["Error", resolved_path, timestamp, stderr_cleaned])
+    except Exception as e:
+        debug_print(config['logging_path'], f"[ERROR] upload_asset() failed: {e}")
+    send_progress(progressDetails, config["repo_guid"])
+
+def process_csv_and_upload(config, dry_run=False):
+    config["dry_run"] = dry_run
+    setup_log_and_progress_paths(config)
+    transferred_log, issues_log, client_log = prepare_log_files(config)
+    records = read_csv_records(config["files_list"], config["logging_path"])
+    total_size = calculate_total_size(records, config)
 
     progressDetails = {
         "run_id": config["run_id"],
         "job_id": config["job_id"],
         "progress_path": config["progress_path"],
         "duration": int(time.time()),
-        "totalFiles": total_files,
+        "totalFiles": len(records),
         "totalSize": total_size,
         "processedFiles": 0,
         "processedBytes": 0,
@@ -321,38 +449,16 @@ def process_csv_and_upload(config, dry_run=False):
     }
 
     send_progress(progressDetails, config["repo_guid"])
-
-    def task(record):
-        try:
-            result, resolved_path = upload_asset(record, config, dry_run)
-        except Exception as e:
-            print(f"[ERROR] upload_asset() failed: {e}")
-            return
-        progressDetails["processedFiles"] += 1
-        if result and result.returncode == 0:
-            file_size = os.path.getsize(resolved_path) if os.path.exists(resolved_path) else 0
-            progressDetails["processedBytes"] += file_size
-            debug_print(config["logging_path"], f"Upload success: {resolved_path} ({file_size} bytes)")
-            if transferred_log:
-                write_csv_row(transferred_log, ["Success" ,resolved_path, file_size, ""])
-            if client_log:
-                write_csv_row(client_log, ["Success", resolved_path, file_size, "Client"])
-        else:
-            debug_print(config["logging_path"], f"Upload failed: {resolved_path}\n{result.stderr if result else 'No result'}")
-            if issues_log:
-                stderr_cleaned = result.stderr.replace("\n", " ").replace("\r", " ").strip() if result and result.stderr else "No result"
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                write_csv_row(issues_log, ["Error", resolved_path, timestamp, stderr_cleaned])
-            else:
-                write_csv_row(issues_log, ["Error", resolved_path, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "No result"])
-        send_progress(progressDetails, config["repo_guid"])
+    resolved_ids = build_folder_id_map(records, config, config["logging_path"])
 
     with ThreadPoolExecutor(max_workers=config["thread_count"]) as executor:
-        executor.map(task, records)
+        for record in records:
+            executor.submit(upload_worker, record, config, resolved_ids, progressDetails, transferred_log, issues_log, client_log)
 
     progressDetails["status"] = "complete"
     send_progress(progressDetails, config["repo_guid"])
-
+    
+    
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Uploader Script Backup")
     parser.add_argument("-c","--json-path", help="Path to JSON config file")
@@ -400,9 +506,10 @@ if __name__ == '__main__':
         print(f"No script path found for provider: {provider}")
         sys.exit(1)
 
-    request_data["script_path"] = os.path.join(
+    full_script_path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), script_path
     )
+    request_data["script_path"] = full_script_path
 
     process_csv_and_upload(request_data, args.dry_run)
     sys.exit(0)
