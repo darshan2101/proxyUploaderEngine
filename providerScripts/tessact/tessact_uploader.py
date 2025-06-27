@@ -147,10 +147,9 @@ def find_upload_id_tessact(upload_path, token, config_data, base_id = None):
     workspace_id = config_data['workspace_id']
     current_parent_id = base_id
 
-    folder_path = os.path.dirname(upload_path)
-    logging.info(f"Finding or creating folder path: '{folder_path}'")
+    logging.info(f"Finding or creating folder path: '{upload_path}'")
 
-    for segment in folder_path.strip("/").split("/"):
+    for segment in upload_path.strip("/").split("/"):
         logging.debug(f"Looking for folder '{segment}' under parent '{current_parent_id}'")
 
         folders = list_all_folders(config_data, token, workspace_id, current_parent_id)
@@ -312,10 +311,10 @@ if __name__ == '__main__':
     parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
     parser.add_argument("-j", "--jobId", help="Job Id of SDNA job")
     parser.add_argument("--parent-id", help="Optional parent folder ID to resolve relative upload paths from")    
-    parser.add_argument("-cp", "--catalog-path", required=True, help="Path where catalog resides")
-    parser.add_argument("-sp", "--source-path", required=True, help="Source path of file to look for original upload")
+    parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
+    parser.add_argument("-sp", "--source-path", help="Source path of file to look for original upload")
     parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
-    parser.add_argument("-up", "--upload-path", required=True, help="Path where file will be uploaded to frameIO")
+    parser.add_argument("-up", "--upload-path", required=True, help="Path where file will be uploaded to tessact")
     parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")
@@ -406,7 +405,7 @@ if __name__ == '__main__':
     if args.dry_run:
         logging.info("[DRY RUN] Upload skipped.")
         logging.info(f"[DRY RUN] File to upload: {matched_file}")
-        logging.info(f"[DRY RUN] Upload path: {args.upload_path} => Frame.io")
+        logging.info(f"[DRY RUN] Upload path: {args.upload_path} => Tessact")
         meta_file = args.metadata_file
         if meta_file:
             logging.info(f"[DRY RUN] Metadata would be applied from: {meta_file}")
@@ -414,7 +413,7 @@ if __name__ == '__main__':
             logging.warning("[DRY RUN] Metadata upload enabled but no metadata file specified.")
         sys.exit(0)
 
-    logging.info(f"Starting upload process to Frame.io")
+    logging.info(f"Starting upload process to Tessact")
     upload_path = args.upload_path
     
     if args.resolved_upload_id:

@@ -16,13 +16,5 @@
     "upload_properties": true,
     "files_list": "/mnt/SDNA/jobs/file_list.csv",
     "runId": "run-1234",
-    "repo_guid": "repo-5678",
-    "proxy_output_base_path": "/SDNA/generatedProxies",
-    "proxy_extra_params": {
-        "proxy_params": "-c:v libx264 -crf 25 -pix_fmt yuv420p -c:a aac -b:a 128k",
-        "frame_formate": "jpg",
-        "frame_params": "-vf fps=1/2",
-        "tile_layout": "10x10",
-        "image_geometry": "200x200+10+10"
-    }
+    "repo_guid": "repo-5678"
 }

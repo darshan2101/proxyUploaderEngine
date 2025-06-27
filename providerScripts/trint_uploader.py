@@ -130,7 +130,7 @@ def get_folder_id(config_data, upload_path, base_id = None):
     Resolves or creates the folder hierarchy based on upload_path and returns the final folder ID.
     """
     # Strip filename and leading/trailing slashes
-    folder_path = os.path.dirname(upload_path).strip("/")
+    folder_path = upload_path.strip("/")
     folder_parts = folder_path.split("/")
 
     # Fetch all existing folders
@@ -231,7 +231,7 @@ if __name__ == '__main__':
     parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
     parser.add_argument("-sp", "--source-path", help="Source path of file to look for original upload")
     parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
-    parser.add_argument("-up", "--upload-path", help="Path where file will be uploaded to Trint")
+    parser.add_argument("-up", "--upload-path", required=True, help="Path where file will be uploaded to Trint")
     parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")

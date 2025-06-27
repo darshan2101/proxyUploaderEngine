@@ -138,7 +138,7 @@ def get_folder_id(config_data, upload_path, base_id = None):
     current_parent_id = base_id
 
     # Remove the filename from the upload_path
-    folder_path = os.path.dirname(upload_path)
+    folder_path = upload_path
     logging.info(f"Finding or creating folder path: '{folder_path}'")
 
     for segment in folder_path.strip("/").split("/"):
@@ -421,8 +421,8 @@ if __name__ == '__main__':
     parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
     parser.add_argument("-j", "--jobId", help="Job Id of SDNA job")
     parser.add_argument("--parent-id", help="Optional parent folder ID to resolve relative upload paths from")
-    parser.add_argument("-cp", "--catalog-path", required=True, help="Path where catalog resides")
-    parser.add_argument("-sp", "--source-path", required=True, help="Source path of file to look for original upload")
+    parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
+    parser.add_argument("-sp", "--source-path", help="Source path of file to look for original upload")
     parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
     parser.add_argument("-up", "--upload-path", required=True, help="Path where file will be uploaded to frameIO")
     parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
