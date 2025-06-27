@@ -10,7 +10,7 @@ from twelvelabs import TwelveLabs
 from twelvelabs.models.task import Task
 
 # Constants
-VALID_MODES = ["proxy", "original"]
+VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet"]
 CHUNK_SIZE = 5 * 1024 * 1024 
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"

@@ -260,7 +260,8 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None):
         proxy_output_path = os.path.join(config["proxy_output_base_path"], name_wo_ext + proxy_ext)
         try:
             generate_proxy_asset(config["mode"], base_source_path, proxy_output_path, config.get("proxy_extra_params", {}))
-            base_source_path = proxy_output_path
+            # Always return proxy_output_path as source_path for uploader
+            return None, proxy_output_path
         except Exception as e:
             debug_print(config["logging_path"], str(e))
             return None, base_source_path
@@ -497,6 +498,8 @@ if __name__ == '__main__':
         required_keys.append("original_file_size_limit")
     if "generate" in mode:
         required_keys.append("proxy_output_base_path")
+        os.makedirs(request_data.get("proxy_output_base_path"), exist_ok=True)  # ✅ Ensure target dir exists
+
 
     for key in required_keys:
         if key not in request_data:
