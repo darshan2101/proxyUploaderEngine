@@ -289,6 +289,6 @@ if __name__ == '__main__':
         logging.info("Applying metadata to uploaded asset...")
         response = update_asset(token, asset_id, meta_file)
         parsed = response.json()
-        print(json.dumps(parsed, indent=4))
+        logging.debug(json.dumps(parsed, indent=4))
 
     sys.exit(0)
