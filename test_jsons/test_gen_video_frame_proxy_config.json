@@ -1,5 +1,5 @@
 {
-    "mode": "generate_intelligence_proxy",
+    "mode": "generate_video_frame_proxy",
     "provider": "tessact",
     "logging_path": "logs/proxyUploaderEngine/tessact/gen_inteligent_proxy",
     "progress_path": "logs/proxyUploaderEngine/tessact/gen_inteligent_proxy/progresses",
@@ -10,5 +10,10 @@
     "files_list": "/home/darshan/Darshan/Dev/(python +node) Wrappers/proxyUploaderEngine/test/int_proxy_gen_file_list.csv",
     "run_id": "run-1234",
     "repo_guid": "repo-5678",
-    "proxy_output_base_path": "/home/darshan/Darshan/lambda/SDNA/generatedProxies"
+    "proxy_output_base_path": "/home/darshan/Darshan/lambda/SDNA/generatedProxies",
+    "proxy_extra_params": {
+        "frame_params": "-vf fps=1/2",
+        "frame_formate": "jpg",
+        "proxy_params": "-framerate 60 -s:v 1920x1080 -c:v libx264 -pix_fmt yuv420p"
+    }
 }

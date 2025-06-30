@@ -97,7 +97,7 @@ def send_progress(progressDetails, request_id):
         file.write(xml_str)
 
 # get base upload path's id to optimize upload progress
-def resolve_base_upload_id(script_path, cloud_config_name, upload_path, parent_id=None):
+def resolve_base_upload_id(logging_path,script_path, cloud_config_name, upload_path, parent_id=None):
     try:
         cmd = [
             "python3", script_path,
@@ -107,6 +107,7 @@ def resolve_base_upload_id(script_path, cloud_config_name, upload_path, parent_i
         ]
         if parent_id:
             cmd.extend(["--parent-id", parent_id])
+        debug_print(logging_path, f"Command block copy for resolve folder ---------------------> {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             return upload_path  # fallback
@@ -184,7 +185,7 @@ def build_payload_for_proxy_mode(mode, input_path, output_path, config_params):
 
 # generate proxy asset according to options
 def generate_proxy_asset(config_mode, input_path, output_path, extra_params, generator_tool = "ffmpeg"):
-    base_url = f"http://127.0.0.1/{generator_tool}/"
+    base_url = f"http://127.0.0.1:8000/{generator_tool}/"
     mode_url_map = {
         "generate_video_proxy": "generate_video_proxy",
         "generate_video_frame_proxy": "generate_video_frame_proxy",
@@ -208,7 +209,7 @@ def generate_proxy_asset(config_mode, input_path, output_path, extra_params, gen
             raise Exception("No jobid returned from proxy generation call")
 
         # Poll job status
-        job_status_url = f"http://127.0.0.1/job_details/{jobid}"
+        job_status_url = f"http://127.0.0.1:8000/job_details/{jobid}"
         start_time = time.time()
         timeout = 600  # 10 minutes
         poll_interval = 3
@@ -233,7 +234,7 @@ def generate_proxy_asset(config_mode, input_path, output_path, extra_params, gen
         raise RuntimeError(f"Proxy generation failed: {e}")
 
 # Launches the provider script with file arguments
-def upload_asset(record, config, dry_run=False, upload_path_id=None):
+def upload_asset(record, config, dry_run=False, upload_path_id=None, override_source_path=None):
     original_source_path, catalog_path, metadata_path = record
 
     if "/./" in original_source_path:
@@ -244,34 +245,22 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None):
         base_source_path = original_source_path
         full_upload_path = config["upload_path"]
 
-    # Proxy/derivative asset generation logic
-    if config["mode"] in [
-        "generate_video_proxy",
-        "generate_video_frame_proxy",
-        "generate_intelligence_proxy",
-        "generate_video_to_spritesheet"
-    ]:
-        file_name = os.path.basename(base_source_path)
-        name_wo_ext = os.path.splitext(file_name)[0]
-        proxy_ext = ".mp4" if "spritesheet" not in config["mode"] else ".png"
-        proxy_output_path = os.path.join(config["proxy_output_base_path"], name_wo_ext + proxy_ext)
-        try:
-            generate_proxy_asset(config["mode"], base_source_path, proxy_output_path, config.get("proxy_extra_params", {}))
-            base_source_path = proxy_output_path
-        except Exception as e:
-            debug_print(config["logging_path"], str(e))
-            return None, base_source_path
+    # Use override_source_path if provided (for generated proxies)
+    source_path = override_source_path if override_source_path else base_source_path
 
+    # Proxy mode: resolve proxy file if needed
     if config["mode"] == "proxy":
         base_name = os.path.splitext(os.path.basename(base_source_path))[0]
         pattern = f"{base_name}*"
         resolved_path = resolve_proxy_file(config["proxy_directory"], pattern, config["extensions"])
-        if not resolved_path:
-            debug_print(config["logging_path"], f"Proxy not found for: {base_source_path}")
-            return None, base_source_path
-        source_path = resolved_path
-    else:
-        source_path = base_source_path
+        if resolved_path:
+            source_path = resolved_path
+            debug_print(config["logging_path"], f"Using proxy file for upload: {resolved_path}")
+        else:
+            source_path = base_source_path
+            debug_print(config["logging_path"], f"[Fallback] Proxy not found. Uploading original file instead: {base_source_path}")
+    # else:
+    #     source_path = base_source_path
 
     # Use the resolved upload path ID if provided, otherwise fallback
     if upload_path_id:
@@ -305,6 +294,7 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None):
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result, source_path
 
+# csv row writer helpeer
 def write_csv_row(file_path, row):
     with open(file_path, mode="a", newline="") as f:
         writer = csv.writer(f)
@@ -369,7 +359,7 @@ def build_folder_id_map(records, config, logging_path):
     resolved_ids = {}
     base_upload_path = config["upload_path"]
     debug_print(logging_path, f"[STEP] Resolving base upload path: {base_upload_path}")
-    base_id = resolve_base_upload_id(config["script_path"], config["cloud_config_name"], base_upload_path)
+    base_id = resolve_base_upload_id(config["logging_path"],config["script_path"], config["cloud_config_name"], base_upload_path)
     resolved_ids[base_upload_path] = base_id
 
     for record in records:
@@ -386,6 +376,7 @@ def build_folder_id_map(records, config, logging_path):
                     if next_path not in resolved_ids:
                         debug_print(logging_path, f"[STEP] Resolving segment: {segment} under {current_path}")
                         resolved_id = resolve_base_upload_id(
+                            config["logging_path"],
                             config["script_path"],
                             config["cloud_config_name"],
                             f"/{segment}",
@@ -410,7 +401,37 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
         upload_path_id = resolved_ids.get(parent_folder_rel_path, resolved_ids[config["upload_path"]])
         debug_print(config['logging_path'], f"[PATH-MATCH] {parent_folder_rel_path} -> using ID {upload_path_id}")
 
-        result, resolved_path = upload_asset(record, config, config.get("dry_run", False), upload_path_id)
+        # --- Proxy/derivative asset generation logic moved here ---
+        override_source_path = None
+        if config["mode"] in [
+            "generate_video_proxy",
+            "generate_video_frame_proxy",
+            "generate_intelligence_proxy",
+            "generate_video_to_spritesheet"
+        ]:
+            if "/./" in original_source_path:
+                prefix, sub_path = original_source_path.split("/./", 1)
+                base_source_path = os.path.join(prefix, sub_path)
+            else:
+                base_source_path = original_source_path
+
+            file_name = os.path.basename(base_source_path)
+            name_wo_ext, source_ext = os.path.splitext(file_name)
+            proxy_ext = ".png" if "spritesheet" in config["mode"] else source_ext
+            proxy_output_path = os.path.join(config["proxy_output_base_path"], name_wo_ext + proxy_ext)
+            try:
+                generate_proxy_asset(config["mode"], base_source_path, proxy_output_path, config.get("proxy_extra_params", {}))
+                override_source_path = proxy_output_path
+            except Exception as e:
+                debug_print(config["logging_path"], f"[ERROR] Proxy generation failed: {e}")
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                write_csv_row(issues_log, ["Error", base_source_path, timestamp, f"Proxy generation failed: {e}"])
+                send_progress(progressDetails, config["repo_guid"])
+                return
+
+        result, resolved_path = upload_asset(
+            record, config, config.get("dry_run", False), upload_path_id, override_source_path=override_source_path
+        )
     
         progressDetails["processedFiles"] += 1
         if result and result.returncode == 0:
@@ -450,7 +471,7 @@ def process_csv_and_upload(config, dry_run=False):
 
     send_progress(progressDetails, config["repo_guid"])
     resolved_ids = build_folder_id_map(records, config, config["logging_path"])
-
+    debug_print(config["logging_path"],f" Resolved ids directory ---------------------------> {resolved_ids}")
     with ThreadPoolExecutor(max_workers=config["thread_count"]) as executor:
         for record in records:
             executor.submit(upload_worker, record, config, resolved_ids, progressDetails, transferred_log, issues_log, client_log)
@@ -478,7 +499,7 @@ if __name__ == '__main__':
     required_keys = [
         "provider", "progress_path", "logging_path", "thread_count",
         "files_list", "cloud_config_name", "job_id",
-        "upload_path", "extensions", "mode", "run_id", "repo_guid"
+        "upload_path", "mode", "run_id", "repo_guid"
     ]
     optional_keys = ["proxy_output_base_path", "proxy_extra_params"]
 
@@ -487,8 +508,13 @@ if __name__ == '__main__':
     # Conditionally require proxy_directory and original_file_size_limit
     if mode == "proxy":
         required_keys.append("proxy_directory")
+        required_keys.append("extensions")
     if mode == "original":
         required_keys.append("original_file_size_limit")
+    if "generate" in mode:
+        required_keys.append("proxy_output_base_path")
+        os.makedirs(request_data.get("proxy_output_base_path"), exist_ok=True)  # Ensuring target dir exists
+
 
     for key in required_keys:
         if key not in request_data:

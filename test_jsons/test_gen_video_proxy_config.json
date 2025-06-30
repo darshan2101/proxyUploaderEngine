@@ -1,0 +1,17 @@
+{
+    "mode": "generate_video_proxy",
+    "provider": "frameio_v2",
+    "logging_path": "logs/proxyUploaderEngine/frameio/gen_inteligent_proxy",
+    "progress_path": "logs/proxyUploaderEngine/frameio/gen_inteligent_proxy/progresses",
+    "thread_count": 3,
+    "upload_path": "Hello_World/eszqsx-tgbygv/gen_int_proxies",
+    "cloud_config_name": "sdna-frameio",
+    "job_id": "vdfn-fdgd-fdgdf-sfsf",
+    "files_list": "/home/darshan/Darshan/Dev/(python +node) Wrappers/proxyUploaderEngine/test/int_proxy_gen_file_list.csv",
+    "run_id": "run-1234",
+    "repo_guid": "repo-5678",
+    "proxy_output_base_path": "/home/darshan/Darshan/lambda/SDNA/generatedProxies/manual/",
+    "proxy_extra_params": {
+        "proxy_params": "-c:v libx264 -crf 25 -pix_fmt yuv420p -c:a aac -b:a 128k"
+    }
+}
