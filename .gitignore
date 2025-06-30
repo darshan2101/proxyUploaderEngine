@@ -1,5 +1,7 @@
+.venv
 extra
 logs
+Demo
 csv_logs
 proxyUploaderScripts
 providerScripts/framIO/test/
