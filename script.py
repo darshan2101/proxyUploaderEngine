@@ -15,6 +15,8 @@ from pathlib import Path
 # Debug configuration
 DEBUG_PRINT = True
 DEBUG_TO_FILE = True
+
+PROXY_GENERATION_HOST = "http://127.0.0.1:8000"
 PROVIDERS_SUPPORTING_GET_BASE_TARGET = {"frameio_v2", "frameio_v4", "tessact", "overcast", "trint"}
 
 # Mapping provider names to their respective upload scripts
@@ -27,26 +29,6 @@ PROVIDER_SCRIPTS = {
     "trint": "providerScripts/trint/trint_uploder.py",
     "twelvelabs": "providerScripts/twelvelabs/twelvelab_uploader.py"
 }
-
-# class UploadPathResolver:
-#     def __init__(self, script_path, cloud_config_name):
-#         self.script_path = script_path
-#         self.cloud_config_name = cloud_config_name
-#         self.cache = {}
-#         self.lock = threading.Lock()
-
-#     def get_or_resolve(self, upload_path):
-#         with self.lock:
-#             if upload_path in self.cache:
-#                 return self.cache[upload_path]
-
-#             resolved_id = resolve_base_upload_id(
-#                 self.script_path,
-#                 self.cloud_config_name,
-#                 upload_path
-#             )
-#             self.cache[upload_path] = resolved_id
-#             return resolved_id
 
 def debug_print(log_path, text_string):
     current_datetime = datetime.now()
@@ -185,7 +167,7 @@ def build_payload_for_proxy_mode(mode, input_path, output_path, config_params):
 
 # generate proxy asset according to options
 def generate_proxy_asset(config_mode, input_path, output_path, extra_params, generator_tool = "ffmpeg"):
-    base_url = f"http://127.0.0.1:8000/{generator_tool}/"
+    base_url = f"{PROXY_GENERATION_HOST}/{generator_tool}/"
     mode_url_map = {
         "generate_video_proxy": "generate_video_proxy",
         "generate_video_frame_proxy": "generate_video_frame_proxy",
@@ -209,7 +191,7 @@ def generate_proxy_asset(config_mode, input_path, output_path, extra_params, gen
             raise Exception("No jobid returned from proxy generation call")
 
         # Poll job status
-        job_status_url = f"http://127.0.0.1:8000/job_details/{jobid}"
+        job_status_url = f"{PROXY_GENERATION_HOST}/job_details/{jobid}"
         start_time = time.time()
         timeout = 600  # 10 minutes
         poll_interval = 3
@@ -245,10 +227,10 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
         base_source_path = original_source_path
         full_upload_path = config["upload_path"]
 
-    # Use override_source_path if provided (for generated proxies)
+    # Using override_source_path if provided (for generated proxies)
     source_path = override_source_path if override_source_path else base_source_path
 
-    # Proxy mode: resolve proxy file if needed
+    # Proxy mode: resolve proxy file
     if config["mode"] == "proxy":
         base_name = os.path.splitext(os.path.basename(base_source_path))[0]
         pattern = f"{base_name}*"
@@ -259,9 +241,7 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
         else:
             source_path = base_source_path
             debug_print(config["logging_path"], f"[Fallback] Proxy not found. Uploading original file instead: {base_source_path}")
-    # else:
-    #     source_path = base_source_path
-
+    
     # Use the resolved upload path ID if provided, otherwise fallback
     if upload_path_id:
         upload_path = upload_path_id
@@ -279,7 +259,7 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
         "--log-level", "debug"
     ]
 
-    if config["mode"] == "original":
+    if config["mode"] == "original" and "original_file_size_limit" in config:
         cmd.extend(["--size-limit", str(config["original_file_size_limit"])])
     if metadata_path:
         cmd.extend(["--metadata-file", metadata_path])
@@ -301,11 +281,10 @@ def write_csv_row(file_path, row):
         writer.writerow(row)
 
 def setup_log_and_progress_paths(config):
-    job_time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    config["logging_path"] = os.path.join(config["logging_path"], f"{job_time_str}_{config['mode']}_log.txt")
-    config["progress_path"] = os.path.join(config["progress_path"], f"{job_time_str}_{config['mode']}_progress.xml")
-    os.makedirs(os.path.dirname(config["logging_path"]), exist_ok=True)
-    os.makedirs(os.path.dirname(config["progress_path"]), exist_ok=True)
+    for key in ["logging_path", "progress_path"]:
+        path = config[key]
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "a").close()
 
 def prepare_log_files(config):
     log_prefix = config.get("log_prefix")
@@ -329,8 +308,8 @@ def read_csv_records(csv_path, logging_path):
     with open(csv_path, 'r') as f:
         reader = csv.reader(f, delimiter='|')
         for row in reader:
-            if len(row) == 3:
-                records.append(tuple(row))
+            if len(row) in (2, 3):
+                records.append(tuple(row) if len(row) == 3 else (row[0], row[1], ""))
     debug_print(logging_path, f"[STEP] Total records loaded: {len(records)}")
     return records
 
@@ -349,6 +328,8 @@ def calculate_total_size(records, config):
             proxy = resolve_proxy_file(config["proxy_directory"], pattern, config["extensions"])
             if proxy and os.path.exists(proxy):
                 total_size += os.path.getsize(proxy)
+            else:
+                total_size += os.path.getsize(full_path)
         elif os.path.exists(full_path):
             total_size += os.path.getsize(full_path)
 
@@ -401,7 +382,7 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
         upload_path_id = resolved_ids.get(parent_folder_rel_path, resolved_ids[config["upload_path"]])
         debug_print(config['logging_path'], f"[PATH-MATCH] {parent_folder_rel_path} -> using ID {upload_path_id}")
 
-        # --- Proxy/derivative asset generation logic moved here ---
+        # --- Proxy asset generation logic moved here ---
         override_source_path = None
         if config["mode"] in [
             "generate_video_proxy",
@@ -509,11 +490,10 @@ if __name__ == '__main__':
     if mode == "proxy":
         required_keys.append("proxy_directory")
         required_keys.append("extensions")
-    if mode == "original":
-        required_keys.append("original_file_size_limit")
+    
     if "generate" in mode:
         required_keys.append("proxy_output_base_path")
-        os.makedirs(request_data.get("proxy_output_base_path"), exist_ok=True)  # Ensuring target dir exists
+        os.makedirs(request_data.get("proxy_output_base_path"), exist_ok=True)  # ✅ Ensure target dir exists
 
 
     for key in required_keys:
