@@ -21,13 +21,14 @@ PROVIDERS_SUPPORTING_GET_BASE_TARGET = {"frameio_v2", "frameio_v4", "tessact", "
 
 # Mapping provider names to their respective upload scripts
 PROVIDER_SCRIPTS = {
-    "frameio_v2": "providerScripts/frameIO/frameIO_v2.py",
-    "frameio_v4": "providerScripts/frameIO/frameIO_v4.py",
-    "tessact": "providerScripts/tessact/tessact_uploader.py",
-    "overcast": "providerScripts/overcastHQ/overcast_uploader.py",
-    "s3": "providerScripts/s3/s3_uploder.py",
-    "trint": "providerScripts/trint/trint_uploder.py",
-    "twelvelabs": "providerScripts/twelvelabs/twelvelab_uploader.py"
+    "frameio": "frame_io_v2_uploader.py",
+    "frameio_v2": "frame_io_v2_uploader.py",
+    "frameio_v4": "frame_io_v4_uploader.py",
+    "tessact": "tessact_uploader.py",
+    "overcast": "overcasthq_uploader.py",
+    "s3": "s3_uploder.py",
+    "trint": "trint_uploder.py",
+    "twelvelabs": "twelvelabs_uploader.py"
 }
 
 def debug_print(log_path, text_string):
@@ -214,7 +215,6 @@ def generate_proxy_asset(config_mode, input_path, output_path, extra_params, gen
 
     except Exception as e:
         raise RuntimeError(f"Proxy generation failed: {e}")
-
 # Launches the provider script with file arguments
 def upload_asset(record, config, dry_run=False, upload_path_id=None, override_source_path=None):
     original_source_path, catalog_path, metadata_path = record
@@ -308,8 +308,8 @@ def read_csv_records(csv_path, logging_path):
     with open(csv_path, 'r') as f:
         reader = csv.reader(f, delimiter='|')
         for row in reader:
-            if len(row) in (2, 3):
-                records.append(tuple(row) if len(row) == 3 else (row[0], row[1], ""))
+            if len(row) == 3:
+                records.append(tuple(row))
     debug_print(logging_path, f"[STEP] Total records loaded: {len(records)}")
     return records
 
@@ -328,8 +328,6 @@ def calculate_total_size(records, config):
             proxy = resolve_proxy_file(config["proxy_directory"], pattern, config["extensions"])
             if proxy and os.path.exists(proxy):
                 total_size += os.path.getsize(proxy)
-            else:
-                total_size += os.path.getsize(full_path)
         elif os.path.exists(full_path):
             total_size += os.path.getsize(full_path)
 
@@ -382,7 +380,7 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
         upload_path_id = resolved_ids.get(parent_folder_rel_path, resolved_ids[config["upload_path"]])
         debug_print(config['logging_path'], f"[PATH-MATCH] {parent_folder_rel_path} -> using ID {upload_path_id}")
 
-        # --- Proxy asset generation logic moved here ---
+        # --- Proxy/derivative asset generation logic moved here ---
         override_source_path = None
         if config["mode"] in [
             "generate_video_proxy",

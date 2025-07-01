@@ -22,8 +22,6 @@ if __name__ == "__main__":
 
     run_config_test("/home/darshan/Darshan/Dev/(python +node) Wrappers/proxyUploaderEngine/test_jsons/tessact_gen_proxy_test_config.json", "generate_intelligence_proxy")
 
-
     run_config_test("/home/darshan/Darshan/Dev/(python +node) Wrappers/proxyUploaderEngine/test_jsons/test_gen_video_proxy_config.json", "generate_video_proxy")
-
 
     run_config_test("/home/darshan/Darshan/Dev/(python +node) Wrappers/proxyUploaderEngine/test_jsons/test_gen_video_frame_proxy_config.json", "generate_video_frame_proxy")

@@ -345,6 +345,9 @@ if __name__ == '__main__':
     workspace_id = cloud_config_data['workspace_id']
     logging.debug(f"Workspace Id ----------------------->{workspace_id}")
 
+    if "base_url" not in cloud_config_data or not cloud_config_data["base_url"]:
+        cloud_config_data["base_url"] = "https://dev-api.tessact.com"
+
     logging.info(f"Starting Tessact upload process in {mode} mode")
     logging.debug(f"Using cloud config: {cloud_config_path}")
     logging.debug(f"Source path: {args.source_path}")
