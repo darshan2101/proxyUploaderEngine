@@ -545,4 +545,3 @@ if __name__ == '__main__':
     request_data["script_path"] = full_script_path
 
     process_csv_and_upload(request_data, args.dry_run)
-    sys.exit(0)

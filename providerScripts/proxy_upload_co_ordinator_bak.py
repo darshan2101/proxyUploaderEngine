@@ -31,6 +31,7 @@ PROVIDER_SCRIPTS = {
     "twelvelabs": "twelvelabs_uploader.py"
 }
 
+
 def debug_print(log_path, text_string):
     current_datetime = datetime.now()
     formatted_datetime = current_datetime.strftime("%Y-%m-%d %H:%M:%S")
@@ -215,6 +216,7 @@ def generate_proxy_asset(config_mode, input_path, output_path, extra_params, gen
 
     except Exception as e:
         raise RuntimeError(f"Proxy generation failed: {e}")
+
 # Launches the provider script with file arguments
 def upload_asset(record, config, dry_run=False, upload_path_id=None, override_source_path=None):
     original_source_path, catalog_path, metadata_path = record
@@ -255,7 +257,7 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
         "--catalog-path", catalog_path,
         "--config-name", config["cloud_config_name"],
         "--upload-path", upload_path,
-        "--jobId", config["job_id"],
+        "--job-guid", config["job_guid"],
         "--log-level", "debug"
     ]
 
@@ -263,6 +265,8 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
         cmd.extend(["--size-limit", str(config["original_file_size_limit"])])
     if metadata_path:
         cmd.extend(["--metadata-file", metadata_path])
+    if config["controller_address"]:
+        cmd.extend(["--controller-address", config["controller_address"]])
     if dry_run:
         cmd.append("--dry-run")
 
@@ -302,14 +306,18 @@ def prepare_log_files(config):
             csv.writer(f).writerow(["Status","Filename", "Size", "Detail"] if "issues" not in log else ["Status", "Filename","Timestamp", "Issue"])
     return transferred_log, issues_log, client_log
 
-def read_csv_records(csv_path, logging_path):
+def read_csv_records(csv_path, logging_path, extensions = []):
     debug_print(logging_path, "[STEP] Reading records from CSV...")
     records = []
     with open(csv_path, 'r') as f:
         reader = csv.reader(f, delimiter='|')
         for row in reader:
-            if len(row) == 3:
-                records.append(tuple(row))
+            if len(row) in (2, 3):
+                first_value = row[0]
+                if extensions:
+                    if not any(first_value.lower().endswith(ext.lower()) for ext in extensions):
+                        continue
+                records.append(tuple(row) if len(row) == 3 else (row[0], row[1], None))
     debug_print(logging_path, f"[STEP] Total records loaded: {len(records)}")
     return records
 
@@ -328,6 +336,8 @@ def calculate_total_size(records, config):
             proxy = resolve_proxy_file(config["proxy_directory"], pattern, config["extensions"])
             if proxy and os.path.exists(proxy):
                 total_size += os.path.getsize(proxy)
+            else:
+                total_size += os.path.getsize(full_path)
         elif os.path.exists(full_path):
             total_size += os.path.getsize(full_path)
 
@@ -380,7 +390,7 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
         upload_path_id = resolved_ids.get(parent_folder_rel_path, resolved_ids[config["upload_path"]])
         debug_print(config['logging_path'], f"[PATH-MATCH] {parent_folder_rel_path} -> using ID {upload_path_id}")
 
-        # --- Proxy/derivative asset generation logic moved here ---
+        # --- Proxy asset generation logic moved here ---
         override_source_path = None
         if config["mode"] in [
             "generate_video_proxy",
@@ -412,28 +422,34 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
             record, config, config.get("dry_run", False), upload_path_id, override_source_path=override_source_path
         )
     
-        progressDetails["processedFiles"] += 1
         if result and result.returncode == 0:
             file_size = os.path.getsize(resolved_path) if os.path.exists(resolved_path) else 0
-            debug_print(config["logging_path"], f"Upload success: {resolved_path} ({file_size} bytes)")
+            progressDetails["processedFiles"] += 1
+            progressDetails["processedBytes"] += file_size
+            debug_print(config["logging_path"], f"[UPLOAD SUCCESS] {resolved_path} | {file_size} bytes")
             if transferred_log:
                 write_csv_row(transferred_log, ["Success", resolved_path, file_size, ""])
             if client_log:
                 write_csv_row(client_log, ["Success", resolved_path, file_size, "Client"])
+            return {"status": "success", "file": resolved_path, "size": file_size}
         else:
-            debug_print(config["logging_path"], f"Upload failed: {resolved_path}\n{result.stderr if result else 'No result'}")
+            debug_print(config["logging_path"], f"[UPLOAD FAILURE] {resolved_path}\n{result.stderr if result else 'No result'}")
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            stderr_cleaned = result.stderr.replace("\n", " ").replace("\r", " ").strip() if result and result.stderr else "No result"
+            stderr_cleaned = result.stderr.replace("\n", " ").replace("\r", " ").strip() if result and result.stderr else "Something went wrong"
             write_csv_row(issues_log, ["Error", resolved_path, timestamp, stderr_cleaned])
+            return {"status": "failure", "file": resolved_path, "error": stderr_cleaned}
     except Exception as e:
         debug_print(config['logging_path'], f"[ERROR] upload_asset() failed: {e}")
-    send_progress(progressDetails, config["repo_guid"])
+    finally:
+        send_progress(progressDetails, config["repo_guid"])
 
 def process_csv_and_upload(config, dry_run=False):
     config["dry_run"] = dry_run
     setup_log_and_progress_paths(config)
     transferred_log, issues_log, client_log = prepare_log_files(config)
-    records = read_csv_records(config["files_list"], config["logging_path"])
+    
+    exts = config.get("extensions") if config.get("mode") == "original" and config.get("extensions") else []
+    records = read_csv_records(config["files_list"], config["logging_path"], exts)
     total_size = calculate_total_size(records, config)
 
     progressDetails = {
@@ -451,13 +467,30 @@ def process_csv_and_upload(config, dry_run=False):
     send_progress(progressDetails, config["repo_guid"])
     resolved_ids = build_folder_id_map(records, config, config["logging_path"])
     debug_print(config["logging_path"],f" Resolved ids directory ---------------------------> {resolved_ids}")
+    upload_results = []
     with ThreadPoolExecutor(max_workers=config["thread_count"]) as executor:
-        for record in records:
+        futures = [
             executor.submit(upload_worker, record, config, resolved_ids, progressDetails, transferred_log, issues_log, client_log)
+            for record in records
+        ]
+        for future in futures:
+            upload_results.append(future.result())
+    success_count = sum(1 for r in upload_results if r and r.get("status") == "success")
+    failure_results = [r for r in upload_results if r and r.get("status") == "failure"]
 
+    debug_print(config["logging_path"], f"Upload summary: {success_count} succeeded, {len(failure_results)} failed")
+    print(f"Successful Uploads:{success_count}")
+    print(f"Failed Uploads:{len(failure_results)}")
+
+    if failure_results:
+        print("\nFailed Uploads:")
+        for failure in failure_results:
+            print(f" - {failure['file']} | Error: {failure['error']}")
+            
     progressDetails["status"] = "complete"
     send_progress(progressDetails, config["repo_guid"])
-    
+    sys.exit(0 if success_count == len(records) else 2)
+
     
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Uploader Script Backup")
@@ -476,11 +509,9 @@ if __name__ == '__main__':
         request_data = json.load(f)
 
     required_keys = [
-        "provider", "progress_path", "logging_path", "thread_count",
-        "files_list", "cloud_config_name", "job_id",
-        "upload_path", "mode", "run_id", "repo_guid"
+        "provider", "progress_path", "logging_path", "thread_count", "files_list", "cloud_config_name", "job_id","upload_path","mode", "run_id", "repo_guid","job_guid"
     ]
-    optional_keys = ["proxy_output_base_path", "proxy_extra_params"]
+    optional_keys = ["proxy_output_base_path", "proxy_extra_params", "controller_address"]
 
     mode = request_data.get("mode")
 
@@ -499,7 +530,7 @@ if __name__ == '__main__':
             print(f"Missing required field in config: {key}")
             sys.exit(1)
     for key in optional_keys:
-        request_data.setdefault(key, "" if key == "proxy_output_base_path" else {})
+        request_data.setdefault(key, {} if key == "proxy_extra_params" else None)
 
     if args.log_prefix:
         request_data["log_prefix"] = args.log_prefix
@@ -516,4 +547,3 @@ if __name__ == '__main__':
     request_data["script_path"] = full_script_path
 
     process_csv_and_upload(request_data, args.dry_run)
-    sys.exit(0)
