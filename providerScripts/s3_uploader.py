@@ -76,7 +76,7 @@ def get_link_address_and_port():
     return ip, port
 
 
-def upload_file_to_s3(config_data, bucket_name, source_path, upload_path, metadata= None):
+def upload_file_to_s3(config_data, bucket_name, source_path, upload_path, metadata=None):
     try:
         s3 = boto3.client(
             's3',
@@ -86,13 +86,17 @@ def upload_file_to_s3(config_data, bucket_name, source_path, upload_path, metada
         )
 
         # Upload the file
-        s3.upload_file(Filename = source_path, Bucket = bucket_name ,Key = upload_path,ExtraArgs={'Metadata': metadata})
-        print(f"✅ File uploaded to {config_data['endpoint_url']}/{bucket_name}/{source_path}")
-        response = s3.head_object(Bucket=bucket_name, Key=source_path)
-        print(json.dumps(response['Metadata'],indent=4))
-
+        s3.upload_file(Filename=source_path, Bucket=bucket_name, Key=upload_path, ExtraArgs={'Metadata': metadata} if metadata else {})
+        return {
+            "status": 200,
+            "detail": "uploaded asset successfully"
+        }
     except Exception as e:
-        print(f"Error: {e}")
+        logging.debug(f"Error: {e}")
+        return  {
+            "status": 500,
+            "detail": str(e)
+        }
 
 def prepare_metadata_to_upload( backlink_url, properties_file):    
     if not os.path.exists(properties_file):
@@ -123,8 +127,7 @@ def prepare_metadata_to_upload( backlink_url, properties_file):
                 logging.debug(f"Loaded XML properties: {metadata}")
             else:
                 logging.error("No <meta-data> section found in XML.")
-                sys.exit(1)
-                
+                sys.exit(1)     
         else:
             with open(properties_file, 'r') as f:
                 for line in f:
@@ -146,7 +149,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--mode", required=True, help="mode of Operation proxy or original upload")
     parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
-    parser.add_argument("-j", "--jobId", help="Job Id of SDNA job")
+    parser.add_argument("-j", "--job-guid", help="Job Guid of SDNA job")
     parser.add_argument("-b", "--bucket-name", required=True, help= "Name of Bucket")
     parser.add_argument("-cp", "--catalog-path", required=True, help="Path where catalog resides")
     parser.add_argument("-sp", "--source-path", required=True, help="Source path of file to look for original upload")
@@ -155,6 +158,7 @@ if __name__ == '__main__':
     parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")
+    parser.add_argument("--controller-address",help="Link IP/Hostname Port")
     args = parser.parse_args()
 
     setup_logging(args.log_level)
@@ -203,12 +207,21 @@ if __name__ == '__main__':
             logging.warning(f"Could not validate size limit: {e}")
 
     catalog_path = remove_file_name_from_path(matched_file)
-    catalog_url = urllib.parse.quote(catalog_path)
+    normalized_path = catalog_path.replace("\\", "/")
+    if "/1/" in normalized_path:
+        relative_path = normalized_path.split("/1/", 1)[-1]
+    else:
+        relative_path = normalized_path
+    catalog_url = urllib.parse.quote(relative_path)
     filename_enc = urllib.parse.quote(file_name_for_url)
-    jobId = args.jobId
-    client_ip, client_port = get_link_address_and_port()
+    job_guid = args.job_guid
 
-    backlink_url = f"https://{client_ip}:{client_port}/dashboard/projects/{jobId}/browse&search?path={catalog_url}&filename={filename_enc}"
+    if args.controller_address is not None and len(args.controller_address.split(":")) == 2:
+        client_ip, client_port = args.controller_address.split(":")
+    else:
+        client_ip, client_port = get_link_address_and_port()
+
+    backlink_url = f"https://{client_ip}/dashboard/projects/{job_guid}/browse&search?path={catalog_url}&filename={filename_enc}"
     logging.debug(f"Generated dashboard URL: {backlink_url}")
 
     if args.dry_run:
@@ -238,4 +251,10 @@ if __name__ == '__main__':
     
     #  upload file
     response = upload_file_to_s3(cloud_config_data, args.bucket_name, args.source_path, args.upload_path, parsed)
+    if response["status_code"] != 200:
+        print(f"Failed to upload file parts: {response['detail']}")
+        sys.exit(1)
+    else:
+        logging.info("All parts uploaded successfully to Frame.io")
+        sys.exit(0)
 
