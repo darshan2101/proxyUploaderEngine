@@ -96,7 +96,6 @@ def find_upload_id(path, project_id, token, base_id=None):
 
 def upload_file(client, source_path, up_id, description):
     file_size = os.stat(source_path).st_size
-    logging.info(f"Starting upload for file: {source_path} ({file_size/1024/1024:.2f} MB)")
     
     logging.debug("Creating asset in Frame.io")
     asset = client.assets.create(
@@ -163,14 +162,17 @@ def update_asset(token, asset_id, properties_file):
     }
     logging.debug("Sending asset update request to Frame.io API")
     response = request('PUT', f'https://api.frame.io/v2/assets/{asset_id}', headers=headers, data=dumps({'properties': props}))
-    logging.info(f"Asset update completed with status code: {response.status_code}")
-    return response
+    if response.status_code in (200, 201):
+        logging.info("Uploaded successfully")
+    else:
+        logging.error("Failed to upload Metadata file: %s", response.text)
+    return response, response.status_code
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--mode", required=True, help="mode of Operation proxy or original upload")
     parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
-    parser.add_argument("-j", "--jobId", help="Job Id of SDNA job")
+    parser.add_argument("-j", "--job-guid", help="Job Guid of SDNA job")
     parser.add_argument("--parent-id", help="Optional parent folder ID to resolve relative upload paths from")
     parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
     parser.add_argument("-sp", "--source-path", help="Source path of file to look for original upload")
@@ -180,6 +182,7 @@ if __name__ == '__main__':
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")
     parser.add_argument("--resolved-upload-id", action="store_true", help="Pass if upload path is already resolved ID")
+    parser.add_argument("--controller-address",help="Link IP/Hostname Port")
 
     args = parser.parse_args()
 
@@ -254,12 +257,21 @@ if __name__ == '__main__':
             logging.warning(f"Could not validate size limit: {e}")
 
     catalog_path = remove_file_name_from_path(matched_file)
-    catalog_url = urllib.parse.quote(catalog_path)
+    normalized_path = catalog_path.replace("\\", "/")
+    if "/1/" in normalized_path:
+        relative_path = normalized_path.split("/1/", 1)[-1]
+    else:
+        relative_path = normalized_path
+    catalog_url = urllib.parse.quote(relative_path)
     filename_enc = urllib.parse.quote(file_name_for_url)
-    jobId = args.jobId
-    client_ip, client_port = get_link_address_and_port()
+    job_guid = args.job_guid 
 
-    url = f"https://{client_ip}:{client_port}/dashboard/projects/{jobId}/browse&search?path={catalog_url}&filename={filename_enc}"
+    if args.controller_address is not None and len(args.controller_address.split(":")) == 2:
+        client_ip, client_port = args.controller_address.split(":")
+    else:
+        client_ip, client_port = get_link_address_and_port()
+
+    url = f"https://{client_ip}/dashboard/projects/{job_guid}/browse&search?path={catalog_url}&filename={filename_enc}"
     logging.debug(f"Generated dashboard URL: {url}")
 
     if args.dry_run:
@@ -282,13 +294,20 @@ if __name__ == '__main__':
     logging.info(f"Upload location ID: {up_id}")
     
     asset_id = upload_file(client, matched_file, up_id, url)
+
+    if not asset_id:
+        print("Failed to upload file to Frame.io")
+        sys.exit(3)
+
     logging.info(f"File uploaded successfully. Asset ID: {asset_id}")
 
     meta_file = args.metadata_file
     if meta_file:
         logging.info("Applying metadata to uploaded asset...")
-        response = update_asset(token, asset_id, meta_file)
+        response, metadata_code = update_asset(token, asset_id, meta_file)
         parsed = response.json()
-        logging.debug(json.dumps(parsed, indent=4))
+        if not parsed or metadata_code not in (200, 201):
+            print("Failed to upload metadata or no response received.")
+            sys.exit(1)
 
     sys.exit(0)
