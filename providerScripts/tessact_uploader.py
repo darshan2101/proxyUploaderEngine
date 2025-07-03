@@ -195,14 +195,9 @@ def initiate_upload(file_path, config_data, token, parent_id=None):
     if response.status_code in (200, 201):
         logging.info("File Upload Initiated successfully")
     else:
-        try:
-            detail = response.json().get("detail", response.text)
-        except Exception:
-            detail = response.text
-        logging.debug(f"Failed to Initiate upload: {detail}")
-        logging.error("Failed to Initiate File Upload")
-    
-    return response.json()
+        detail = response.json().get("detail", response.text)
+        logging.error(f"Failed to Initiate File Upload {detail}")
+    return response.json(), response.status_code  
 
 def upload_parts(file_path, presigned_urls):
     etags = []
@@ -227,16 +222,9 @@ def finalize_upload(base_url, token, payload):
     logging.info("Finalizing upload with payload: %s", payload)
     headers = {"Content-Type": "application/json" ,"Authorization": f"Bearer {token}"}
     response = requests.post(url, headers=headers, data=json.dumps(payload))
-    if response.status_code in (200, 201):
-        logging.info("Finalize upload response: %s", response.text)
-    else:
-        try:
-            detail = response.json().get("detail", response.text)
-        except Exception:
-            detail = response.text
-        logging.debug(f"Failed to finalize upload: {detail}")
-        logging.error("Failed to finalize File Upload")
     logging.info("Finalize upload response: %s", response.text)
+    if response.status_code  not in (200,201):
+        print(f"Failed to finalize upload {response.text}")
     return response.json(), response.status_code
 
 def upload_metadata_to_asset(base_url, token, backlink_url, asset_id, properties_file):
@@ -317,12 +305,11 @@ def upload_metadata_to_asset(base_url, token, backlink_url, asset_id, properties
         logging.error("Failed to upload Metadata file: %s", response.text)
     return response, response.status_code
 
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--mode", required=True, help="mode of Operation proxy or original upload")
     parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
-    parser.add_argument("-j", "--job-guid", help="Job Id of SDNA job")
+    parser.add_argument("-j", "--job-guid", help="Job Guid of SDNA job")
     parser.add_argument("--parent-id", help="Optional parent folder ID to resolve relative upload paths from")    
     parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
     parser.add_argument("-sp", "--source-path", help="Source path of file to look for original upload")
@@ -333,6 +320,7 @@ if __name__ == '__main__':
     parser.add_argument("--log-level", default="debug", help="Logging level")
     parser.add_argument("--resolved-upload-id", action="store_true", help="Pass if upload path is already resolved ID")
     parser.add_argument("--controller-address",help="Link IP/Hostname Port")
+
     args = parser.parse_args()
 
     setup_logging(args.log_level)
@@ -355,6 +343,9 @@ if __name__ == '__main__':
         sys.exit(1)
 
     cloud_config_data = cloud_config[cloud_config_name]
+
+    if "base_url" not in cloud_config_data or not cloud_config_data["base_url"]:
+        cloud_config_data["base_url"] = "https://dev-api.tessact.com"
 
     workspace_id = cloud_config_data['workspace_id']
     logging.debug(f"Workspace Id ----------------------->{workspace_id}")
@@ -407,15 +398,17 @@ if __name__ == '__main__':
         except Exception as e:
             logging.warning(f"Could not validate size limit: {e}")
 
-    catalog_path = remove_file_name_from_path(matched_file)
-    # Extract part after "/1/" in catalog_path for backlink URL
+    catalog_path = remove_file_name_from_path(args.catalog_path)
     normalized_path = catalog_path.replace("\\", "/")
-    after_one = normalized_path.split("/1/", 1)[-1] if "/1/" in normalized_path else os.path.basename(catalog_path)
-    catalog_url = urllib.parse.quote(after_one)
+    if "/1/" in normalized_path:
+        relative_path = normalized_path.split("/1/", 1)[-1]
+    else:
+        relative_path = normalized_path
+    catalog_url = urllib.parse.quote(relative_path)
     filename_enc = urllib.parse.quote(file_name_for_url)
-    job_guid = args.job_guid
+    job_guid = args.job_guid 
 
-    if args.controller_address and ":" in args.controller_address:
+    if args.controller_address is not None and len(args.controller_address.split(":")) == 2:
         client_ip, client_port = args.controller_address.split(":")
     else:
         client_ip, client_port = get_link_address_and_port()
@@ -442,13 +435,12 @@ if __name__ == '__main__':
     else:
         folder_id = find_upload_id_tessact(upload_path, token,cloud_config_data)
     logging.info(f"Upload location ID: {folder_id}")
-    
+
     # Initiate upload with chunks
-    upload_meta, initialized_code = initiate_upload(args.source_path, cloud_config_data, token, folder_id)
-    if initialized_code not in (200, 201):
-        print(f"Failed to initiate upload: {upload_meta}")
+    upload_meta, initialization_code = initiate_upload(args.source_path, cloud_config_data, token, folder_id)
+    if initialization_code not in (200, 201):
+        print(f"Failed to initiate upload. {upload_meta}.")
         sys.exit(1)
-        
     file_id = upload_meta["data"]["id"]
     upload_id = upload_meta["upload_id"]
     presigned_urls = upload_meta["presigned_urls"]
@@ -456,17 +448,17 @@ if __name__ == '__main__':
     
     # Upload all parts to given urls and get etags to finalize upload
     part_etags = upload_parts(args.source_path, presigned_urls)
-    
+    logging.debug(f"received etags  {part_etags}")    
     finalize_payload = {
         "file": upload_meta["data"]["id"],
         "upload_id": upload_id,
         "parts": part_etags
     }
-    finalize_response, finalized_code = finalize_upload(cloud_config_data['base_url'], token, finalize_payload)
+    finalize_response, finalized_code = finalize_upload(cloud_config_data['base_url'], token,finalize_payload)
     if finalized_code not in (200, 201):
-        logging.error(f"Failed to finalize upload: {finalize_response}")
+        print(f"Failed to finalize upload: {finalize_response}")
         sys.exit(1)
-    
+
     logging.info(f"File uploaded successfully. Asset ID: {file_id}")
 
     meta_file = args.metadata_file
@@ -474,8 +466,8 @@ if __name__ == '__main__':
         logging.info("Applying metadata to uploaded asset...")
         response, metadata_code = upload_metadata_to_asset(cloud_config_data['base_url'] ,token, backlink_url, file_id, meta_file)
         parsed = response.json()
-        if metadata_code not in (200, 201):
-            logging.error(f"Failed to upload metadata: {parsed}")
+        if not parsed or metadata_code not in (200, 201):
+            print("Failed to upload metadata or no response received.")
             sys.exit(1)
 
     sys.exit(0)

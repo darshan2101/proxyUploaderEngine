@@ -304,18 +304,37 @@ def prepare_log_files(config):
             csv.writer(f).writerow(["Status","Filename", "Size", "Detail"] if "issues" not in log else ["Status", "Filename","Timestamp", "Issue"])
     return transferred_log, issues_log, client_log
 
-def read_csv_records(csv_path, logging_path, extensions = []):
+def read_csv_records(csv_path, logging_path, extensions = [], file_size_limit = None):
     debug_print(logging_path, "[STEP] Reading records from CSV...")
     records = []
+    size_limit_bytes = float(file_size_limit) * 1024 * 1024 if file_size_limit else None
     with open(csv_path, 'r') as f:
         reader = csv.reader(f, delimiter='|')
         for row in reader:
             if len(row) in (2, 3):
                 first_value = row[0]
+                if "/./" in first_value:
+                    prefix, sub_path = first_value.split("/./", 1)
+                    base_source_path = os.path.join(prefix, sub_path)
+                else:
+                    base_source_path = first_value
+                try:
+                    size = os.stat(base_source_path).st_size
+                except Exception as e:
+                    debug_print(logging_path, f"[ERROR] Could not stat file {base_source_path}: {e}")
+                    continue
+                # Check extension on the resolved base_source_path
                 if extensions:
-                    if not any(first_value.lower().endswith(ext.lower()) for ext in extensions):
+                    if not any(base_source_path.lower().endswith(ext.lower()) for ext in extensions):
                         continue
-                records.append(tuple(row) if len(row) == 3 else (row[0], row[1], None))
+                if size_limit_bytes is not None and size > size_limit_bytes:
+                    debug_print(logging_path, f"[SKIP] File {base_source_path} exceeds size limit ({size} > {size_limit_bytes})")
+                    continue
+                # Always append a tuple of length 3: (source, catalog, metadata)
+                if len(row) == 3:
+                    records.append((row[0], row[1], row[2]))
+                elif len(row) == 2:
+                    records.append((row[0], row[1], None))
     debug_print(logging_path, f"[STEP] Total records loaded: {len(records)}")
     return records
 
@@ -447,7 +466,8 @@ def process_csv_and_upload(config, dry_run=False):
     transferred_log, issues_log, client_log = prepare_log_files(config)
     
     exts = config.get("extensions") if config.get("mode") == "original" and config.get("extensions") else []
-    records = read_csv_records(config["files_list"], config["logging_path"], exts)
+    file_size_limit = config.get("original_file_size_limit") if config.get("mode") == "original" and config.get("original_file_size_limit") else None
+    records = read_csv_records(config["files_list"], config["logging_path"], exts, file_size_limit)
     total_size = calculate_total_size(records, config)
 
     progressDetails = {
@@ -512,6 +532,9 @@ if __name__ == '__main__':
     optional_keys = ["proxy_output_base_path", "proxy_extra_params", "controller_address"]
 
     mode = request_data.get("mode")
+
+    if mode in ("original"):
+        optional_keys.append("original_file_size_limit")
 
     # Conditionally require proxy_directory and original_file_size_limit
     if mode == "proxy":
