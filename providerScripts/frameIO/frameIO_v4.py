@@ -96,21 +96,21 @@ def get_folders_list(config_data, folder_id):
         }
     logger.debug(f"URL :------------------------------------------->  {url}")
     response = requests.get(url, headers=headers)
-    if response.status_code not in (200, 201):
-        logger.info(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        exit(1)
-    response = response.json()['data']
-    all_folders = []
-    for item in response:
-        if item['type'] == 'folder':
-            all_folders.append(
-                {
-                    "name" : item['name'],
-                    "id" : item["id"]
-                }
-            )
-    
-    return all_folders
+    if response.status_code in (200, 201):
+        items = response.json()['data']
+        all_folders = []
+        for item in items:
+            if item['type'] == 'folder':
+                all_folders.append(
+                    {
+                        "name": item['name'],
+                        "id": item["id"]
+                    }
+                )
+        return all_folders, response.status_code
+    else:
+        logger.error(f"Response error. Status - {response.status_code}, Error - {response.text}")
+        return response.text, response.status_code
 
 def create_folder(config_data,folder_name,parent_id):
     url = f"{config_data['domain']}/v4/accounts/{config_data['account_id']}/folders/{parent_id}/folders"
@@ -141,7 +141,10 @@ def find_upload_id(upload_path, config_data, base_id = None):
     for segment in folder_path.strip("/").split("/"):
         logging.debug(f"Looking for folder '{segment}' under parent '{current_parent_id}'")
 
-        folders = get_folders_list(config_data, current_parent_id)
+        folders, response_code = get_folders_list(config_data, current_parent_id)
+        if not isinstance(folders, list) or response_code not in (200, 201):
+            print(f"Failed to get folders list: {folders}")
+            sys.exit(1)
         matched = next((f for f in folders if f.get("name") == segment), None)
 
         if matched:
@@ -156,7 +159,7 @@ def find_upload_id(upload_path, config_data, base_id = None):
     logging.info(f"Final destination folder ID for upload: {current_parent_id}")
     return current_parent_id
 
-def crete_asset(config_data,folder_id,file_path):
+def create_asset(config_data,folder_id,file_path):
     url = f"{config_data['domain']}/v4/accounts/{config_data['account_id']}/folders/{folder_id}/files/local_upload"
     file_name = extract_file_name(file_path)
 
@@ -171,12 +174,12 @@ def crete_asset(config_data,folder_id,file_path):
         'Authorization': f"Bearer {cloud_config_data['token']}"
     }
     response = requests.post(url, headers=headers, json=payload)
-    if response.status_code == 201:
+    if response.status_code in (200, 201):
         logging.info(f"Created asset '{file_name}' with size {os.path.getsize(file_path)} bytes in folder ID {folder_id}")
-        return response.json()
     else:
         logging.error(f"Failed to create asset for file '{file_path}'. Status: {response.status_code}, Response: {response.text}")
         logging.debug(f"Response error. Status - {response.status_code}, Error - {response.text}")
+    return response, response.status_code
         
 def upload_parts(file_path, asset_info):
     upload_urls = asset_info['data']['upload_urls']
@@ -193,7 +196,7 @@ def upload_parts(file_path, asset_info):
             response = requests.put(
                 part_url,
                 data=part_data,
-                headers={"Content-Type": content_type,"x-amz-acl":"private"}
+                headers={"Content-Type": content_type, "x-amz-acl": "private"}
             )
 
             if response.status_code == 200:
@@ -202,14 +205,21 @@ def upload_parts(file_path, asset_info):
             else:
                 logging.debug(f"Failed to upload part {i + 1}: {response.status_code} - {response.text}")
                 logging.error(f"Failed to upload part {i + 1}: HTTP {response.status_code} - {response.text}")
-                break
+                return {
+                    "detail": response.text,
+                    "status_code": response.status_code
+                }
+    return {
+        "detail": "uploaded all part",
+        "status_code": 200
+    }
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--mode", required=True, help="mode of Operation proxy or original upload")
     parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
-    parser.add_argument("-j", "--jobId", help="Job Id of SDNA job")
+    parser.add_argument("-j", "--job-guid", help="Job Id of SDNA job")
     # parser.add_argument("-p", "--project-id", required=True, help="Project Id")
     parser.add_argument("--parent-id", help="Optional parent folder ID to resolve relative upload paths from")
     parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
@@ -220,6 +230,7 @@ if __name__ == '__main__':
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")
     parser.add_argument("--resolved-upload-id", action="store_true", help="Pass if upload path is already resolved ID")
+    parser.add_argument("--controller-address",help="Link IP/Hostname Port")
     
     args = parser.parse_args()
 
@@ -273,9 +284,13 @@ if __name__ == '__main__':
         #     if folder['type'] == 'folder':
         #         buckets.append(f"{folder['id']}:{folder['name']}")
         # print(','.join(buckets))
-        folders = get_folders_list(cloud_config_data, asset_id)
-        print(f"Response of folder list -----> {folders}")
-        exit(0)
+        response, response_code = get_folders_list(cloud_config_data, asset_id)
+
+        if response_code not in (200, 201):
+            logging.error(f"Failed to fetch folders. Status: {response_code}")
+            sys.exit(1)
+        print(f"Response of folder list -----> {response}")
+        sys.exit(0)
 
 
     logging.info(f"Starting FrameIO v4 upload process in {mode} mode")
@@ -303,12 +318,21 @@ if __name__ == '__main__':
             logging.warning(f"Could not validate size limit: {e}")
 
     catalog_path = remove_file_name_from_path(matched_file)
-    catalog_url = urllib.parse.quote(catalog_path)
+    normalized_path = catalog_path.replace("\\", "/")
+    if "/1/" in normalized_path:
+        relative_path = normalized_path.split("/1/", 1)[-1]
+    else:
+        relative_path = normalized_path
+    catalog_url = urllib.parse.quote(relative_path)
     filename_enc = urllib.parse.quote(file_name_for_url)
-    jobId = args.jobId
-    client_ip, client_port = get_link_address_and_port()
+    job_guid = args.job_guid
 
-    backlink_url = f"https://{client_ip}:{client_port}/dashboard/projects/{jobId}/browse&search?path={catalog_url}&filename={filename_enc}"
+    if args.controller_address is not None and len(args.controller_address.split(":")) == 2:
+        client_ip, client_port = args.controller_address.split(":")
+    else:
+        client_ip, client_port = get_link_address_and_port()
+
+    backlink_url = f"https://{client_ip}/dashboard/projects/{job_guid}/browse&search?path={catalog_url}&filename={filename_enc}"
     logging.debug(f"Generated dashboard URL: {backlink_url}")
 
     if args.dry_run:
@@ -330,8 +354,16 @@ if __name__ == '__main__':
     else:
         folder_id = find_upload_id(upload_path, cloud_config_data, args.parent_id)
 
-    folder_id = find_upload_id(args.upload_path, cloud_config_data)
+    asset_info, creation_status = create_asset(cloud_config_data, folder_id, args.source_path)
+    if creation_status not in (200, 201):
+        print(f"Failed to create asset: {asset_info.text}")
+        sys.exit(1)
 
-    asset_info = crete_asset(cloud_config_data,folder_id,args.source_path)
-    upload_parts(args.source_path, asset_info)
-    logging.info(f"Upload completed for file: {args.source_path}")
+    parts_info = upload_parts(args.source_path, asset_info)
+    if parts_info["status_code"] != 200:
+        print(f"Failed to upload file parts: {parts_info['detail']}")
+        sys.exit(1)
+    else:
+        logging.info("All parts uploaded successfully to Frame.io")
+        sys.exit(0)
+
