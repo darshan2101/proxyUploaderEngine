@@ -216,17 +216,16 @@ def create_asset(config_data, file_path, backlink_url=None, folder_id=None, work
     if response.status_code == 200:
         logger.info("Upload successful.")
         logger.debug(f"Response: {response.json()}")
-        return response.json()
     else:
         logger.error(f"Upload failed with status: {response.status_code}")
         logger.error(f"Response: {response.text}")
-        response.raise_for_status()
+    return response, response.status_code
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--mode", help="mode of Operation proxy or original upload")
     parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
-    parser.add_argument("-j", "--jobId", help="Job Id of SDNA job")
+    parser.add_argument("-j", "--job-guid", help="Job Guid of SDNA job")
     parser.add_argument("--parent-id", help="Optional parent folder ID to resolve relative upload paths from")
     parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
     parser.add_argument("-sp", "--source-path", help="Source path of file to look for original upload")
@@ -236,6 +235,7 @@ if __name__ == '__main__':
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")
     parser.add_argument("--resolved-upload-id", action="store_true", help="Pass if upload path is already resolved ID")
+    parser.add_argument("--controller-address",help="Link IP/Hostname Port")
     args = parser.parse_args()
 
     setup_logging(args.log_level)
@@ -302,12 +302,21 @@ if __name__ == '__main__':
             logging.warning(f"Could not validate size limit: {e}")
 
     catalog_path = remove_file_name_from_path(matched_file)
-    catalog_url = urllib.parse.quote(catalog_path)
+    normalized_path = catalog_path.replace("\\", "/")
+    if "/1/" in normalized_path:
+        relative_path = normalized_path.split("/1/", 1)[-1]
+    else:
+        relative_path = normalized_path
+    catalog_url = urllib.parse.quote(relative_path)
     filename_enc = urllib.parse.quote(file_name_for_url)
-    jobId = args.jobId
-    client_ip, client_port = get_link_address_and_port()
+    job_guid = args.job_guid
 
-    backlink_url = f"https://{client_ip}:{client_port}/dashboard/projects/{jobId}/browse&search?path={catalog_url}&filename={filename_enc}"
+    if args.controller_address is not None and len(args.controller_address.split(":")) == 2:
+        client_ip, client_port = args.controller_address.split(":")
+    else:
+        client_ip, client_port = get_link_address_and_port()
+
+    backlink_url = f"https://{client_ip}/dashboard/projects/{job_guid}/browse&search?path={catalog_url}&filename={filename_enc}"
     logging.debug(f"Generated dashboard URL: {backlink_url}")
 
     if args.dry_run:
@@ -330,11 +339,12 @@ if __name__ == '__main__':
         folder_id = get_folder_id(cloud_config_data, args.upload_path)
     logging.debug(f"Folder ID check -------------------------> {folder_id}")
 
-    asset = create_asset(cloud_config_data, args.source_path, backlink_url, folder_id)    
-    if asset and 'trintId' in asset:
-        logging.info(f"asset upload completed ==============================> {asset['trintId']}")
-        logging.debug(f"asset upload completed ==============================> {asset}")
+    asset, creation_status = create_asset(cloud_config_data, args.source_path, backlink_url, folder_id)
+    response = asset.json() if isinstance(asset, requests.Response) else asset
+    if creation_status in [200, 201] and 'trintId' in response:
+        logging.info(f"asset upload completed ==============================> {response['trintId']}")
+        sys.exit(0)
     else:
         logging.error("Asset upload failed or 'trintId' not found in response.")
-        
-    sys.exit(0)
+        print(f"Error Details: {asset.text}")
+        sys.exit(1)
