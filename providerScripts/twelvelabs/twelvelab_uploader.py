@@ -45,22 +45,23 @@ def get_cloud_config_path():
 def on_task_update(task: Task):
     logger.debug(f"  Status={task.status}")
 
-def upload_asset(client, index_id ,file_path):
-    
-    task = client.task.create(
-        index_id=index_id,
-        file=file_path
-    )
-    logger.debug(f"Task id={task.id}")
+def upload_asset(client, index_id, file_path):
+    try:
+        task = client.task.create(
+            index_id=index_id,
+            file=file_path
+        )
+        logger.debug(f"Task id={task.id}")
 
-    task.wait_for_done(sleep_interval=5, callback=on_task_update)
-    if task.status != "ready":
-        raise RuntimeError(f"Indexing failed with status {task.status}")
-    
-    logger.info("Asset upload suceeded")
-    logger.debug(f"Video ID: {task.video_id}")
-    return task
+        task.wait_for_done(sleep_interval=5, callback=on_task_update)
+        if task.status != "ready":
+            raise RuntimeError(f"Indexing failed with status {task.status}")
 
+        logger.info("Asset upload succeeded")
+        logger.debug(f"Video ID: {task.video_id}")
+        return task
+    except Exception as e:
+        raise RuntimeError(f"Asset upload failed: {e}")
 
 
 
@@ -68,7 +69,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--mode", required=True, help="mode of Operation proxy or original upload")
     parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
-    parser.add_argument("-j", "--jobId", help="Job Id of SDNA job")
+    parser.add_argument("-j", "--job-guid", help="Job Guid of SDNA job")
     parser.add_argument("-cp", "--catalog-path", required=True, help="Path where catalog resides")
     parser.add_argument("-sp", "--source-path", required=True, help="Source path of file to look for original upload")
     parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
@@ -76,6 +77,7 @@ if __name__ == '__main__':
     parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")
+    parser.add_argument("--controller-address",help="Link IP/Hostname Port")
     args = parser.parse_args()
 
     setup_logging(args.log_level)
@@ -135,7 +137,10 @@ if __name__ == '__main__':
 
     logging.info(f"Starting upload process to Twelve labs")
 
-    asset = upload_asset(client, index_id, args.source_path )
-
-    logging.info(f"Asset uploaded to twelve labs. Asset ID: --> {asset.video_id}")
-
+    try:
+        asset = upload_asset(client, index_id, args.source_path)
+        logging.info(f"Asset uploaded to twelve labs. Asset ID: --> {asset.video_id}")
+        sys.exit(0)
+    except Exception as e:
+        print(str(e))
+        sys.exit(1)
