@@ -138,7 +138,7 @@ def get_folder_id(config_data, upload_path, base_id = None):
     current_parent_id = base_id
 
     # Remove the filename from the upload_path
-    folder_path = os.path.dirname(upload_path)
+    folder_path = upload_path
     logging.info(f"Finding or creating folder path: '{folder_path}'")
 
     for segment in folder_path.strip("/").split("/"):
@@ -177,9 +177,7 @@ def create_asset(config_data, project_id, folder_id, file_path):
     if response.status_code != 201:
         logging.error("failed to create asset")       
         logging.debug(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        exit(1)
-    response = response.json()
-    return response
+    return response, response.status_code
 
 
 def multipart_upload_to_s3(asset_res, config_data,file_path):
@@ -403,14 +401,15 @@ def upload_metadata_to_asset(hostname, api_key, backlink_url, asset_id, properti
             "value": value
         }
         response = requests.post(url, headers=headers, data=payload)
+        response_json = response.json()
         if response.status_code in (200, 201):
-            response_json = response.json()
             logging.info(f"Added data successfully: {response_json}")
         else:
             logging.debug(f"Response error. Status - {response.status_code}, Error - {response.text}")
             logging.error("Failed to upload Metadata file: %s", response.text)
-
+            return { "status_code": response.status_code, "detail": response.text }
     logging.info("Asset metadata insertion completed")
+    return { "status_code": 200, "detail": "Metadata uploaded successfully" }
 
 
 
@@ -419,16 +418,17 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--mode", required=True, help="mode of Operation proxy or original upload")
     parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
-    parser.add_argument("-j", "--jobId", help="Job Id of SDNA job")
+    parser.add_argument("-j", "--job-guid", help="Job Guid of SDNA job")
     parser.add_argument("--parent-id", help="Optional parent folder ID to resolve relative upload paths from")
-    parser.add_argument("-cp", "--catalog-path", required=True, help="Path where catalog resides")
-    parser.add_argument("-sp", "--source-path", required=True, help="Source path of file to look for original upload")
+    parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
+    parser.add_argument("-sp", "--source-path", help="Source path of file to look for original upload")
     parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
     parser.add_argument("-up", "--upload-path", required=True, help="Path where file will be uploaded to frameIO")
     parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")
     parser.add_argument("--resolved-upload-id", action="store_true", help="Pass if upload path is already resolved ID")
+    parser.add_argument("--controller-address",help="Link IP/Hostname Port")
     args = parser.parse_args()
 
     setup_logging(args.log_level)
@@ -454,6 +454,9 @@ if __name__ == '__main__':
 
     project_id = cloud_config_data['project_id']
     logging.debug(f"Project id ----------------------->{project_id}")
+
+    if not cloud_config_data.get('hostname'):
+        cloud_config_data['hostname'] = "keycode"
     
     if mode == "get_base_target":
         upload_path = args.upload_path
@@ -500,12 +503,21 @@ if __name__ == '__main__':
             logging.warning(f"Could not validate size limit: {e}")
 
     catalog_path = remove_file_name_from_path(matched_file)
-    catalog_url = urllib.parse.quote(catalog_path)
+    normalized_path = catalog_path.replace("\\", "/")
+    if "/1/" in normalized_path:
+        relative_path = normalized_path.split("/1/", 1)[-1]
+    else:
+        relative_path = normalized_path
+    catalog_url = urllib.parse.quote(relative_path)
     filename_enc = urllib.parse.quote(file_name_for_url)
-    jobId = args.jobId
-    client_ip, client_port = get_link_address_and_port()
+    job_guid = args.job_guid
 
-    backlink_url = f"https://{client_ip}:{client_port}/dashboard/projects/{jobId}/browse&search?path={catalog_url}&filename={filename_enc}"
+    if args.controller_address is not None and len(args.controller_address.split(":")) == 2:
+        client_ip, client_port = args.controller_address.split(":")
+    else:
+        client_ip, client_port = get_link_address_and_port()
+
+    backlink_url = f"https://{client_ip}/dashboard/projects/{job_guid}/browse&search?path={catalog_url}&filename={filename_enc}"
     logging.debug(f"Generated dashboard URL: {backlink_url}")
 
     if args.dry_run:
@@ -522,20 +534,32 @@ if __name__ == '__main__':
     logging.info(f"Starting upload process to Frame.io")
     upload_path = args.upload_path
 
-    folder_id = get_folder_id(cloud_config_data, upload_path)
+    if args.resolved_upload_id:
+        folder_id = upload_path
+    else:
+        folder_id = get_folder_id(cloud_config_data, upload_path)
     logging.debug(f"Folder ID check -------------------------> {folder_id}")
 
-    asset = create_asset(cloud_config_data, project_id, folder_id, args.source_path)
-    asset_id = asset['result']['uuid']
+    response, status_code = create_asset(cloud_config_data, project_id, folder_id, args.source_path)
+    if status_code not in (200, 201):
+        print(f"Failed to create asset: {response.status_code} {response.text}")
+        sys.exit(1)
+    parsed_response = response.json()
+    asset_id = parsed_response['result']['uuid']
     logging.info(f"Asset upload Initiated. Asset id: {asset_id}")
 
-    multipart_upload_to_s3(asset['result'], cloud_config_data, args.source_path)
+    multipart_upload_to_s3(parsed_response['result'], cloud_config_data, args.source_path)
     logging.info(f"asset upload completed")
 
     meta_file = args.metadata_file
     if meta_file:
         logging.info("Applying metadata to uploaded asset...")
 
-        upload_metadata_to_asset(cloud_config_data['hostname'] ,cloud_config_data['api_key'], backlink_url, asset_id, meta_file)
+        response = upload_metadata_to_asset(cloud_config_data['hostname'] ,cloud_config_data['api_key'], backlink_url, asset_id, meta_file)
+        if response['status_code']  != 200:
+            print(f"Failed to upload file parts: {response['detail']}")
+            sys.exit(1)
+        else:
+            logging.info("All parts uploaded successfully to Frame.io")
         
     sys.exit(0)
