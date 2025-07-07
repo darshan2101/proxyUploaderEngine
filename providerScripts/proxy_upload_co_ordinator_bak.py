@@ -18,6 +18,7 @@ DEBUG_TO_FILE = True
 
 PROXY_GENERATION_HOST = "http://127.0.0.1:8000"
 PROVIDERS_SUPPORTING_GET_BASE_TARGET = {"frameio_v2", "frameio_v4", "tessact", "overcast", "trint"}
+PATH_BASED_PROVIDERS = {"dropbox", "s3"}
 
 # Mapping provider names to their respective upload scripts
 PROVIDER_SCRIPTS = {
@@ -28,7 +29,11 @@ PROVIDER_SCRIPTS = {
     "overcast": "overcasthq_uploader.py",
     "s3": "s3_uploder.py",
     "trint": "trint_uploder.py",
-    "twelvelabs": "twelvelabs_uploader.py"
+    "twelvelabs": "twelvelabs_uploader.py",
+    "box": "box_uploader.py",
+    "dropbox": "dropbox_uploader.py",
+    "google_drive": "google_drive_uploader.py",
+    "iconic": "iconic_uploader.py",
 }
 
 
@@ -227,7 +232,7 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
         full_upload_path = os.path.join(config["upload_path"], sub_path)
     else:
         base_source_path = original_source_path
-        full_upload_path = config["upload_path"]
+        full_upload_path = os.path.join(config["upload_path"], os.path.basename(original_source_path))
 
     # Using override_source_path if provided (for generated proxies)
     source_path = override_source_path if override_source_path else base_source_path
@@ -406,7 +411,10 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
         else:
             parent_folder_rel_path = config["upload_path"]
         
-        upload_path_id = resolved_ids.get(parent_folder_rel_path, resolved_ids[config["upload_path"]])
+        if config["provider"] in PATH_BASED_PROVIDERS:
+            upload_path_id = None
+        else:
+            upload_path_id = resolved_ids.get(parent_folder_rel_path, resolved_ids[config["upload_path"]])
         debug_print(config['logging_path'], f"[PATH-MATCH] {parent_folder_rel_path} -> using ID {upload_path_id}")
 
         # --- Proxy asset generation logic moved here ---
@@ -485,7 +493,10 @@ def process_csv_and_upload(config, dry_run=False):
     }
 
     send_progress(progressDetails, config["repo_guid"])
-    resolved_ids = build_folder_id_map(records, config, config["logging_path"])
+    if not config["provider"] in PATH_BASED_PROVIDERS:
+        resolved_ids = build_folder_id_map(records, config, config["logging_path"])
+    else:
+        resolved_ids = []
     debug_print(config["logging_path"],f" Resolved ids directory ---------------------------> {resolved_ids}")
     upload_results = []
     with ThreadPoolExecutor(max_workers=config["thread_count"]) as executor:

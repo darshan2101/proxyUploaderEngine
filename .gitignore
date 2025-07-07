@@ -3,6 +3,7 @@ extra
 logs
 Demo
 csv_logs
+test/newOnes
 proxyUploaderScripts
 providerScripts/framIO/test/
 providerScripts/frameIO/test/frame.py
