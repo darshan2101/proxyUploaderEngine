@@ -1,0 +1,19 @@
+{
+    "mode": "original",
+    "provider": "box",
+    "logging_path": "D:\\Dev\\(python +node) Wrappers\\proxyUploaderEngine\\logs\\proxyUploaderEngine\\box\\box.ailink.csv",
+    "progress_path": "D:\\Dev\\(python +node) Wrappers\\proxyUploaderEngine\\logs\\proxyUploaderEngine\\box\\box_progress.xml",
+    "thread_count": 2,
+    "extensions": [
+        ".mov",
+        ".mp4"
+    ],
+    "original_file_size_limit": 10,
+    "upload_path": "SDNA-DEMO/test/7539-wasd-2456",
+    "cloud_config_name": "sdna-box",
+    "job_guid": "125570F8-4A8B-159E-E25D-653D4500A022",
+    "job_id": 12,
+    "files_list": "D:\\Dev\\(python +node) Wrappers\\proxyUploaderEngine\\test\\original_file_list.csv",
+    "run_id": "run-1234",
+    "repo_guid": "repo-5678"
+}
