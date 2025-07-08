@@ -573,7 +573,7 @@ if __name__ == '__main__':
     if args.log_prefix:
         request_data["log_prefix"] = args.log_prefix
 
-    provider = request_data.get("type")
+    provider = request_data.get("provider")
     script_path = PROVIDER_SCRIPTS.get(provider)
     if not script_path:
         print(f"No script path found for provider: {provider}")
