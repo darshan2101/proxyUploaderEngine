@@ -79,7 +79,30 @@ def get_link_address_and_port():
 
     logging.info(f"Server connection details - Address: {ip}, Port: {port}")
     return ip, port 
-  
+
+def get_first_project(config_data):
+    logging.debug("Fetching first project from OvercastHQ")
+    url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/projects"
+    headers = {
+        'x-api-key': config_data["api_key"]
+    }
+    response = requests.get(url, headers=headers)
+
+    if response.status_code in (200, 201):
+        result = response.json().get("result", {})
+        items = result.get("items", [])
+        if items:
+            first_project = items[0]
+            first_project_id = first_project.get("uuid")
+            logging.info(f"First project ID: {first_project_id}")
+            return first_project_id
+        else:
+            logging.error("No projects found in OvercastHQ")
+            raise RuntimeError("No projects found in OvercastHQ")
+    else:
+        logging.error(f"Failed to fetch projects: {response.status_code} {response.text}")
+        raise RuntimeError(f"Failed to fetch projects: {response.status_code} {response.text}")
+
 def create_folder(config_data, name, project_id, parent_id=None):
     logging.info(f"Creating folder: {name}, project: {project_id}, parent: {parent_id}")
     url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/folders"
@@ -420,6 +443,7 @@ if __name__ == '__main__':
     parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
     parser.add_argument("-j", "--job-guid", help="Job Guid of SDNA job")
     parser.add_argument("--parent-id", help="Optional parent folder ID to resolve relative upload paths from")
+    parser.add_argument("-p", "--project-id", help="Project ID for OvercastHQ")
     parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
     parser.add_argument("-sp", "--source-path", help="Source path of file to look for original upload")
     parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
@@ -452,7 +476,12 @@ if __name__ == '__main__':
 
     cloud_config_data = cloud_config[cloud_config_name]
 
-    project_id = cloud_config_data['project_id']
+    if args.project_id:
+        project_id = args.project_id
+    elif "project_id" in cloud_config_data:
+        project_id = cloud_config_data["project_id"]
+    else:
+        project_id = get_first_project(cloud_config_data)
     logging.debug(f"Project id ----------------------->{project_id}")
 
     if not cloud_config_data.get('hostname'):
