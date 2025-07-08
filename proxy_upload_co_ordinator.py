@@ -17,8 +17,8 @@ DEBUG_PRINT = True
 DEBUG_TO_FILE = True
 
 PROXY_GENERATION_HOST = "http://127.0.0.1:8000"
-PROVIDERS_SUPPORTING_GET_BASE_TARGET = {"frameio_v2", "frameio_v4", "tessact", "overcast", "trint"}
-PATH_BASED_PROVIDERS = {"dropbox", "s3"}
+PROVIDERS_SUPPORTING_GET_BASE_TARGET = {"frameio_v2", "frameio_v4", "tessact", "overcasthq", "trint"}
+PATH_BASED_PROVIDERS = {"dropbox", "s3", "iconik"}
 
 # Mapping provider names to their respective upload scripts
 PROVIDER_SCRIPTS = {
@@ -26,14 +26,14 @@ PROVIDER_SCRIPTS = {
     "frameio_v2": "frame_io_v2_uploader.py",
     "frameio_v4": "frame_io_v4_uploader.py",
     "tessact": "tessact_uploader.py",
-    "overcast": "overcasthq_uploader.py",
+    "overcasthq": "overcasthq_uploader.py",
     "s3": "s3_uploder.py",
     "trint": "trint_uploder.py",
     "twelvelabs": "twelvelabs_uploader.py",
     "box": "box_uploader.py",
     "dropbox": "dropbox_uploader.py",
     "google_drive": "google_drive_uploader.py",
-    "iconic": "iconic_uploader.py",
+    "iconik": "iconik_uploader.py",
 }
 
 def debug_print(log_path, text_string):
@@ -267,6 +267,10 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
 
     if config["mode"] == "original" and "original_file_size_limit" in config:
         cmd.extend(["--size-limit", str(config["original_file_size_limit"])])
+    if config["provider"] == "iconik" and "collection_id" in config:
+        cmd.extend(["--collection-id", config["collection_id"]])
+    if config["provider"] == "overcasthq" and "project_id" in config:
+        cmd.extend(["--project-id", config["project_id"]])
     if metadata_path:
         cmd.extend(["--metadata-file", metadata_path])
     if config["controller_address"]:
