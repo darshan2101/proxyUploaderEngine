@@ -118,7 +118,7 @@ def update_asset(token, asset_id, properties_file):
     
     if not os.path.exists(properties_file):
         logging.error(f"Properties file not found: {properties_file}")
-        sys.exit(1)
+        return None, 204
 
     props = {}
     logging.debug(f"Reading properties from: {properties_file}")
@@ -142,7 +142,6 @@ def update_asset(token, asset_id, properties_file):
                 logging.debug(f"Loaded XML properties: {props}")
             else:
                 logging.error("No <meta-data> section found in XML.")
-                sys.exit(1)
                 
         else:
             with open(properties_file, 'r') as f:
@@ -153,8 +152,12 @@ def update_asset(token, asset_id, properties_file):
                         props[key] = value
                 logging.debug(f"Loaded CSV properties: {props}")
     except Exception as e:
-        logging.error(f"Failed to parse metadata file: {e}")
-        sys.exit(1)
+        logging.error(f"Failed to parse metadata file {properties_file}: {e}")
+        return None, 422  # Unprocessable Entity
+
+    if not props:
+        logging.warning(f"[Metadata Warning] No valid properties extracted from file: {properties_file}")
+        return None, 204
 
     headers = {
         'Content-Type': 'application/json',
@@ -305,9 +308,14 @@ if __name__ == '__main__':
     if meta_file:
         logging.info("Applying metadata to uploaded asset...")
         response, metadata_code = update_asset(token, asset_id, meta_file)
-        parsed = response.json()
-        if not parsed or metadata_code not in (200, 201):
-            print("Failed to upload metadata or no response received.")
-            sys.exit(1)
+
+        if metadata_code in (200, 201):
+            logging.info("Metadata update confirmed by Frame.io.")
+        elif metadata_code == 204:
+            logging.info("Metadata skipped (either not provided or not parseable).")
+        elif metadata_code == 422:
+            logging.warning("Metadata file found but could not be parsed. Skipping update.")
+        else:
+            logging.warning(f"Asset uploaded but metadata update failed with status {metadata_code}. See logs for details.")
 
     sys.exit(0)
