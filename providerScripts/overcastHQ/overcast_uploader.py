@@ -367,72 +367,73 @@ def complete_multipart_upload(asset_res, upload_id, etags, config_data):
 
 
 
-def upload_metadata_to_asset(hostname, api_key, backlink_url, asset_id, properties_file):
-    logging.info(f"Updating asset {asset_id} with properties from {properties_file}")
-    
-    if not os.path.exists(properties_file):
-        logging.error(f"Properties file not found: {properties_file}")
-        sys.exit(1)
+def parse_metadata_file(properties_file):
+    metadata = {}
 
-    metadata = {
-        "fabric URL": backlink_url
-    }
-    logging.debug(f"Reading properties from: {properties_file}")
-    file_ext = properties_file.lower()
+    if not os.path.exists(properties_file):
+        logging.warning(f"Metadata file not found: {properties_file}")
+        return metadata
+
     try:
+        file_ext = properties_file.lower()
+
         if file_ext.endswith(".json"):
             with open(properties_file, 'r') as f:
-                metadata = json.load(f)
-                logging.debug(f"Loaded JSON properties: {metadata}")
+                metadata.update(json.load(f))
 
         elif file_ext.endswith(".xml"):
             tree = ET.parse(properties_file)
             root = tree.getroot()
             metadata_node = root.find("meta-data")
-            if metadata_node is not None:
+            if metadata_node:
                 for data_node in metadata_node.findall("data"):
                     key = data_node.get("name")
                     value = data_node.text.strip() if data_node.text else ""
                     if key:
                         metadata[key] = value
-                logging.debug(f"Loaded XML properties: {metadata}")
             else:
-                logging.error("No <meta-data> section found in XML.")
-                sys.exit(1)
-                
-        else:
+                logging.warning("No <meta-data> section found in XML.")
+
+        else:  # assume CSV
             with open(properties_file, 'r') as f:
                 for line in f:
                     parts = line.strip().split(',')
                     if len(parts) == 2:
                         key, value = parts[0].strip(), parts[1].strip()
                         metadata[key] = value
-                logging.debug(f"Loaded CSV properties: {metadata}")
+
     except Exception as e:
-        logging.error(f"Failed to parse metadata file: {e}")
-        sys.exit(1)
+        logging.error(f"Failed to parse {properties_file}: {e}")
 
-    headers = {
-        'x-api-key': api_key
-    }
-    logging.debug("Sending asset update request to Overcast API (form-data)")
+    return metadata
 
+def upload_metadata_to_asset(hostname, api_key, backlink_url, asset_id, properties_file):
+    logging.info(f"Updating asset {asset_id} with properties from {properties_file}")
+
+    metadata = {"fabric URL": backlink_url}
+    parsed_metadata = parse_metadata_file(properties_file)
+    metadata.update(parsed_metadata)
+
+    headers = {'x-api-key': api_key}
     url = f"https://api-{hostname}.overcasthq.com/v1/assets/{asset_id}/metadata"
+
     for key, value in metadata.items():
-        payload = {
-            "key": key,
-            "value": value
-        }
-        response = requests.post(url, headers=headers, data=payload)
-        response_json = response.json()
-        if response.status_code in (200, 201):
-            logging.info(f"Added data successfully: {response_json}")
-        else:
-            logging.debug(f"Response error. Status - {response.status_code}, Error - {response.text}")
-            logging.error("Failed to upload Metadata file: %s", response.text)
-            return { "status_code": response.status_code, "detail": response.text }
-    logging.info("Asset metadata insertion completed")
-    return { "status_code": 200, "detail": "Metadata uploaded successfully" }
+        payload = { "key": key, "value": value }
+        logging.debug(f"Sending: {payload}")
+        
+        try:
+            response = requests.post(url, headers=headers, data=payload)
+            if response.status_code in (200, 201):
+                logging.info(f"Uploaded: {key} = {value}")
+            else:
+                logging.error(f"Failed [{response.status_code}]: {response.text}")
+                return {"status_code": response.status_code, "detail": response.text}
+        except Exception as e:
+            logging.error(f"Request error for key '{key}': {e}")
+            return {"status_code": 500, "detail": str(e)}
+
+    logging.info("All metadata uploaded successfully.")
+    return {"status_code": 200, "detail": "Metadata uploaded successfully"}
 
 
 

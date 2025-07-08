@@ -227,21 +227,20 @@ def finalize_upload(base_url, token, payload):
         print(f"Failed to finalize upload {response.text}")
     return response.json(), response.status_code
 
-def upload_metadata_to_asset(base_url, token, backlink_url, asset_id, properties_file):
-    logging.info(f"Updating asset {asset_id} with properties from {properties_file}")
+def parse_metadata_file(properties_file):
+    props = {}
+    file_ext = properties_file.lower()
 
     if not os.path.exists(properties_file):
-        logging.error(f"Properties file not found: {properties_file}")
-        sys.exit(1)
+        logging.warning(f"Properties file not found: {properties_file}")
+        return props
 
-    props = {}
-    logging.debug(f"Reading properties from: {properties_file}")
-    file_ext = properties_file.lower()
     try:
+        logging.debug(f"Reading properties from: {properties_file}")
+
         if file_ext.endswith(".json"):
             with open(properties_file, 'r') as f:
                 props = json.load(f)
-                logging.debug(f"Loaded JSON properties: {props}")
 
         elif file_ext.endswith(".xml"):
             tree = ET.parse(properties_file)
@@ -253,28 +252,28 @@ def upload_metadata_to_asset(base_url, token, backlink_url, asset_id, properties
                     value = data_node.text.strip() if data_node.text else ""
                     if key:
                         props[key] = value
-                logging.debug(f"Loaded XML properties: {props}")
             else:
-                logging.error("No <meta-data> section found in XML.")
-                sys.exit(1)
+                logging.warning("No <meta-data> section found in XML.")
 
-        else:
+        else:  # Assume CSV or key-value flat file
             with open(properties_file, 'r') as f:
                 for line in f:
                     parts = line.strip().split(',')
                     if len(parts) == 2:
                         key, value = parts[0].strip(), parts[1].strip()
                         props[key] = value
-                logging.debug(f"Loaded CSV properties: {props}")
 
+        logging.debug(f"Parsed metadata: {props}")
     except Exception as e:
         logging.error(f"Failed to parse metadata file: {e}")
-        sys.exit(1)
 
-    headers = {
-        'Content-Type': 'application/json',
-        'Authorization': f'Bearer {token}'
-    }
+    return props
+
+
+def upload_metadata_to_asset(base_url, token, backlink_url, asset_id, properties_file):
+    logging.info(f"Updating asset {asset_id} with properties from {properties_file}")
+
+    props = parse_metadata_file(properties_file)
 
     metadata = [
         {
@@ -283,6 +282,7 @@ def upload_metadata_to_asset(base_url, token, backlink_url, asset_id, properties
             "value": backlink_url
         }
     ]
+
     for k, v in props.items():
         metadata.append({
             "field_name": k,
@@ -295,6 +295,11 @@ def upload_metadata_to_asset(base_url, token, backlink_url, asset_id, properties
         'metadata': metadata
     }
 
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {token}'
+    }
+
     url = f'{base_url}/api/v1/value_instances/bulk_update/'
     response = requests.post(url, headers=headers, data=json.dumps(payload))
 
@@ -303,6 +308,7 @@ def upload_metadata_to_asset(base_url, token, backlink_url, asset_id, properties
         logging.info("Uploaded successfully")
     else:
         logging.error("Failed to upload Metadata file: %s", response.text)
+
     return response, response.status_code
 
 if __name__ == '__main__':
@@ -467,7 +473,6 @@ if __name__ == '__main__':
         response, metadata_code = upload_metadata_to_asset(cloud_config_data['base_url'] ,token, backlink_url, file_id, meta_file)
         parsed = response.json()
         if not parsed or metadata_code not in (200, 201):
-            print("Failed to upload metadata or no response received.")
-            sys.exit(1)
+            print("File uploaded successfully but Failed to upload metadata.")
 
     sys.exit(0)
