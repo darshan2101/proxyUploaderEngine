@@ -254,7 +254,9 @@ if __name__ == '__main__':
         sys.exit(1)
 
     cloud_config_data = cloud_config[cloud_config_name]
-    
+    if not cloud_config_data.get('domain'):
+        cloud_config_data['domain'] = "https://api.frame.io"
+        
     project_id = cloud_config_data['project_id']
     logging.info(f"project Id ----------------------->{project_id}")
     
