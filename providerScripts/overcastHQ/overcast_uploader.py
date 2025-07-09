@@ -502,7 +502,7 @@ if __name__ == '__main__':
 
         logging.info(f"Fetching upload target ID for path: {upload_path}")
         base_id = args.parent_id or None
-        up_id = get_folder_id(upload_path, cloud_config_data, base_id) if '/' in upload_path else upload_path
+        up_id = get_folder_id(cloud_config_data, upload_path, base_id) if '/' in upload_path else upload_path
         print(up_id)
         sys.exit(0)
 
