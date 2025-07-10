@@ -361,7 +361,7 @@ if __name__ == '__main__':
         print(f"Failed to create asset: {asset_info.text}")
         sys.exit(1)
 
-    parts_info = upload_parts(args.source_path, asset_info)
+    parts_info = upload_parts(args.source_path, asset_info.json())
     if parts_info["status_code"] != 200:
         print(f"Failed to upload file parts: {parts_info['detail']}")
         sys.exit(1)
