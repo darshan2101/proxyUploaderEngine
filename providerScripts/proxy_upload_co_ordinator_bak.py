@@ -478,6 +478,11 @@ def process_csv_and_upload(config, dry_run=False):
     exts = config.get("extensions") if config.get("mode") == "original" and config.get("extensions") else []
     file_size_limit = config.get("original_file_size_limit") if config.get("mode") == "original" and config.get("original_file_size_limit") else None
     records = read_csv_records(config["files_list"], config["logging_path"], exts, file_size_limit)
+    if not records:
+        size_limit_str = f"{file_size_limit} MB" if file_size_limit else "No Limit"
+        extensions_str = ", ".join(exts) if exts else "All"
+        print(f"No records found with size <= {size_limit_str} and extensions: {extensions_str}")
+        sys.exit(0)    
     total_size = calculate_total_size(records, config)
 
     progressDetails = {
