@@ -418,7 +418,7 @@ def upload_metadata_to_asset(hostname, api_key, backlink_url, asset_id, properti
     url = f"https://api-{hostname}.overcasthq.com/v1/assets/{asset_id}/metadata"
 
     for key, value in metadata.items():
-        payload = { "key": key, "value": value }
+        payload = { "key": key, "value": value if value not in (None, '', [], {}) else "N/A" }
         logging.debug(f"Sending: {payload}")
         
         try:
