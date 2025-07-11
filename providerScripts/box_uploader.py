@@ -330,7 +330,7 @@ if __name__ == '__main__':
         except Exception as e:
             logging.warning(f"Could not validate size limit: {e}")
 
-    catalog_path = remove_file_name_from_path(matched_file)
+    catalog_path = remove_file_name_from_path(catalog_path)
     normalized_path = catalog_path.replace("\\", "/")
     if "/1/" in normalized_path:
         relative_path = normalized_path.split("/1/", 1)[-1]
