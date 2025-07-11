@@ -283,13 +283,13 @@ if __name__ == '__main__':
     logging.debug(f"Upload path: {args.upload_path}")
     
     parsed_token = json.loads(cloud_config_data.get('token')) if 'token' in cloud_config_data else None
-    print(f"Parsed token: {parsed_token}")
+    logging.info(f"Parsed token: {parsed_token}")
 
     oauth = OAuth2(
         client_id=cloud_config_data['client_id'],
         client_secret=cloud_config_data['client_secret'],
-        access_token= parsed_token["accessToken"] if parsed_token else cloud_config_data['access_token'],
-        refresh_token=parsed_token["refreshToken"] if parsed_token else cloud_config_data.get('refresh_token', None),
+        access_token= parsed_token["access_token"] if parsed_token else cloud_config_data['access_token'],
+        refresh_token=parsed_token["refresh_token"] if parsed_token else cloud_config_data.get('refresh_token', None),
     )
     client = Client(oauth)
     
