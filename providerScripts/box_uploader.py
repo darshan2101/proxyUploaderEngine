@@ -17,7 +17,7 @@ import time
 # Constants
 VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet"]
 CHUNK_SIZE = 5 * 1024 * 1024
-CONFLICT_RESOLUTION = "new_version"  # Options: 'overwrite', 'new_version', 'skip', 'rename'
+# CONFLICT_RESOLUTION = "new_version"  # Options: 'overwrite', 'new_version', 'skip', 'rename'
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
@@ -423,8 +423,10 @@ if __name__ == '__main__':
     else:
         folder_id = ensure_path(client, args.upload_path)
     print(f"Resolved upload path to folder ID: {folder_id}")
+    
+    conflict_resolution_mode = cloud_config_data.get('conflict_resolution', 'overwrite')
       
-    asset = upload_file_with_conflict_resolution(client, folder_id, args.source_path, CONFLICT_RESOLUTION)
+    asset = upload_file_with_conflict_resolution(client, folder_id, args.source_path, )
     if asset.get("success"):
         logging.info(f"File uploaded successfully: {args.source_path}")
         if parsed is not None:
