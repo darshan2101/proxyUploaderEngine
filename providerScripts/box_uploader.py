@@ -53,7 +53,6 @@ def calculate_sha1(file_path,chunk_size):
     return sha1.digest()
 
 def get_cloud_config_path():
-    logging.debug("Determining cloud config path based on platform")
     if IS_LINUX:
         parser = ConfigParser()
         parser.read(DNA_CLIENT_SERVICES)
@@ -70,7 +69,6 @@ def get_link_address_and_port():
     try:
         with open(SERVERS_CONF_PATH) as f:
             lines = f.readlines()
-            logging.debug(f"Successfully read {len(lines)} lines from config")
 
         if IS_LINUX:
             for line in lines:
@@ -100,13 +98,11 @@ def prepare_metadata_to_upload( backlink_url, properties_file):
     if not os.path.exists(properties_file):
         logging.warning(f"Metadata file not found: {properties_file}")
         return metadata
-    logging.debug(f"Reading properties from: {properties_file}")
     file_ext = properties_file.lower()
     try:
         if file_ext.endswith(".json"):
             with open(properties_file, 'r') as f:
                 metadata = json.load(f)
-                logging.debug(f"Loaded JSON properties: {metadata}")
 
         elif file_ext.endswith(".xml"):
             tree = ET.parse(properties_file)
@@ -118,7 +114,6 @@ def prepare_metadata_to_upload( backlink_url, properties_file):
                     value = data_node.text.strip() if data_node.text else ""
                     if key:
                         metadata[key] = value
-                logging.debug(f"Loaded XML properties: {metadata}")
             else:
                 logging.warning("No <meta-data> section found in XML.")
         else:
@@ -128,77 +123,53 @@ def prepare_metadata_to_upload( backlink_url, properties_file):
                     if len(parts) == 2:
                         key, value = parts[0].strip(), parts[1].strip()
                         metadata[key] = value
-                logging.debug(f"Loaded CSV properties: {metadata}")
     except Exception as e:
         logging.error(f"Failed to parse {properties_file}: {e}")
     
     return metadata
-
 def apply_metadata_with_upsert(file_obj, metadata_dict, template='properties', scope='global'):
     try:
         # Try to create metadata
-        applied_metadata = file_obj.metadata(scope, template).create(metadata_dict)
-        logging.info(f"Metadata created: {applied_metadata}")
-        return applied_metadata
+        return file_obj.metadata(scope, template).create(metadata_dict)
     except BoxAPIException as e:
         if e.status == 409 and 'conflict' in str(e).lower():
-            # Metadata already exists, so update it
-            logging.info("Metadata already exists, updating instead.")
+            # Metadata exists, so update instead
             update_ops = MetadataUpdate()
             for key, value in metadata_dict.items():
-                update_ops.add(key, value)  # add() will update if key exists, or add if not
-            updated_metadata = file_obj.metadata(scope, template).update(update_ops)
-            logging.info(f"Metadata updated: {updated_metadata}")
-            return updated_metadata
+                update_ops.add(key, value)
+            return file_obj.metadata(scope, template).update(update_ops)
         else:
             raise
 
+
 def get_or_create_folder(client, folder_name, parent_id):
-    start_time = time.time()
-    logging.debug(f"[get_or_create_folder] Start: folder_name='{folder_name}', parent_id='{parent_id}'")
     try:
         parent_folder = client.folder(folder_id=parent_id)
         items = parent_folder.get_items(limit=1000, offset=0)
         for item in items:
             if item.name == folder_name and item.type == 'folder':
-                elapsed = time.time() - start_time
                 return item.id
-
         created_folder = parent_folder.create_subfolder(folder_name)
-        logging.debug(f"[get_or_create_folder] Created folder: {created_folder}")
-        elapsed = time.time() - start_time
         return created_folder.id
     except Exception as e:
-        elapsed = time.time() - start_time
-        logging.error(f"[get_or_create_folder] Error after {elapsed:.3f}s in get_or_create_folder('{folder_name}', '{parent_id}'): {e}", exc_info=True)
+        logging.error(f"[get_or_create_folder] Error in get_or_create_folder('{folder_name}', '{parent_id}'): {e}", exc_info=True)
         raise
+
 
 def ensure_path(client, path, base_id="0"):
-    start_time = time.time()
-    logging.debug(f"[ensure_path] Start: path='{path}', base_id='{base_id}'")
     try:
         current_folder_id = base_id
-        last_folder_id = None
         segments = path.strip("/").split("/")
-        logging.debug(f"[ensure_path] Path segments: {segments}")
-        for idx, segment in enumerate(segments):
+        for segment in segments:
             if segment:
-                logging.debug(f"[ensure_path] ({idx+1}/{len(segments)}) Ensuring folder '{segment}' exists under parent ID '{current_folder_id}'")
-                last_folder_id = get_or_create_folder(client, segment, current_folder_id)
-                current_folder_id = last_folder_id
-        return last_folder_id
+                current_folder_id = get_or_create_folder(client, segment, current_folder_id)
+        return current_folder_id
     except Exception as e:
-        elapsed = time.time() - start_time
-        logging.error(f"[ensure_path] Error after {elapsed:.3f}s in ensure_path('{path}', base_id='{base_id}'): {e}", exc_info=True)
+        logging.error(f"[ensure_path] Error in ensure_path('{path}', base_id='{base_id}'): {e}", exc_info=True)
         raise
 
+
 def resolve_conflict_and_prepare_upload(folder, file_name, conflict_resolution):
-    """
-    Checks for file name conflicts in the folder and returns:
-    - existing_file: the Box file object if it exists, else None
-    - upload_name: the name to use for upload
-    - skip_upload: True if should skip (for 'skip' mode)
-    """
     items = folder.get_items(limit=1000)
     existing_file = None
     existing_names = set()
@@ -219,17 +190,13 @@ def resolve_conflict_and_prepare_upload(folder, file_name, conflict_resolution):
                 new_name = f"{base} ({counter}){ext}"
                 counter += 1
             return None, new_name, False
-        # For overwrite and new_version, keep the same name
         else:
             return existing_file, file_name, False
     else:
         return None, file_name, False
 
+
 def upload_file_with_conflict_resolution(client, folder_id, file_path, conflict_resolution="overwrite"):
-    """
-    Uploads file to Box, handling conflicts per the specified strategy.
-    conflict_resolution: 'overwrite', 'new_version', 'skip', 'rename'
-    """
     logging.debug(f"Starting upload for file: {file_path} to folder ID: {folder_id}")
     try:
         file_name = os.path.basename(file_path)
@@ -237,13 +204,12 @@ def upload_file_with_conflict_resolution(client, folder_id, file_path, conflict_
         folder = client.folder(folder_id).get()
         min_upload_session_size = 20000000  # 20 MB
 
-        # Check for conflicts and determine upload name/target
         existing_file, upload_name, skip_upload = resolve_conflict_and_prepare_upload(
             folder, file_name, conflict_resolution
         )
 
         if skip_upload:
-            logging.info(f"File {file_name} exists. Skipping upload as per conflict_resolution.")
+            logging.warning(f"File {file_name} exists and is being skipped (conflict_resolution=skip).")
             return {
                 "success": True,
                 "file_id": existing_file.id,
@@ -252,22 +218,15 @@ def upload_file_with_conflict_resolution(client, folder_id, file_path, conflict_
                 "skipped": True
             }
 
-        # Small file: simple upload
+        # Small file
         if file_size < min_upload_session_size:
-            try:
-                if existing_file and conflict_resolution == "new_version":
-                    # Upload as new version
-                    file_obj = client.file(existing_file.id)
-                    uploaded_file = file_obj.update_contents(file_path)
-                elif existing_file and conflict_resolution == "overwrite":
-                    # Overwrite (Box SDK will upload as new version)
-                    uploaded_file = folder.upload(file_path, file_name=upload_name, overwrite=True)
-                else:
-                    # New file or renamed
-                    uploaded_file = folder.upload(file_path, file_name=upload_name)
-            except BoxAPIException as e:
-                logging.error(f"BoxAPIException during small file upload: {e}")
-                raise
+            if existing_file and conflict_resolution == "new_version":
+                file_obj = client.file(existing_file.id)
+                uploaded_file = file_obj.update_contents(file_path)
+            elif existing_file and conflict_resolution == "overwrite":
+                uploaded_file = folder.upload(file_path, file_name=upload_name, overwrite=True)
+            else:
+                uploaded_file = folder.upload(file_path, file_name=upload_name)
             return {
                 "success": True,
                 "file_id": uploaded_file.id,
@@ -275,40 +234,34 @@ def upload_file_with_conflict_resolution(client, folder_id, file_path, conflict_
                 "size": uploaded_file.size
             }
 
-        # Large file: chunked upload
+        # Large file (chunked upload)
         else:
-            try:
-                if existing_file and conflict_resolution in ("overwrite", "new_version"):
-                    # Upload new version using chunked upload
-                    file_obj = client.file(existing_file.id)
-                    upload_session = file_obj.create_upload_session(file_size=file_size)
-                else:
-                    # New file or renamed
-                    upload_session = folder.create_upload_session(file_name=upload_name, file_size=file_size)
+            if existing_file and conflict_resolution in ("overwrite", "new_version"):
+                file_obj = client.file(existing_file.id)
+                upload_session = file_obj.create_upload_session(file_size=file_size)
+            else:
+                upload_session = folder.create_upload_session(file_name=upload_name, file_size=file_size)
 
-                chunk_size = upload_session.part_size
-                parts = []
-                offset = 0
-                with open(file_path, 'rb') as file_stream:
-                    while offset < file_size:
-                        bytes_to_read = min(chunk_size, file_size - offset)
-                        part_data = file_stream.read(bytes_to_read)
-                        part = upload_session.upload_part_bytes(
-                            part_data,
-                            offset=offset,
-                            total_size=file_size
-                        )
-                        parts.append(part)
-                        offset += bytes_to_read
+            chunk_size = upload_session.part_size
+            parts = []
+            offset = 0
+            with open(file_path, 'rb') as file_stream:
+                while offset < file_size:
+                    bytes_to_read = min(chunk_size, file_size - offset)
+                    part_data = file_stream.read(bytes_to_read)
+                    part = upload_session.upload_part_bytes(
+                        part_data,
+                        offset=offset,
+                        total_size=file_size
+                    )
+                    parts.append(part)
+                    offset += bytes_to_read
 
-                content_sha1 = calculate_sha1(file_path, chunk_size)
-                uploaded_file = upload_session.commit(
-                    parts=parts,
-                    content_sha1=content_sha1
-                )
-            except BoxAPIException as e:
-                logging.error(f"BoxAPIException during chunked upload: {e}")
-                raise
+            content_sha1 = calculate_sha1(file_path, chunk_size)
+            uploaded_file = upload_session.commit(
+                parts=parts,
+                content_sha1=content_sha1
+            )
             return {
                 "success": True,
                 "file_id": uploaded_file.id,
@@ -316,8 +269,14 @@ def upload_file_with_conflict_resolution(client, folder_id, file_path, conflict_
                 "size": uploaded_file.size
             }
 
+    except BoxAPIException as e:
+        logging.error(f"[BoxAPIException] Failed to upload file: {file_path} -> {str(e)}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e)
+        }
     except Exception as e:
-        logging.error(f"Failed to upload file: {file_path}, Error: {str(e)}")
+        logging.error(f"[Exception] Failed to upload file: {file_path} -> {str(e)}", exc_info=True)
         return {
             "success": False,
             "error": str(e)
