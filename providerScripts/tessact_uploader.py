@@ -195,9 +195,9 @@ def initiate_upload(file_path, config_data, token, parent_id=None):
     if response.status_code in (200, 201):
         logging.info("File Upload Initiated successfully")
     else:
-        detail = response.json().get("detail", response.text)
+        detail = response.text
         logging.error(f"Failed to Initiate File Upload {detail}")
-    return response.json(), response.status_code  
+    return response, response.status_code  
 
 def upload_parts(file_path, presigned_urls):
     etags = []
@@ -443,10 +443,11 @@ if __name__ == '__main__':
     logging.info(f"Upload location ID: {folder_id}")
 
     # Initiate upload with chunks
-    upload_meta, initialization_code = initiate_upload(args.source_path, cloud_config_data, token, folder_id)
+    response, initialization_code = initiate_upload(args.source_path, cloud_config_data, token, folder_id)
     if initialization_code not in (200, 201):
-        print(f"Failed to initiate upload. {upload_meta}.")
+        print(f"Failed to initiate upload.")
         sys.exit(1)
+    upload_meta = response.json()
     file_id = upload_meta["data"]["id"]
     upload_id = upload_meta["upload_id"]
     presigned_urls = upload_meta["presigned_urls"]
