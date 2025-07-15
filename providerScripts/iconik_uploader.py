@@ -611,19 +611,6 @@ if __name__ == '__main__':
         sys.exit(0)
 
     logging.info(f"Starting upload process to Google Drive in {mode} mode")
-    
-            
-    # current_id = collection_id
-    # for folder in upload_path.strip("/").split("/"):
-    #     if not folder is None and len(folder)!= 0:
-    #         folders = get_call_of_collections_content(cloud_config_data ,current_id)
-    #         for f in folders:
-    #             if 'files' not in f and f['title'] == folder:
-    #                 current_id = f['id']
-    #                 break
-    #         else:
-    #             current_id = create_collection(cloud_config_data,folder,current_id)
-    # logging.info(f"Final Collection ID: {current_id}")
  
     storage_name = cloud_config_data["name"] if not cloud_config_data["name"] is None and len(cloud_config_data["name"]) != 0 else "iconik-files-gcs"
     storage_method = cloud_config_data["method"] if not cloud_config_data["method"] is None and len(cloud_config_data["method"]) != 0 else "GCS"
