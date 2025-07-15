@@ -178,6 +178,23 @@ def create_collection(config, collection_name, parent_id=None):
         sys.exit(1)
     return response.json()['id']
 
+def find_or_create_collection_path(config, collection_path, base_collection_id=None):
+    current_id = base_collection_id
+    for folder in collection_path.strip('/').split('/'):
+        if not folder:
+            continue
+        # Fetch contents of the current collection
+        contents = get_call_of_collections_content(config, current_id) if current_id else []
+        # Check if the folder exists as a collection
+        matched = next((item for item in contents if 'files' not in item and item.get('title') == folder), None)
+        if matched:
+            current_id = matched['id']
+        else:
+            # Create collection under current_id
+            current_id = create_collection(config, folder, current_id)
+    return current_id
+
+
 def get_call_of_collections_content(config, collection_id):
     url = f"{DOMAIN}/API/assets/v1/collections/{collection_id}/contents"
     headers = {
@@ -474,6 +491,7 @@ if __name__ == '__main__':
     parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
     parser.add_argument("-j", "--job-guid", help="Job Guid of SDNA job")
     parser.add_argument("--collection-id", help="Collection ID to resolve relative upload paths from") 
+    parser.add_argument("--parent-id", help="Optional parent collection ID to resolve relative upload paths from") 
     parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
     parser.add_argument("-sp", "--source-path", help="Source path of file to look for original upload")
     parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
@@ -481,6 +499,7 @@ if __name__ == '__main__':
     parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")
+    parser.add_argument("--resolved-upload-id", action="store_true", help="Pass if upload path is already resolved collection ID")
     parser.add_argument("--controller-address",help="Link IP/Hostname Port")
     args = parser.parse_args()
     
@@ -513,6 +532,24 @@ if __name__ == '__main__':
         collection_id = cloud_config_data["collection_id"]
     else:
         collection_id = get_first_collection(cloud_config_data)
+        
+    if mode == "get_base_target":
+        upload_path = args.upload_path
+        if not upload_path:
+            logging.error("Upload path must be provided for get_base_target mode")
+            sys.exit(1)
+
+        logging.info(f"Fetching upload target ID for path: {upload_path}")
+        
+        if args.resolved_upload_id:
+            print(args.upload_path)
+            sys.exit(0)
+
+        logging.info(f"Fetching upload target ID for path: {upload_path}")
+        base_id = args.parent_id or collection_id
+        up_id = find_or_create_collection_path(cloud_config_data, upload_path, base_id) if '/' in upload_path else upload_path
+        print(up_id)
+        sys.exit(0)
     
     matched_file = args.source_path
     catalog_path = args.catalog_path
@@ -576,23 +613,30 @@ if __name__ == '__main__':
     logging.info(f"Starting upload process to Google Drive in {mode} mode")
     
             
-    current_id = collection_id
-    for folder in upload_path.strip("/").split("/"):
-        if not folder is None and len(folder)!= 0:
-            folders = get_call_of_collections_content(cloud_config_data ,current_id)
-            for f in folders:
-                if 'files' not in f and f['title'] == folder:
-                    current_id = f['id']
-                    break
-            else:
-                current_id = create_collection(cloud_config_data,folder,current_id)
-    logging.info(f"Final Collection ID: {current_id}")
+    # current_id = collection_id
+    # for folder in upload_path.strip("/").split("/"):
+    #     if not folder is None and len(folder)!= 0:
+    #         folders = get_call_of_collections_content(cloud_config_data ,current_id)
+    #         for f in folders:
+    #             if 'files' not in f and f['title'] == folder:
+    #                 current_id = f['id']
+    #                 break
+    #         else:
+    #             current_id = create_collection(cloud_config_data,folder,current_id)
+    # logging.info(f"Final Collection ID: {current_id}")
  
     storage_name = cloud_config_data["name"] if not cloud_config_data["name"] is None and len(cloud_config_data["name"]) != 0 else "iconik-files-gcs"
     storage_method = cloud_config_data["method"] if not cloud_config_data["method"] is None and len(cloud_config_data["method"]) != 0 else "GCS"
     
+    if args.upload_path and args.resolved_upload_id:
+        collection_to_use = args.upload_path
+    elif args.upload_path and not args.resolved_upload_id:
+        collection_to_use = find_or_create_collection_path(cloud_config_data, args.upload_path, collection_id)
+    else:
+        collection_to_use = collection_id
+    
     if storage_method and storage_name:
-        collection = current_id
+        collection = collection_to_use
         file_name = extract_file_name(matched_file)
         storage_id = get_storage_id(cloud_config_data, storage_name,storage_method)
         asset_id, user_id = create_asset_id(cloud_config_data, file_name,collection)
