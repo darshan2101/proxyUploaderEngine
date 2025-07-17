@@ -508,7 +508,7 @@ def process_csv_and_upload(config, dry_run=False):
     setup_log_and_progress_paths(config)
     transferred_log, issues_log, client_log = prepare_log_files(config)
     
-    exts = config.get("extensions") if config.get("mode") == "original" and config.get("extensions") else []
+    exts = exts = config["extensions"] if config.get("mode") in ("original", "proxy") and config.get("extensions") else []
     file_size_limit = config.get("original_file_size_limit") if config.get("mode") == "original" and config.get("original_file_size_limit") else None
     records = read_csv_records(config["files_list"], config["logging_path"], exts, file_size_limit)
     if not records:
