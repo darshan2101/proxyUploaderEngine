@@ -107,33 +107,47 @@ def resolve_base_upload_id(logging_path,script_path, cloud_config_name, upload_p
         return upload_path
 
 # Locates proxy file by filename pattern inside a directory tree
-def resolve_proxy_file(directory, pattern):
-    logging.debug(f"Searching for proxy in {directory} with pattern {pattern}")
-    try:
-        base_path = Path(directory)
-        if not base_path.exists():
-            logging.error(f"Directory does not exist: {directory}")
-            return None
+def resolve_proxy_file(proxy_dir, original_source_path, pattern, log_path):
+    base_dir = Path(proxy_dir)
 
-        if not base_path.is_dir() or not os.access(directory, os.R_OK):
-            logging.error(f"No read permission for directory: {directory}")
-            return None
+    # Flat search (first-level, non-recursive)
+    flat_matches = list(base_dir.glob(pattern))
+    if flat_matches:
+        resolved_path = str(flat_matches[0])
+        debug_print(log_path, f"[FLAT] Using proxy file for upload: {resolved_path}")
+        return resolved_path
 
-        matched_files = sorted(
-            [str(f) for f in base_path.rglob(pattern) if f.is_file()]
-        )
+    # Mirror structure search
+    mirror_path = base_dir / Path(original_source_path).parent
+    if mirror_path.exists():
+        mirror_matches = list(mirror_path.glob(pattern))
+        if mirror_matches:
+            resolved_path = str(mirror_matches[0])
+            debug_print(log_path, f"[MIRROR] Using proxy file for upload: {resolved_path}")
+            return resolved_path
 
-        if matched_files:
-            chosen_file = matched_files[0]
-            logging.debug(f"Selected proxy file: {chosen_file}")
-            return chosen_file
-        else:
-            logging.debug(f"No matching proxy files found for {pattern} in {directory}")
-            return None
+    # Segment-stripping search
+    path_segments = Path(original_source_path).parts
+    for i in range(1, len(path_segments)):
+        sub_path = Path(*path_segments[i:-1])  # Exclude i leading segments + filename
+        search_path = base_dir / sub_path
+        if search_path.exists():
+            strip_matches = list(search_path.glob(pattern))
+            if strip_matches:
+                resolved_path = str(strip_matches[0])
+                debug_print(log_path, f"[SEGMENT STRIP] Using proxy file for upload: {resolved_path}")
+                return resolved_path
 
-    except Exception as e:
-        logging.error(f"Proxy resolution failed: {e}")
-        return None
+    # Fallback to rglob (recursive, full-tree)
+    fallback_matches = sorted([str(f) for f in base_dir.rglob(pattern) if f.is_file()])
+    if fallback_matches:
+        resolved_path = fallback_matches[0]
+        debug_print(log_path, f"[FALLBACK RGLOB] Using proxy file for upload: {resolved_path}")
+        return resolved_path
+
+    # Nothing found
+    debug_print(log_path, "[MISS] No proxy file found for this pattern.")
+    return None
 
 # validate params per mode for proxy_generation
 def validate_proxy_params(mode, params):
@@ -243,7 +257,7 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
     if config["mode"] == "proxy" and original_ext in extensions_lower:
         base_name = os.path.splitext(os.path.basename(base_source_path))[0]
         pattern = f"{base_name}*.*"
-        resolved_path = resolve_proxy_file(config["proxy_directory"], pattern)
+        resolved_path = resolve_proxy_file(config["proxy_directory"], base_source_path , pattern, config["logging_path"])
 
         if resolved_path:
             source_path = resolved_path
@@ -367,7 +381,7 @@ def calculate_total_size(records, config):
         if config["mode"] == "proxy":
             base_name = os.path.splitext(os.path.basename(full_path))[0]
             pattern = f"{base_name}*.*"
-            proxy = resolve_proxy_file(config["proxy_directory"], pattern, config["extensions"])
+            proxy = resolve_proxy_file(config["proxy_directory"], full_path, pattern, config["logging_path"])
             if proxy and os.path.exists(proxy):
                 total_size += os.path.getsize(proxy)
             else:
