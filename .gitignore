@@ -2,6 +2,7 @@
 extra
 logs
 Demo
+CloudConfig
 csv_logs
 test/newOnes
 proxyUploaderScripts
