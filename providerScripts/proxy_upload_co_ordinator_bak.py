@@ -27,7 +27,7 @@ PROVIDER_SCRIPTS = {
     "frameio_v4": "frame_io_v4_uploader.py",
     "tessact": "tessact_uploader.py",
     "overcasthq": "overcasthq_uploader.py",
-    "s3": "s3_uploder.py",
+    "AWS": "s3_uploder.py",
     "trint": "trint_uploder.py",
     "twelvelabs": "twelvelabs_uploader.py",
     "box": "box_uploader.py",
@@ -107,9 +107,9 @@ def resolve_base_upload_id(logging_path,script_path, cloud_config_name, upload_p
     except Exception as e:
         return upload_path
 
-# Locates proxy file by filename pattern and extension inside a directory tree
-def resolve_proxy_file(directory, pattern, extensions):
-    logging.debug(f"Searching for file using pattern in: {directory}")
+# Locates proxy file by filename pattern inside a directory tree
+def resolve_proxy_file(directory, pattern):
+    logging.debug(f"Searching for proxy in {directory} with pattern {pattern}")
     try:
         base_path = Path(directory)
         if not base_path.exists():
@@ -120,20 +120,20 @@ def resolve_proxy_file(directory, pattern, extensions):
             logging.error(f"No read permission for directory: {directory}")
             return None
 
-        for matched_file in base_path.rglob(pattern):
-            if matched_file.is_file():
-                if extensions and not any(matched_file.name.lower().endswith(ext.lower()) for ext in extensions):
-                    logging.debug(f"File {matched_file.name} does not match extensions")
-                    continue
-                logging.debug(f"Found matching file: {str(matched_file)}")
-                return str(matched_file)
+        matched_files = sorted(
+            [str(f) for f in base_path.rglob(pattern) if f.is_file()]
+        )
 
-        return None
-    except PermissionError as e:
-        logging.error(f"Permission denied accessing directory: {e}")
-        return None
+        if matched_files:
+            chosen_file = matched_files[0]
+            logging.debug(f"Selected proxy file: {chosen_file}")
+            return chosen_file
+        else:
+            logging.debug(f"No matching proxy files found for {pattern} in {directory}")
+            return None
+
     except Exception as e:
-        logging.error(f"Error during file search: {e}")
+        logging.error(f"Proxy resolution failed: {e}")
         return None
 
 # validate params per mode for proxy_generation
@@ -236,13 +236,32 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
     # Use override proxy file if applicable
     source_path = override_source_path or base_source_path
 
+    # Check if the file extension matches config['extensions']
+    original_ext = os.path.splitext(original_source_path)[-1].lower().lstrip(".")
+    extensions_lower = [ext.lower() for ext in config.get("extensions", [])]
+    
     # Proxy mode: resolve proxy file if needed
-    if config["mode"] == "proxy":
+    if config["mode"] == "proxy" and original_ext in extensions_lower:
         base_name = os.path.splitext(os.path.basename(base_source_path))[0]
-        pattern = f"{base_name}*"
-        resolved_path = resolve_proxy_file(config["proxy_directory"], pattern, config["extensions"])
-        source_path = resolved_path if resolved_path else base_source_path
-        debug_print(config["logging_path"], f"[Proxy Upload] Using: {source_path}")
+        pattern = f"{base_name}*.*"
+        resolved_path = resolve_proxy_file(config["proxy_directory"], pattern)
+
+        if resolved_path:
+            source_path = resolved_path
+            debug_print(config["logging_path"], f"[Proxy Upload] Using proxy file: {source_path}")
+        else:
+            # Proxy not found for matching extension -> Fail the job & delete catalog
+            error_message = f"Proxy file not found for: {base_name} in {config['proxy_directory']}"
+            logging.error(error_message)
+            debug_print(config["logging_path"], error_message)
+
+            if os.path.exists(catalog_path):
+                try:
+                    os.remove(catalog_path)
+                    logging.info(f"Deleted catalog file: {catalog_path}")
+                except Exception as e:
+                    logging.error(f"Failed to delete catalog file {catalog_path}: {e}")
+            return {"success": False, "error": error_message}, source_path
 
     cmd = [
         "python3", config["script_path"],
@@ -348,7 +367,7 @@ def calculate_total_size(records, config):
 
         if config["mode"] == "proxy":
             base_name = os.path.splitext(os.path.basename(full_path))[0]
-            pattern = f"{base_name}*"
+            pattern = f"{base_name}*.*"
             proxy = resolve_proxy_file(config["proxy_directory"], pattern, config["extensions"])
             if proxy and os.path.exists(proxy):
                 total_size += os.path.getsize(proxy)
@@ -362,41 +381,46 @@ def calculate_total_size(records, config):
 
 def build_folder_id_map(records, config, log_path):
     resolved_ids = {}
-
     # Determine base path and parent ID
     upload_path = config["upload_path"]
     if ":" in upload_path:
-        parent_id, base_path = upload_path.split(":", 1)
+        parent_id, base_upload_path = upload_path.split(":", 1)
         base_id = parent_id.strip("/")
-        base_path = base_path.strip("/")
-        resolved_ids[base_path] = base_id
-        debug_print(log_path, f"[INIT] Mapping root path '{base_path}' to ID '{base_id}'")
+        resolved_ids[base_upload_path] = base_id
+        debug_print(log_path, f"[INIT] Mapping root path '{base_upload_path}' to ID '{base_id}'")
 
     else:
-        base_path = upload_path.strip("/")
+        base_upload_path = config["upload_path"]
         base_id = resolve_base_upload_id(
-            log_path, config["script_path"], config["cloud_config_name"], f"/{base_path}"
+            log_path, config["script_path"], config["cloud_config_name"], f"/{base_upload_path}"
         )
-        resolved_ids[base_path] = base_id
-        debug_print(log_path, f"[INIT] Resolved base path '{base_path}' to ID '{base_id}'")
+        resolved_ids[base_upload_path] = base_id
+        debug_print(log_path, f"[INIT] Resolved base path '{base_upload_path}' to ID '{base_id}'")
 
     # Subtree creation for /./ based paths
-    for rec in records:
-        if "/./" not in rec[0]:
-            continue
-        sub_path = rec[0].split("/./", 1)[1].strip("/")
-        current_id = base_id
-        current_path = base_path
-        for seg in sub_path.split(os.sep)[:-1]:  # Skip filename
-            next_path = os.path.join(current_path, seg)
-            if next_path not in resolved_ids:
-                debug_print(log_path, f"[STEP] Creating /{seg} under {current_path}")
-                current_id = resolve_base_upload_id(
-                    log_path, config["script_path"], config["cloud_config_name"],
-                    f"/{seg}", parent_id=current_id
-                )
-                resolved_ids[next_path] = current_id
-            current_path = next_path
+    for record in records:
+        original_source_path = record[0]
+        if "/./" in original_source_path:
+            _, sub_path = original_source_path.split("/./", 1)
+            path_segments = [seg for seg in sub_path.split(os.sep) if seg]
+            current_path = base_upload_path
+            current_id = base_id
+
+            for idx, segment in enumerate(path_segments):
+                if idx < len(path_segments) - 1:
+                    next_path = os.path.join(current_path, segment)
+                    if next_path not in resolved_ids:
+                        debug_print(log_path, f"[STEP] Resolving segment: {segment} under {current_path}")
+                        resolved_id = resolve_base_upload_id(
+                            config["logging_path"],
+                            config["script_path"],
+                            config["cloud_config_name"],
+                            f"/{segment}",
+                            parent_id=current_id
+                        )
+                        resolved_ids[next_path] = resolved_id
+                    current_path = next_path
+                    current_id = resolved_ids[next_path]
 
     return resolved_ids
 
@@ -450,7 +474,16 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
                 return
 
         result, resolved_path = upload_asset(record, config, config.get("dry_run", False), upload_path_id, override_source_path)
-
+        
+        # --- Handle proxy failure case ---
+        if isinstance(result, dict) and not result.get("success", True):
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            error_message = result.get("error", "Unknown error during proxy resolution or upload")
+            debug_print(config["logging_path"], f"[PROXY FAILURE] {resolved_path}\n{error_message}")
+            write_csv_row(issues_log, ["Error", resolved_path, timestamp, error_message])
+            return {"status": "failure", "file": resolved_path, "error": error_message}
+        
+        # --- Handle normal subprocess result ---
         if result and result.returncode == 0:
             file_size = os.path.getsize(resolved_path) if os.path.exists(resolved_path) else 0
             progressDetails["processedFiles"] += 1
@@ -494,7 +527,7 @@ def process_csv_and_upload(config, dry_run=False):
         "totalSize": total_size,
         "processedFiles": 0,
         "processedBytes": 0,
-        "status": "in-progress"
+        "status": "Preparing to Upload"
     }
 
     send_progress(progressDetails, config["repo_guid"])
@@ -504,6 +537,8 @@ def process_csv_and_upload(config, dry_run=False):
         resolved_ids = []
     debug_print(config["logging_path"],f" Resolved ids directory ---------------------------> {resolved_ids}")
     upload_results = []
+    progressDetails["status"] = "Uploading Files"
+    send_progress(progressDetails, config["repo_guid"])
     with ThreadPoolExecutor(max_workers=config["thread_count"]) as executor:
         futures = [
             executor.submit(upload_worker, record, config, resolved_ids, progressDetails, transferred_log, issues_log, client_log)
