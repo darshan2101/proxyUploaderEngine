@@ -8,7 +8,6 @@ import time
 import json
 import sys
 import argparse
-from collections import defaultdict
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -111,41 +110,55 @@ def resolve_base_upload_id(logging_path,script_path, cloud_config_name, upload_p
 # Locates proxy file by filename pattern inside a directory tree
 def resolve_proxy_file(proxy_dir, original_source_path, pattern, log_path):
     base_dir = Path(proxy_dir)
+    source_file = Path(original_source_path).resolve()
 
-    # Flat search (first-level, non-recursive)
-    flat_matches = list(base_dir.glob(pattern))
-    if flat_matches:
-        resolved_path = str(flat_matches[0])
-        debug_print(log_path, f"[FLAT] Using proxy file for upload: {resolved_path}")
-        return resolved_path
+    debug_print(log_path,f"[resolve_proxy_file] proxy_dir={proxy_dir} | pattern={pattern} | original_source={original_source_path}")
 
-    # Mirror structure search
-    mirror_path = base_dir / Path(original_source_path).parent
-    if mirror_path.exists():
-        mirror_matches = list(mirror_path.glob(pattern))
-        if mirror_matches:
-            resolved_path = str(mirror_matches[0])
-            debug_print(log_path, f"[MIRROR] Using proxy file for upload: {resolved_path}")
-            return resolved_path
+    # 1. Flat search (non-recursive) in proxy_dir
+    flat_matches = [f.resolve() for f in base_dir.glob(pattern) if f.is_file()]
+    debug_print(log_path, f"[FLAT] Candidates: {flat_matches}")
+    for candidate in flat_matches:
+        if candidate != source_file:
+            debug_print(log_path, f"[FLAT] Using proxy file for upload: {candidate}")
+            return str(candidate)
 
-    # Segment-stripping search
+    # 2. Mirror structure search
+    try:
+        relative_subpath = Path(*Path(original_source_path).parts[1:]).parent
+        mirror_path = base_dir / relative_subpath
+        if mirror_path.exists():
+            mirror_matches = [f.resolve() for f in mirror_path.glob(pattern) if f.is_file()]
+            debug_print(log_path, f"[MIRROR] Candidates in {mirror_path}: {mirror_matches}")
+            for candidate in mirror_matches:
+                if candidate != source_file:
+                    debug_print(log_path, f"[MIRROR] Using proxy file for upload: {candidate}")
+                    return str(candidate)
+    except Exception as e:
+        debug_print(log_path, f"[ERROR] Mirror structure exception: {e}")
+
+    # 3. Segment-stripping search
     path_segments = Path(original_source_path).parts
-    for i in range(1, len(path_segments)):
-        sub_path = Path(*path_segments[i:-1])  # Exclude i leading segments + filename
+    for i in range(1, len(path_segments) - 1):  # Exclude last (filename)
+        sub_path = Path(*path_segments[i:-1])
         search_path = base_dir / sub_path
         if search_path.exists():
-            strip_matches = list(search_path.glob(pattern))
-            if strip_matches:
-                resolved_path = str(strip_matches[0])
-                debug_print(log_path, f"[SEGMENT STRIP] Using proxy file for upload: {resolved_path}")
-                return resolved_path
+            strip_matches = [f.resolve() for f in search_path.glob(pattern) if f.is_file()]
+            debug_print(log_path, f"[SEGMENT STRIP i={i}] Candidates in {search_path}: {strip_matches}")
+            for candidate in strip_matches:
+                if candidate != source_file:
+                    debug_print(log_path, f"[SEGMENT STRIP] Using proxy file for upload: {candidate}")
+                    return str(candidate)
 
-    # Fallback to rglob (recursive, full-tree)
-    fallback_matches = sorted([str(f) for f in base_dir.rglob(pattern) if f.is_file()])
+    # 4. Fallback: rglob (recursive) inside proxy_dir only
+    fallback_matches = sorted([
+        f.resolve() for f in base_dir.rglob(pattern)
+        if f.is_file() and f.resolve() != source_file
+    ])
+    debug_print(log_path, f"[FALLBACK RGLOB] Candidates: {fallback_matches}")
     if fallback_matches:
         resolved_path = fallback_matches[0]
         debug_print(log_path, f"[FALLBACK RGLOB] Using proxy file for upload: {resolved_path}")
-        return resolved_path
+        return str(resolved_path)
 
     # Nothing found
     debug_print(log_path, "[MISS] No proxy file found for this pattern.")
@@ -254,12 +267,13 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
     # Check if the file extension matches config['extensions']
     original_ext = os.path.splitext(original_source_path)[-1].lower().lstrip(".")
     extensions_lower = [ext.lower() for ext in config.get("extensions", [])]
-    
+    debug_print(config["logging_path"], f"[DEBUG] original_ext: {original_ext}, extensions_lower: {extensions_lower}, mode: {config['mode']}, override_source_path: {override_source_path}")
+
     # Proxy mode: resolve proxy file if needed
     if config["mode"] == "proxy" and original_ext in extensions_lower:
         base_name = os.path.splitext(os.path.basename(base_source_path))[0]
         pattern = f"{base_name}*.*"
-        resolved_path = resolve_proxy_file(config["proxy_directory"], base_source_path , pattern, config["logging_path"])
+        resolved_path = resolve_proxy_file(config["proxy_directory"], base_source_path, pattern, config["logging_path"])
 
         if resolved_path:
             source_path = resolved_path
@@ -341,33 +355,46 @@ def read_csv_records(csv_path, logging_path, extensions = [], file_size_limit = 
     debug_print(logging_path, "[STEP] Reading records from CSV...")
     records = []
     size_limit_bytes = float(file_size_limit) * 1024 * 1024 if file_size_limit else None
+
     with open(csv_path, 'r') as f:
         reader = csv.reader(f, delimiter='|')
         for row in reader:
             if len(row) in (2, 3):
                 first_value = row[0]
+
                 if "/./" in first_value:
                     prefix, sub_path = first_value.split("/./", 1)
                     base_source_path = os.path.join(prefix, sub_path)
                 else:
                     base_source_path = first_value
+
+                debug_print(logging_path, f"[FILE] Checking file: {base_source_path}")
+
                 try:
                     size = os.stat(base_source_path).st_size
                 except Exception as e:
                     debug_print(logging_path, f"[ERROR] Could not stat file {base_source_path}: {e}")
                     continue
-                # Check extension on the resolved base_source_path
+
+                # Check extension
                 if extensions:
-                    if not any(base_source_path.lower().endswith(ext.lower()) for ext in extensions):
+                    file_ext = os.path.splitext(base_source_path)[-1].lower().lstrip('.')
+                    debug_print(logging_path, f"[EXTENSION CHECK] File: {base_source_path}, Extracted: '{file_ext}', Allowed: {extensions}")
+
+                    if file_ext not in [ext.lower().lstrip('.') for ext in extensions]:
+                        debug_print(logging_path, f"[SKIP] Extension '{file_ext}' not in allowed list {extensions}")
                         continue
+
                 if size_limit_bytes is not None and size > size_limit_bytes:
                     debug_print(logging_path, f"[SKIP] File {base_source_path} exceeds size limit ({size} > {size_limit_bytes})")
                     continue
-                # Always append a tuple of length 3: (source, catalog, metadata)
+
+                # Always append a tuple of length 3
                 if len(row) == 3:
                     records.append((row[0], row[1], row[2]))
                 elif len(row) == 2:
                     records.append((row[0], row[1], None))
+
     debug_print(logging_path, f"[STEP] Total records loaded: {len(records)}")
     return records
 
@@ -606,7 +633,7 @@ if __name__ == '__main__':
     
     if "generate" in mode:
         required_keys.append("proxy_output_base_path")
-        os.makedirs(request_data.get("proxy_output_base_path"), exist_ok=True)  # ✅ Ensure target dir exists
+        os.makedirs(request_data.get("proxy_output_base_path"), exist_ok=True)  # Ensure target dir exists
 
 
     for key in required_keys:
