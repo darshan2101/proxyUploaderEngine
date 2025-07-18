@@ -32,7 +32,7 @@ PROVIDER_SCRIPTS = {
     "twelvelabs": "twelvelabs_uploader.py",
     "box": "box_uploader.py",
     "dropbox": "dropbox_uploader.py",
-    "google_drive": "google_drive_uploader.py",
+    "googledrive": "google_drive_uploader.py",
     "iconik": "iconik_uploader.py",
 }
 
