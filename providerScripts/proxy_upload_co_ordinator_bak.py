@@ -449,7 +449,7 @@ def calculate_total_size(records, config, proxy_map=None):
             full_path = r[0]
 
         if config["mode"] == "proxy":
-            proxy = proxy_map.get(r[0]) if proxy_map else None
+            proxy = proxy_map.get(full_path) if proxy_map else None
             if proxy and os.path.exists(proxy):
                 total_size += os.path.getsize(proxy)
             else:
