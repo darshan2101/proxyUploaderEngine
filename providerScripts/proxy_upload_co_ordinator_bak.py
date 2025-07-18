@@ -457,7 +457,7 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
             _, logical_base = base_path.split(":", 1)
         else:
             logical_base = base_path
-        normalized_folder_key = os.path.normpath(os.path.join(logical_base.strip("/"), dir_path))
+        normalized_folder_key = os.path.normpath(os.path.join(logical_base, dir_path))
 
         # Determine upload path ID
         if config["provider"] in PATH_BASED_PROVIDERS:
