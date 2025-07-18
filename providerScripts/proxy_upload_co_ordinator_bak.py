@@ -9,7 +9,7 @@ import json
 import sys
 import argparse
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # Debug configuration
@@ -106,6 +106,28 @@ def resolve_base_upload_id(logging_path,script_path, cloud_config_name, upload_p
         return upload_path
     except Exception as e:
         return upload_path
+
+def build_proxy_map(records, config):
+    proxy_map = {}
+    proxy_dir = config["proxy_directory"]
+    log_path = config["logging_path"]
+
+    def resolve_proxy(record):
+        original_source_path = record[0]
+        base_source_path = os.path.join(*original_source_path.split("/./")) if "/./" in original_source_path else original_source_path
+        base_name = os.path.splitext(os.path.basename(base_source_path))[0]
+        pattern = f"{base_name}*.*"
+        proxy = resolve_proxy_file(proxy_dir, base_source_path, pattern, log_path)
+        return (base_source_path, proxy)
+
+    with ThreadPoolExecutor(max_workers=config.get("thread_count", 2)) as executor:
+        future_to_record = {executor.submit(resolve_proxy, r): r for r in records}
+        for future in as_completed(future_to_record):
+            base_source_path, proxy_path = future.result()
+            proxy_map[base_source_path] = proxy_path
+
+    debug_print(log_path, f"[PROXY MAP] Pre-resolved {len(proxy_map)} proxies.")
+    return proxy_map
 
 # Locates proxy file by filename pattern inside a directory tree
 def resolve_proxy_file(proxy_dir, original_source_path, pattern, log_path):
@@ -250,48 +272,67 @@ def generate_proxy_asset(config_mode, input_path, output_path, extra_params, gen
     except Exception as e:
         raise RuntimeError(f"Proxy generation failed: {e}")
 
-# Launches the provider script with file arguments
-def upload_asset(record, config, dry_run=False, upload_path_id=None, override_source_path=None):
-    original_source_path, catalog_path, metadata_path = record
+# Determine source path: override > proxy_map > base path (only for non-proxy modes) 
+def resolve_source_path_for_upload_asset(record, config, override_source_path=None, proxy_map=None):
+    original_source_path = record[0]
 
     if "/./" in original_source_path:
         base_source_path = os.path.join(*original_source_path.split("/./"))
-        full_upload_path = os.path.join(config["upload_path"].split(":")[-1], original_source_path.split("/./", 1)[1])
     else:
         base_source_path = original_source_path
-        full_upload_path = os.path.join(config["upload_path"].split(":")[-1], os.path.basename(original_source_path))
 
-    # Use override proxy file if applicable
-    source_path = override_source_path or base_source_path
+    # Proxy generation modes: always use override_source_path
+    if config["mode"] in [
+        "generate_video_proxy", "generate_video_frame_proxy",
+        "generate_intelligence_proxy", "generate_video_to_spritesheet"
+    ]:
+        return override_source_path, None
 
-    # Check if the file extension matches config['extensions']
-    original_ext = os.path.splitext(original_source_path)[-1].lower().lstrip(".")
-    extensions_lower = [ext.lower() for ext in config.get("extensions", [])]
-    debug_print(config["logging_path"], f"[DEBUG] original_ext: {original_ext}, extensions_lower: {extensions_lower}, mode: {config['mode']}, override_source_path: {override_source_path}")
-
-    # Proxy mode: resolve proxy file if needed
-    if config["mode"] == "proxy" and original_ext in extensions_lower:
-        base_name = os.path.splitext(os.path.basename(base_source_path))[0]
-        pattern = f"{base_name}*.*"
-        resolved_path = resolve_proxy_file(config["proxy_directory"], base_source_path, pattern, config["logging_path"])
-
-        if resolved_path:
-            source_path = resolved_path
-            debug_print(config["logging_path"], f"[Proxy Upload] Using proxy file: {source_path}")
+    # Proxy mode: use proxy_map
+    elif config["mode"] == "proxy":
+        debug_print(config["logging_path"], f"[PROXY MODE] Resolving source path for {base_source_path}")
+        if proxy_map and base_source_path in proxy_map and proxy_map[base_source_path]:
+            return proxy_map[base_source_path], None
         else:
-            # Proxy not found for matching extension -> Fail the job & delete catalog
-            error_message = f"Proxy file not found for: {base_name} in {config['proxy_directory']}"
-            logging.error(error_message)
-            debug_print(config["logging_path"], error_message)
+            error_msg = f"[STRICT PROXY MODE] Proxy missing for {base_source_path}"
+            return None, error_msg
 
-            if os.path.exists(catalog_path):
-                try:
-                    os.remove(catalog_path)
-                    logging.info(f"Deleted catalog file: {catalog_path}")
-                except Exception as e:
-                    logging.error(f"Failed to delete catalog file {catalog_path}: {e}")
-            return {"success": False, "error": error_message}, source_path
+    # Default: original mode or others
+    else:
+        return override_source_path or base_source_path, None
 
+# Launches the provider script with file arguments
+def upload_asset(record, config, dry_run=False, upload_path_id=None, override_source_path=None, proxy_map=None):
+    original_source_path, catalog_path, metadata_path = record
+
+    # Resolve base source path and upload path
+    if "/./" in original_source_path:
+        base_source_path = os.path.join(*original_source_path.split("/./"))
+        relative_upload_path = original_source_path.split("/./", 1)[1]
+    else:
+        base_source_path = original_source_path
+        relative_upload_path = os.path.basename(original_source_path)
+
+    upload_base = config["upload_path"].split(":")[-1]
+    full_upload_path = os.path.join(upload_base, relative_upload_path)
+
+    # Determine the correct source path using the helper
+    source_path, error = resolve_source_path_for_upload_asset(record, config, override_source_path, proxy_map)
+
+    if error:
+        debug_print(config["logging_path"], error)
+        logging.error(error)
+
+        if os.path.exists(catalog_path):
+            try:
+                os.remove(catalog_path)
+                logging.info(f"Deleted catalog file: {catalog_path}")
+            except Exception as e:
+                logging.error(f"Failed to delete catalog file {catalog_path}: {e}")
+
+        return {"success": False, "error": error}, base_source_path
+
+    # Build command
     cmd = [
         "python3", config["script_path"],
         "--mode", config["mode"],
@@ -303,7 +344,7 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
         "--log-level", "debug"
     ]
 
-    # Append optional args
+    # Optional parameters
     if config["mode"] == "original" and "original_file_size_limit" in config:
         cmd += ["--size-limit", str(config["original_file_size_limit"])]
     if config["provider"] == "iconik" and "collection_id" in config:
@@ -312,14 +353,14 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
         cmd += ["--project-id", config["project_id"]]
     if metadata_path:
         cmd += ["--metadata-file", metadata_path]
-    if config["controller_address"]:
+    if config.get("controller_address"):
         cmd += ["--controller-address", config["controller_address"]]
     if dry_run:
         cmd.append("--dry-run")
     if upload_path_id:
         cmd.append("--resolved-upload-id")
 
-    debug_print(config["logging_path"], f"Command block copy ---------------------> {' '.join(cmd)}")
+    debug_print(config["logging_path"], f"[COMMAND] {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result, source_path
 
@@ -398,7 +439,7 @@ def read_csv_records(csv_path, logging_path, extensions = [], file_size_limit = 
     debug_print(logging_path, f"[STEP] Total records loaded: {len(records)}")
     return records
 
-def calculate_total_size(records, config):
+def calculate_total_size(records, config, proxy_map=None):
     total_size = 0
     for r in records:
         if "/./" in r[0]:
@@ -408,9 +449,7 @@ def calculate_total_size(records, config):
             full_path = r[0]
 
         if config["mode"] == "proxy":
-            base_name = os.path.splitext(os.path.basename(full_path))[0]
-            pattern = f"{base_name}*.*"
-            proxy = resolve_proxy_file(config["proxy_directory"], full_path, pattern, config["logging_path"])
+            proxy = proxy_map.get(r[0]) if proxy_map else None
             if proxy and os.path.exists(proxy):
                 total_size += os.path.getsize(proxy)
             else:
@@ -466,35 +505,31 @@ def build_folder_id_map(records, config, log_path):
 
     return resolved_ids
 
-def upload_worker(record, config, resolved_ids, progressDetails, transferred_log, issues_log, client_log):
+def upload_worker(record, config, resolved_ids, progressDetails, transferred_log, issues_log, client_log, proxy_map=None):
     try:
         debug_print(config['logging_path'], f"[STEP] Processing record: {record}")
         original_source_path, catalog_path, metadata_path = record
 
-        # Extract relative folder path for this record
+        # Extract relative folder path for resolved_ids lookup
         if "/./" in original_source_path:
             _, sub_path = original_source_path.split("/./", 1)
             dir_path = os.path.dirname(sub_path)
         else:
-            dir_path = ""  # root upload
+            dir_path = ""
 
-        # Compute key for resolved_ids lookup
+        # Compute resolved ID
         base_path = config["upload_path"]
-        if ":" in base_path:
-            _, logical_base = base_path.split(":", 1)
-        else:
-            logical_base = base_path
+        logical_base = base_path.split(":", 1)[-1] if ":" in base_path else base_path
         normalized_folder_key = os.path.normpath(os.path.join(logical_base, dir_path))
 
-        # Determine upload path ID
         if config["provider"] in PATH_BASED_PROVIDERS:
             upload_path_id = None
         else:
-            upload_path_id = resolved_ids.get(normalized_folder_key, list(resolved_ids.values())[0])  # fallback to base_id
+            upload_path_id = resolved_ids.get(normalized_folder_key, list(resolved_ids.values())[0])
 
         debug_print(config['logging_path'], f"[PATH-MATCH] {normalized_folder_key} -> using ID {upload_path_id}")
 
-        # --- Optional: proxy generation step ---
+        # Proxy generation step if mode requires it
         override_source_path = None
         if config["mode"] in [
             "generate_video_proxy", "generate_video_frame_proxy",
@@ -504,9 +539,11 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
             name_wo_ext, ext = os.path.splitext(os.path.basename(base_source_path))
             proxy_ext = ".png" if "spritesheet" in config["mode"] else ext
             proxy_output_path = os.path.join(config["proxy_output_base_path"], name_wo_ext + proxy_ext)
+
             try:
                 generate_proxy_asset(config["mode"], base_source_path, proxy_output_path, config.get("proxy_extra_params", {}))
                 override_source_path = proxy_output_path
+                debug_print(config["logging_path"], f"[PROXY GENERATION] Generated proxy: {proxy_output_path}")
             except Exception as e:
                 msg = f"[ERROR] Proxy generation failed: {e}"
                 debug_print(config["logging_path"], msg)
@@ -515,88 +552,125 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
                 send_progress(progressDetails, config["repo_guid"])
                 return
 
-        result, resolved_path = upload_asset(record, config, config.get("dry_run", False), upload_path_id, override_source_path)
-        
-        # --- Handle proxy failure case ---
+        # Call upload_asset with proxy_map
+        result, resolved_path = upload_asset(
+            record, config, config.get("dry_run", False),
+            upload_path_id, override_source_path, proxy_map
+        )
+
+        # Handle proxy resolution failure
         if isinstance(result, dict) and not result.get("success", True):
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             error_message = result.get("error", "Unknown error during proxy resolution or upload")
             debug_print(config["logging_path"], f"[PROXY FAILURE] {resolved_path}\n{error_message}")
             write_csv_row(issues_log, ["Error", resolved_path, timestamp, error_message])
             return {"status": "failure", "file": resolved_path, "error": error_message}
-        
-        # --- Handle normal subprocess result ---
+
+        # Handle upload success
         if result and result.returncode == 0:
             file_size = os.path.getsize(resolved_path) if os.path.exists(resolved_path) else 0
             progressDetails["processedFiles"] += 1
             progressDetails["processedBytes"] += file_size
             debug_print(config["logging_path"], f"[UPLOAD SUCCESS] {resolved_path} | {file_size} bytes")
-            if transferred_log: write_csv_row(transferred_log, ["Success", resolved_path, file_size, ""])
-            if client_log: write_csv_row(client_log, ["Success", resolved_path, file_size, "Client"])
+
+            if transferred_log:
+                write_csv_row(transferred_log, ["Success", resolved_path, file_size, ""])
+            if client_log:
+                write_csv_row(client_log, ["Success", resolved_path, file_size, "Client"])
+
             return {"status": "success", "file": resolved_path, "size": file_size}
+
+        # Handle upload failure
         else:
             stderr_cleaned = result.stderr.replace("\n", " ").replace("\r", " ").strip() if result and result.stderr else "Unknown Error"
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             debug_print(config["logging_path"], f"[UPLOAD FAILURE] {resolved_path}\n{stderr_cleaned}")
             write_csv_row(issues_log, ["Error", resolved_path, timestamp, stderr_cleaned])
             return {"status": "failure", "file": resolved_path, "error": stderr_cleaned}
+
     except Exception as e:
-        debug_print(config['logging_path'], f"[ERROR] upload_asset() failed: {e}")
+        debug_print(config['logging_path'], f"[ERROR] upload_worker() failed: {e}")
+        return {"status": "failure", "file": record[0], "error": str(e)}
+
     finally:
         send_progress(progressDetails, config["repo_guid"])
 
 def process_csv_and_upload(config, dry_run=False):
     config["dry_run"] = dry_run
-    setup_log_and_progress_paths(config)
-    transferred_log, issues_log, client_log = prepare_log_files(config)
-    
-    exts = exts = config["extensions"] if config.get("mode") in ("original", "proxy") and config.get("extensions") else []
-    file_size_limit = config.get("original_file_size_limit") if config.get("mode") == "original" and config.get("original_file_size_limit") else None
-    records = read_csv_records(config["files_list"], config["logging_path"], exts, file_size_limit)
-    if not records:
-        size_limit_str = f"{file_size_limit} MB" if file_size_limit else "No Limit"
-        extensions_str = ", ".join(exts) if exts else "All"
-        print(f"No records found with size <= {size_limit_str} and extensions: {extensions_str}")
-        sys.exit(0)    
-    total_size = calculate_total_size(records, config)
-
     progressDetails = {
         "run_id": config["run_id"],
         "job_id": config["job_id"],
         "progress_path": config["progress_path"],
         "duration": int(time.time()),
-        "totalFiles": len(records),
-        "totalSize": total_size,
+        "totalFiles": 0,
+        "totalSize": 0,
         "processedFiles": 0,
         "processedBytes": 0,
-        "status": "Preparing to Upload"
+        "status": "Initializing",
     }
+    setup_log_and_progress_paths(config)
+    transferred_log, issues_log, client_log = prepare_log_files(config)
 
+    exts = config["extensions"] if config.get("mode") in ("original", "proxy") and config.get("extensions") else []
+    file_size_limit = config.get("original_file_size_limit") if config.get("mode") == "original" and config.get("original_file_size_limit") else None
+    progressDetails["status"] = "Reading Files"
     send_progress(progressDetails, config["repo_guid"])
-    if not config["provider"] in PATH_BASED_PROVIDERS:
+    records = read_csv_records(config["files_list"], config["logging_path"], exts, file_size_limit)
+    if not records:
+        size_limit_str = f"{file_size_limit} MB" if file_size_limit else "No Limit"
+        extensions_str = ", ".join(exts) if exts else "All"
+        print(f"No records found with size <= {size_limit_str} and extensions: {extensions_str}")
+        sys.exit(0)
+    progressDetails["totalFiles"] = len(records)
+    send_progress(progressDetails, config["repo_guid"])
+    # Pre-resolve proxy map if in proxy mode
+    proxy_map = {}
+    if config["mode"] == "proxy":
+        progressDetails["status"] = "Building Proxy Map"
+        send_progress(progressDetails, config["repo_guid"])
+        proxy_map = build_proxy_map(records, config)
+        debug_print(config["logging_path"], f"Proxy map ----------> {proxy_map}")
+
+    progressDetails["status"] = "Calculating Total Size"
+    # Use proxy_map in size calculation
+    total_size = calculate_total_size(records, config, proxy_map if config["mode"] == "proxy" else None)
+    progressDetails["totalSize"] = total_size
+    send_progress(progressDetails, config["repo_guid"])
+
+    # Resolve folder IDs if needed
+    if config["provider"] not in PATH_BASED_PROVIDERS:
+        progressDetails["status"] = "Building Folder Map"
         resolved_ids = build_folder_id_map(records, config, config["logging_path"])
+        send_progress(progressDetails, config["repo_guid"])
+        debug_print(config["logging_path"], f"Resolved ids directory ---------------------------> {resolved_ids}")
     else:
-        resolved_ids = []
-    debug_print(config["logging_path"],f" Resolved ids directory ---------------------------> {resolved_ids}")
+        resolved_ids = {}
+
+    # Upload process
     upload_results = []
     progressDetails["status"] = "Uploading Files"
     send_progress(progressDetails, config["repo_guid"])
+
     with ThreadPoolExecutor(max_workers=config["thread_count"]) as executor:
         futures = [
-            executor.submit(upload_worker, record, config, resolved_ids, progressDetails, transferred_log, issues_log, client_log)
+            executor.submit(upload_worker, record, config, resolved_ids, progressDetails, transferred_log, issues_log, client_log, proxy_map)
             for record in records
         ]
         for future in futures:
             upload_results.append(future.result())
+
+    # Summarize results
     success_count = sum(1 for r in upload_results if r and r.get("status") == "success")
     failure_results = [r for r in upload_results if r and r.get("status") == "failure"]
 
     debug_print(config["logging_path"], f"Upload summary: {success_count} succeeded, {len(failure_results)} failed")
-    print(f"Successful Uploads:{success_count}")
-    print(f"Failed Uploads:{len(failure_results)}")
-            
-    progressDetails["status"] = "complete"
+    print(f"Successful Uploads: {success_count}")
+    print(f"Failed Uploads: {len(failure_results)}")
+
+    # Finalize progress
+    progressDetails["status"] = "Complete"
     send_progress(progressDetails, config["repo_guid"])
+    
     sys.exit(0 if success_count == len(records) else 2)
 
     
