@@ -715,7 +715,10 @@ if __name__ == '__main__':
             print(f"Missing required field in config: {key}")
             sys.exit(1)
     for key in optional_keys:
-        request_data.setdefault(key, {} if key == "proxy_extra_params")
+        if key in request_data:
+            continue
+        if key == "proxy_extra_params":
+            request_data[key] = {}
 
     if args.log_prefix:
         request_data["log_prefix"] = args.log_prefix

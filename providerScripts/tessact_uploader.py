@@ -229,13 +229,11 @@ def finalize_upload(base_url, token, payload):
 
 def parse_metadata_file(properties_file):
     props = {}
-    file_ext = properties_file.lower()
-
     if not properties_file or not os.path.exists(properties_file):
         logging.warning(f"Properties file not found: {properties_file}")
         return props
-
     try:
+        file_ext = properties_file.lower()
         logging.debug(f"Reading properties from: {properties_file}")
 
         if file_ext.endswith(".json"):
