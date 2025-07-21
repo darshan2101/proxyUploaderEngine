@@ -231,7 +231,7 @@ def parse_metadata_file(properties_file):
     props = {}
     file_ext = properties_file.lower()
 
-    if not os.path.exists(properties_file):
+    if not properties_file or not os.path.exists(properties_file):
         logging.warning(f"Properties file not found: {properties_file}")
         return props
 
@@ -270,7 +270,7 @@ def parse_metadata_file(properties_file):
     return props
 
 
-def upload_metadata_to_asset(base_url, token, backlink_url, asset_id, properties_file):
+def upload_metadata_to_asset(base_url, token, backlink_url, asset_id, properties_file = None):
     logging.info(f"Updating asset {asset_id} with properties from {properties_file}")
 
     props = parse_metadata_file(properties_file)
@@ -469,11 +469,10 @@ if __name__ == '__main__':
     logging.info(f"File uploaded successfully. Asset ID: {file_id}")
 
     meta_file = args.metadata_file
-    if meta_file:
-        logging.info("Applying metadata to uploaded asset...")
-        response, metadata_code = upload_metadata_to_asset(cloud_config_data['base_url'] ,token, backlink_url, file_id, meta_file)
-        parsed = response.json()
-        if not parsed or metadata_code not in (200, 201):
-            print("File uploaded successfully but Failed to upload metadata.")
+    logging.info("Applying metadata to uploaded asset...")
+    response, metadata_code = upload_metadata_to_asset(cloud_config_data['base_url'], token, backlink_url, file_id, meta_file)
+    parsed = response.json()
+    if not parsed or metadata_code not in (200, 201):
+        print("File uploaded successfully but Failed to upload metadata.")
 
     sys.exit(0)

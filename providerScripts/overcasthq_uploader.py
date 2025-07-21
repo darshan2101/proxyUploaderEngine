@@ -370,7 +370,7 @@ def complete_multipart_upload(asset_res, upload_id, etags, config_data):
 def parse_metadata_file(properties_file):
     metadata = {}
 
-    if not os.path.exists(properties_file):
+    if not properties_file or not os.path.exists(properties_file):
         logging.warning(f"Metadata file not found: {properties_file}")
         return metadata
 
@@ -407,7 +407,7 @@ def parse_metadata_file(properties_file):
 
     return metadata
 
-def upload_metadata_to_asset(hostname, api_key, backlink_url, asset_id, properties_file):
+def upload_metadata_to_asset(hostname, api_key, backlink_url, asset_id, properties_file = None):
     logging.info(f"Updating asset {asset_id} with properties from {properties_file}")
 
     metadata = {"fabric URL": backlink_url}
@@ -448,7 +448,7 @@ if __name__ == '__main__':
     parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
     parser.add_argument("-sp", "--source-path", help="Source path of file to look for original upload")
     parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
-    parser.add_argument("-up", "--upload-path", required=True, help="Path where file will be uploaded to frameIO")
+    parser.add_argument("-up", "--upload-path", required=True, help="Path where file will be uploaded to Overcast HQ")
     parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")
@@ -553,7 +553,7 @@ if __name__ == '__main__':
     if args.dry_run:
         logging.info("[DRY RUN] Upload skipped.")
         logging.info(f"[DRY RUN] File to upload: {matched_file}")
-        logging.info(f"[DRY RUN] Upload path: {args.upload_path} => Frame.io")
+        logging.info(f"[DRY RUN] Upload path: {args.upload_path} => Overcast HQ")
         meta_file = args.metadata_file
         if meta_file:
             logging.info(f"[DRY RUN] Metadata would be applied from: {meta_file}")
@@ -561,7 +561,7 @@ if __name__ == '__main__':
             logging.warning("[DRY RUN] Metadata upload enabled but no metadata file specified.")
         sys.exit(0)
 
-    logging.info(f"Starting upload process to Frame.io")
+    logging.info(f"Starting upload process to Overcast HQ")
     upload_path = args.upload_path
 
     if args.resolved_upload_id:
@@ -582,14 +582,13 @@ if __name__ == '__main__':
     logging.info(f"asset upload completed")
 
     meta_file = args.metadata_file
-    if meta_file:
-        logging.info("Applying metadata to uploaded asset...")
+    logging.info("Applying metadata to uploaded asset...")
 
-        response = upload_metadata_to_asset(cloud_config_data['hostname'] ,cloud_config_data['api_key'], backlink_url, asset_id, meta_file)
-        if response['status_code']  != 200:
-            print(f"Failed to upload file parts: {response['detail']}")
-            sys.exit(1)
-        else:
-            logging.info("All parts uploaded successfully to Frame.io")
+    response = upload_metadata_to_asset(cloud_config_data['hostname'] ,cloud_config_data['api_key'], backlink_url, asset_id, meta_file)
+    if response['status_code']  != 200:
+        print(f"Failed to upload file parts: {response['detail']}")
+        sys.exit(1)
+    else:
+        logging.info("All parts uploaded successfully to Overcast HQ")
         
     sys.exit(0)

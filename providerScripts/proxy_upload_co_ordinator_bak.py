@@ -18,7 +18,7 @@ DEBUG_TO_FILE = True
 
 PROXY_GENERATION_HOST = "http://127.0.0.1:8000"
 PROVIDERS_SUPPORTING_GET_BASE_TARGET = {"frameio_v2", "frameio_v4", "tessact", "overcasthq", "trint"}
-PATH_BASED_PROVIDERS = {"dropbox", "s3"}
+PATH_BASED_PROVIDERS = ["dropbox", "s3"]
 
 # Mapping provider names to their respective upload scripts
 PROVIDER_SCRIPTS = {
