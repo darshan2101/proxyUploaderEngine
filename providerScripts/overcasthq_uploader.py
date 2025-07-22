@@ -170,7 +170,15 @@ def get_folder_id(config_data, upload_path, base_id = None):
         logging.debug(f"Looking for folder '{segment}' under parent '{current_parent_id}'")
 
         folders = list_all_folders(config_data, project_id, current_parent_id)
-        matched = next((f for f in folders if f.get("name") == segment), None)
+
+        matched = next(
+            (
+                f for f in folders
+                if f.get("name") == segment and 
+                   f.get("parent", {}).get("uuid") == current_parent_id
+            ),
+            None
+        )
 
         if matched:
             current_parent_id = matched["uuid"]
