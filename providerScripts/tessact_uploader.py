@@ -349,7 +349,7 @@ if __name__ == '__main__':
     cloud_config_data = cloud_config[cloud_config_name]
 
     if "base_url" not in cloud_config_data or not cloud_config_data["base_url"]:
-        cloud_config_data["base_url"] = "https://dev-api.tessact.com"
+        cloud_config_data["base_url"] = cloud_config_data.get("domain", "https://dev-api.tessact.com")
 
     workspace_id = cloud_config_data['workspace_id']
     logging.debug(f"Workspace Id ----------------------->{workspace_id}")
