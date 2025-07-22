@@ -11,6 +11,8 @@ import plistlib
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 
 
 SCOPES = ['https://www.googleapis.com/auth/drive']
@@ -164,7 +166,8 @@ def ensure_path(token, path, base_id=None):
         if base_id is None:
             logging.warning("No base_id provided, defaulting to 'root'")
             base_id = "root"
-        creds = service_account.Credentials.from_service_account_info(json.loads(token), scopes=SCOPES)
+        token_info = json.loads(token)
+        creds = Credentials.from_authorized_user_info(token_info, SCOPES)
         service = build('drive', 'v3', credentials=creds)
         current_parent_id = base_id
         folder_id = None
@@ -179,12 +182,22 @@ def ensure_path(token, path, base_id=None):
         logging.error(f"Error in ensure_path('{path}', base_id='{base_id}'): {e}", exc_info=True)
         raise
 
+def get_drive_service(token):
+    creds = None
+    token_info = json.loads(token)
+    creds = Credentials.from_authorized_user_info(token_info, SCOPES)
+    if not creds.valid:
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            print("Provided credentials are not valid and can't be refreshed.")
+            exit(1)
+ 
+    return build('drive', 'v3', credentials=creds)
+
 def upload_file(token, file_path, folder_id,  metadata=None):
     try:
-        creds = service_account.Credentials.from_service_account_info(json.loads(token),scopes=SCOPES)
-        service = build('drive', 'v3', credentials=creds)
-
-
+        service = get_drive_service(token)
         # Only replace spaces with underscores in metadata keys
         sanitized_metadata = None
         if metadata:
@@ -193,7 +206,7 @@ def upload_file(token, file_path, folder_id,  metadata=None):
         file_metadata = {
             'name': os.path.basename(os.path.normpath(file_path)),
             'parents': [folder_id],
-            'appProperties': sanitized_metadata or {}
+            'Source': sanitized_metadata['fabric_host'],
         }
 
         media = MediaFileUpload(file_path, resumable=True)
