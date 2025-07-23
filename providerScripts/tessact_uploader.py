@@ -7,6 +7,8 @@ import logging
 import urllib.parse
 import requests
 from json import dumps
+import time
+from requests.exceptions import RequestException
 from configparser import ConfigParser
 import xml.etree.ElementTree as ET
 import plistlib
@@ -204,16 +206,27 @@ def upload_parts(file_path, presigned_urls):
     logging.info("Uploading file parts using presigned URLs")
     with open(file_path, 'rb') as f:
         for i, url in enumerate(presigned_urls):
-            logging.info("Uploading part %d/%d", i + 1, len(presigned_urls))
             part_data = f.read(CHUNK_SIZE)
-            put_resp = requests.put(url, data=part_data)
-            put_resp.raise_for_status()
-            etag = put_resp.headers.get("ETag")
-            logging.info("Part %d uploaded, ETag: %s", i + 1, etag)
-            etags.append({
-                "PartNumber": i + 1,
-                "ETag": etag.strip('"') if etag else None
-            })
+            part_num = i + 1
+            max_retries = 3
+            for attempt in range(1, max_retries + 1):
+                try:
+                    logging.info("Uploading part %d/%d (attempt %d)", part_num, len(presigned_urls), attempt)
+                    put_resp = requests.put(url, data=part_data, timeout=60)
+                    put_resp.raise_for_status()
+                    etag = put_resp.headers.get("ETag")
+                    logging.info("Part %d uploaded, ETag: %s", part_num, etag)
+                    etags.append({
+                        "PartNumber": part_num,
+                        "ETag": etag.strip('"') if etag else None
+                    })
+                    break  # Success, move to next part
+                except RequestException as e:
+                    logging.warning("Part %d upload failed (attempt %d): %s", part_num, attempt, e)
+                    if attempt == max_retries:
+                        logging.error("Giving up on part %d after %d attempts", part_num, attempt)
+                        raise
+                    time.sleep(2 ** attempt)  # exponential backoff
     logging.info("All parts uploaded successfully")
     return etags
 
