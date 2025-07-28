@@ -1,4 +1,3 @@
-import requests
 import argparse
 import sys
 import os
@@ -12,13 +11,11 @@ import plistlib
 from boxsdk import OAuth2, Client
 from boxsdk.object.metadata import MetadataUpdate
 from boxsdk.exception import BoxAPIException
-import time
 
 # Constants
 VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet"]
 CHUNK_SIZE = 5 * 1024 * 1024
 # CONFLICT_RESOLUTION = "new_version"  # Options: 'overwrite', 'new_version', 'skip', 'rename'
-LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
@@ -91,11 +88,130 @@ def get_link_address_and_port():
     logging.info(f"Server connection details - Address: {ip}, Port: {port}")
     return ip, port
 
-def prepare_metadata_to_upload( backlink_url, properties_file):    
+class ConfigTokenStore:
+    def __init__(self, config_path, config_section):
+        self.config_path = config_path
+        self.config_section = config_section
+
+    def read(self):
+        if not os.path.exists(self.config_path):
+            raise FileNotFoundError(f"Config file {self.config_path} not found")
+        config = ConfigParser()
+        config.read(self.config_path)
+        if self.config_section not in config:
+            raise ValueError(f"Section '{self.config_section}' not found in config")
+        token_info = {}
+        section = config[self.config_section]
+
+        if 'access_token' in section:
+            token_info['access_token'] = section['access_token']
+        if 'refresh_token' in section:
+            token_info['refresh_token'] = section['refresh_token']
+
+        if not token_info.get('access_token') or not token_info.get('refresh_token'):
+             logging.warning("Access token or refresh token missing in individual keys.")
+        return token_info
+
+    def write(self, token_info):
+        config = ConfigParser()
+        config.read(self.config_path)
+        if self.config_section not in config:
+            config[self.config_section] = {}
+        section = config[self.config_section]
+        section['access_token'] = token_info.get('access_token', '')
+        section['refresh_token'] = token_info.get('refresh_token', '')
+
+        os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+        with open(self.config_path, 'w') as configfile:
+            config.write(configfile)
+        logging.debug(f"Tokens updated in {self.config_path} under [{self.config_section}]")
+        logging.info("Tokens automatically refreshed and stored in config.")
+
+    def clear(self):
+        pass
+
+class BoxTokenManager:
+    def __init__(self, client_id, client_secret, config_path, config_section):
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.config_path = config_path
+        self.config_section = config_section
+        self.token_store = ConfigTokenStore(config_path, config_section)
+        self.oauth = None
+        self.client = None
+
+    def get_authenticated_client(self):
+        if self.client:
+            try:
+                current_user = self.client.user().get()
+                logging.debug(f"Token valid for user: {current_user.name} (ID: {current_user.id})")
+                return self.client
+            except BoxAPIException as e:
+                if e.status == 401:
+                    logging.info("Access token expired, attempting refresh...")
+                    if self._refresh_tokens_internal():
+                         return self.client
+                    else:
+                        logging.error("Automatic token refresh failed.")
+                else:
+                     logging.error(f"API error checking token validity: {e}")
+        try:
+            token_info = self.token_store.read()
+            if not token_info.get('access_token') or not token_info.get('refresh_token'):
+                raise ValueError("Valid tokens not found in configuration")
+
+            # persistent OAuth2 with token refresh callback
+            self.oauth = OAuth2(
+                client_id=self.client_id,
+                client_secret=self.client_secret,
+                access_token=token_info['access_token'],
+                refresh_token=token_info['refresh_token'],
+                store_tokens=self._store_tokens_callback
+            )
+            self.client = Client(self.oauth)
+            current_user = self.client.user().get()
+            logging.info(f"Authenticated with Box as {current_user.name} (ID: {current_user.id})")
+            return self.client
+        except (FileNotFoundError, ValueError) as e:
+            logging.error(f"No stored tokens found or invalid tokens: {e}")
+            return None
+        except Exception as e:
+            logging.error(f"Failed to create authenticated client: {e}", exc_info=True)
+            return None
+
+    def _store_tokens_callback(self, access_token, refresh_token):
+        token_info = {
+            'access_token': access_token,
+            'refresh_token': refresh_token
+        }
+        self.token_store.write(token_info)
+
+    def _refresh_tokens_internal(self):
+        try:
+            if not self.oauth:
+                token_info = self.token_store.read()
+                if not token_info.get('access_token') or not token_info.get('refresh_token'):
+                    raise ValueError("Cannot refresh: tokens not found in configuration")
+                self.oauth = OAuth2(
+                    client_id=self.client_id,
+                    client_secret=self.client_secret,
+                    access_token=token_info['access_token'],
+                    refresh_token=token_info['refresh_token'],
+                    store_tokens=self._store_tokens_callback
+                )
+            self.oauth.refresh()
+            self.client = Client(self.oauth)
+            logging.info("Tokens manually refreshed successfully.")
+            return True
+        except Exception as e:
+            logging.error(f"Manual token refresh failed: {e}", exc_info=True)
+            return False
+
+def prepare_metadata_to_upload( backlink_url, properties_file):
     metadata = {
         "fabric URL": backlink_url
     }
-    if not os.path.exists(properties_file):
+    if not properties_file or not os.path.exists(properties_file):
         logging.warning(f"Metadata file not found: {properties_file}")
         return metadata
     file_ext = properties_file.lower()
@@ -103,7 +219,6 @@ def prepare_metadata_to_upload( backlink_url, properties_file):
         if file_ext.endswith(".json"):
             with open(properties_file, 'r') as f:
                 metadata = json.load(f)
-
         elif file_ext.endswith(".xml"):
             tree = ET.parse(properties_file)
             root = tree.getroot()
@@ -125,22 +240,19 @@ def prepare_metadata_to_upload( backlink_url, properties_file):
                         metadata[key] = value
     except Exception as e:
         logging.error(f"Failed to parse {properties_file}: {e}")
-    
     return metadata
+
 def apply_metadata_with_upsert(file_obj, metadata_dict, template='properties', scope='global'):
     try:
-        # Try to create metadata
         return file_obj.metadata(scope, template).create(metadata_dict)
     except BoxAPIException as e:
         if e.status == 409 and 'conflict' in str(e).lower():
-            # Metadata exists, so update instead
             update_ops = MetadataUpdate()
             for key, value in metadata_dict.items():
                 update_ops.add(key, value)
             return file_obj.metadata(scope, template).update(update_ops)
         else:
             raise
-
 
 def get_or_create_folder(client, folder_name, parent_id):
     try:
@@ -155,7 +267,6 @@ def get_or_create_folder(client, folder_name, parent_id):
         logging.error(f"[get_or_create_folder] Error in get_or_create_folder('{folder_name}', '{parent_id}'): {e}", exc_info=True)
         raise
 
-
 def ensure_path(client, path, base_id="0"):
     try:
         current_folder_id = base_id
@@ -168,7 +279,6 @@ def ensure_path(client, path, base_id="0"):
         logging.error(f"[ensure_path] Error in ensure_path('{path}', base_id='{base_id}'): {e}", exc_info=True)
         raise
 
-
 def resolve_conflict_and_prepare_upload(folder, file_name, conflict_resolution):
     items = folder.get_items(limit=1000)
     existing_file = None
@@ -178,7 +288,6 @@ def resolve_conflict_and_prepare_upload(folder, file_name, conflict_resolution):
             existing_names.add(item.name)
             if item.name == file_name:
                 existing_file = item
-
     if existing_file:
         if conflict_resolution == "skip":
             return existing_file, file_name, True
@@ -195,7 +304,6 @@ def resolve_conflict_and_prepare_upload(folder, file_name, conflict_resolution):
     else:
         return None, file_name, False
 
-
 def upload_file_with_conflict_resolution(client, folder_id, file_path, conflict_resolution="overwrite"):
     logging.debug(f"Starting upload for file: {file_path} to folder ID: {folder_id}")
     try:
@@ -203,11 +311,9 @@ def upload_file_with_conflict_resolution(client, folder_id, file_path, conflict_
         file_size = os.path.getsize(file_path)
         folder = client.folder(folder_id).get()
         min_upload_session_size = 20000000  # 20 MB
-
         existing_file, upload_name, skip_upload = resolve_conflict_and_prepare_upload(
             folder, file_name, conflict_resolution
         )
-
         if skip_upload:
             logging.warning(f"File {file_name} exists and is being skipped (conflict_resolution=skip).")
             return {
@@ -217,14 +323,14 @@ def upload_file_with_conflict_resolution(client, folder_id, file_path, conflict_
                 "size": getattr(existing_file, 'size', None),
                 "skipped": True
             }
-
         # Small file
         if file_size < min_upload_session_size:
             if existing_file and conflict_resolution == "new_version":
                 file_obj = client.file(existing_file.id)
                 uploaded_file = file_obj.update_contents(file_path)
             elif existing_file and conflict_resolution == "overwrite":
-                uploaded_file = folder.upload(file_path, file_name=upload_name, overwrite=True)
+                file_obj = client.file(existing_file.id)
+                uploaded_file = file_obj.update_contents(file_path)
             else:
                 uploaded_file = folder.upload(file_path, file_name=upload_name)
             return {
@@ -233,7 +339,6 @@ def upload_file_with_conflict_resolution(client, folder_id, file_path, conflict_
                 "file_name": uploaded_file.name,
                 "size": uploaded_file.size
             }
-
         # Large file (chunked upload)
         else:
             if existing_file and conflict_resolution in ("overwrite", "new_version"):
@@ -241,7 +346,6 @@ def upload_file_with_conflict_resolution(client, folder_id, file_path, conflict_
                 upload_session = file_obj.create_upload_session(file_size=file_size)
             else:
                 upload_session = folder.create_upload_session(file_name=upload_name, file_size=file_size)
-
             chunk_size = upload_session.part_size
             parts = []
             offset = 0
@@ -256,7 +360,6 @@ def upload_file_with_conflict_resolution(client, folder_id, file_path, conflict_
                     )
                     parts.append(part)
                     offset += bytes_to_read
-
             content_sha1 = calculate_sha1(file_path, chunk_size)
             uploaded_file = upload_session.commit(
                 parts=parts,
@@ -268,7 +371,6 @@ def upload_file_with_conflict_resolution(client, folder_id, file_path, conflict_
                 "file_name": uploaded_file.name,
                 "size": uploaded_file.size
             }
-
     except BoxAPIException as e:
         logging.error(f"[BoxAPIException] Failed to upload file: {file_path} -> {str(e)}", exc_info=True)
         return {
@@ -325,18 +427,21 @@ if __name__ == '__main__':
     logging.debug(f"Using cloud config: {cloud_config_path}")
     logging.debug(f"Source path: {args.source_path}")
     logging.debug(f"Upload path: {args.upload_path}")
-    
-    parsed_token = json.loads(cloud_config_data.get('token')) if 'token' in cloud_config_data else None
-    logging.info(f"Parsed token: {parsed_token}")
+    logging.debug(f"Upload path: {args.upload_path}")
 
-    oauth = OAuth2(
+    token_manager = BoxTokenManager(
         client_id=cloud_config_data['client_id'],
         client_secret=cloud_config_data['client_secret'],
-        access_token= parsed_token["access_token"] if parsed_token else cloud_config_data['access_token'],
-        refresh_token=parsed_token["refresh_token"] if parsed_token else cloud_config_data.get('refresh_token', None),
+        client_secret=cloud_config_data['client_secret'],
+        config_path=cloud_config_path,
+        config_section=cloud_config_name
     )
-    client = Client(oauth)
-    
+
+    client = token_manager.get_authenticated_client()
+    if not client:
+        logging.error("Failed to authenticate with Box. Please ensure tokens are valid or re-authenticate.")
+        sys.exit(1)
+
     if mode == "get_base_target":
         upload_path = args.upload_path
         if not upload_path:
@@ -408,15 +513,13 @@ if __name__ == '__main__':
     
     #  upload file along with meatadata
     meta_file = args.metadata_file
-    if meta_file:
-        logging.info("Preparing metadata to be uploaded ...")
-        metadata_obj = prepare_metadata_to_upload(backlink_url, meta_file)
-        if metadata_obj is not None:
-            parsed = metadata_obj
-        else:
-            parsed = None
-            logging.error("Failed to find metadata .")
-
+    meta_file = args.metadata_file
+    logging.info("Preparing metadata to be uploaded ...")
+    metadata_obj = prepare_metadata_to_upload(backlink_url, meta_file)
+    if metadata_obj is not None:
+        parsed = metadata_obj
+    else:
+        parsed = None
     # upload file
     if args.resolved_upload_id:
         folder_id = upload_path

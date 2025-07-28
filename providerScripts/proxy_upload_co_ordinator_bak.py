@@ -355,6 +355,8 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
         cmd += ["--metadata-file", metadata_path]
     if config.get("controller_address"):
         cmd += ["--controller-address", config["controller_address"]]
+    if config.get("provider") in PATH_BASED_PROVIDERS:
+        cmd += ["--bucket-name", config["bucket"]]
     if dry_run:
         cmd.append("--dry-run")
     if upload_path_id:

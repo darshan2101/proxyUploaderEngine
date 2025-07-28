@@ -77,17 +77,17 @@ def get_link_address_and_port():
     logging.info(f"Server connection details - Address: {ip}, Port: {port}")
     return ip, port
 
-def prepare_metadata_to_upload( backlink_url, properties_file):    
-    if not os.path.exists(properties_file):
-        logging.error(f"Properties file not found: {properties_file}")
-        sys.exit(1)
-
+def prepare_metadata_to_upload( backlink_url, properties_file = None):    
     metadata = {
         "fabric URL": backlink_url
     }
+    if not properties_file or not os.path.exists(properties_file):
+        logging.warning(f"Properties file not found: {properties_file}")
+        return metadata
+    
     logging.debug(f"Reading properties from: {properties_file}")
-    file_ext = properties_file.lower()
     try:
+        file_ext = properties_file.lower()
         if file_ext.endswith(".json"):
             with open(properties_file, 'r') as f:
                 metadata = json.load(f)
@@ -124,6 +124,7 @@ def prepare_metadata_to_upload( backlink_url, properties_file):
 def upload_file_to_dropbox(token, file_path, target_path, metadata=None, property_template_id=None):
     try:
         dbx = dropbox.Dropbox(token)
+        logging.debug(f"Attempting to upload '{file_path}' to Dropbox path: '{target_path}'")
         with open(file_path, "rb") as f:
             res = dbx.files_upload(f.read(), target_path, mode=dropbox.files.WriteMode("overwrite"))
         
@@ -158,7 +159,7 @@ if __name__ == '__main__':
     parser.add_argument("-m", "--mode", required=True, help="mode of Operation proxy or original upload")
     parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
     parser.add_argument("-j", "--job-guid", help="Job Guid of SDNA job")
-    parser.add_argument("--parent-id", help="Optional parent folder ID to resolve relative upload paths from")
+    parser.add_argument("-b", "--bucket-name", required=True, help= "Name of Bucket")
     parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
     parser.add_argument("-sp", "--source-path", help="Source path of file to look for original upload")
     parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
@@ -245,23 +246,24 @@ if __name__ == '__main__':
         sys.exit(0)
 
     logging.info(f"Starting upload process to Dropbox in {mode} mode")
-    upload_path = args.upload_path
     
     #  upload file along with meatadata
     meta_file = args.metadata_file
-    if meta_file:
-        logging.info("Preparing metadata to be uploaded ...")
-        metadata_obj = prepare_metadata_to_upload(backlink_url, meta_file)
-        if metadata_obj is not None:
-            parsed = metadata_obj
-        else:
-            parsed = None
-            logging.error("Failed to find metadata .")
+    logging.info("Preparing metadata to be uploaded ...")
+    metadata_obj = prepare_metadata_to_upload(backlink_url, meta_file)
+    if metadata_obj is not None:
+        parsed = metadata_obj
+    else:
+        parsed = None
+        logging.error("Failed to find metadata .")
     
     # Always ensure absolute path for Dropbox
-    if not upload_path.startswith("/"):
-        upload_path = "/" + upload_path
-        
+    if not args.upload_path.startswith("/"):
+        abs_upload_path = "/" + args.upload_path
+    else:
+        abs_upload_path = args.upload_path
+    
+    upload_path = "/" + args.bucket_name.strip("/") + abs_upload_path
 
     asset = upload_file_to_dropbox(json.loads(cloud_config_data["token"])["access_token"], args.source_path, upload_path, parsed)
     
