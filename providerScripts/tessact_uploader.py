@@ -57,7 +57,6 @@ def get_link_address_and_port():
     try:
         with open(SERVERS_CONF_PATH) as f:
             lines = f.readlines()
-            logging.debug(f"Successfully read {len(lines)} lines from config")
 
         if IS_LINUX:
             for line in lines:
@@ -82,15 +81,12 @@ def get_link_address_and_port():
 
 def get_access_token(config):
     url = f"{config['base_url']}/auth/token/"
-    logging.info(f"url check -------------------------------> {url}")
     payload = {
         "email": f"{config['email']}",
         "password": f"{config['password']}"
     }
-    logging.info("Requesting JWT token for user %s", config['email'])
     response = requests.post(url, json=payload)
     if response.status_code == 200:
-        logging.info("JWT token received successfully")
         return response.json()['access']
     else:
         logging.error("Failed to get JWT token: %s", response.text)
@@ -107,9 +103,7 @@ def create_folder(base_url, token, name, workspace_id, parent_id = None):
     if parent_id is not None:
         payload["parent"] = parent_id
     response = requests.post(url, headers=headers, json=payload)
-    logging.info(f"Response for folder creation ------------------------------> {response.json()}")
     if response.status_code in (200, 201):
-        logging.info("Token Aquired Successfully")
         return response.json()["id"]
     else:
         logging.error("Failed to create Folder")
@@ -127,10 +121,8 @@ def list_all_folders(config_data, token, workspace_id, parent_id):
     }
 
     while url:
-        logging.debug(f"Fetching folders from: {url}")
         response = requests.get( url, headers=headers, params=params)
         if response.status_code in (200, 201):
-            logging.info("File Tree Successfully")
             data = response.json().get("data", {})
         else:
             logging.error("Failed to get File Tree")
@@ -282,8 +274,6 @@ def parse_metadata_file(properties_file):
 
 
 def upload_metadata_to_asset(base_url, token, backlink_url, asset_id, properties_file = None):
-    logging.info(f"Updating asset {asset_id} with properties from {properties_file}")
-
     props = parse_metadata_file(properties_file)
 
     metadata = [
@@ -314,7 +304,6 @@ def upload_metadata_to_asset(base_url, token, backlink_url, asset_id, properties
     url = f'{base_url}/api/v1/value_instances/bulk_update/'
     response = requests.post(url, headers=headers, data=json.dumps(payload))
 
-    logging.info(f"Asset update completed with status code: {response.status_code}")
     if response.status_code in (200, 201):
         logging.info("Uploaded successfully")
     else:
@@ -365,14 +354,12 @@ if __name__ == '__main__':
         cloud_config_data["base_url"] = cloud_config_data.get("domain", "https://dev-api.tessact.com")
 
     workspace_id = cloud_config_data['workspace_id']
-    logging.debug(f"Workspace Id ----------------------->{workspace_id}")
 
     logging.info(f"Starting Tessact upload process in {mode} mode")
     logging.debug(f"Using cloud config: {cloud_config_path}")
     logging.debug(f"Source path: {args.source_path}")
     logging.debug(f"Upload path: {args.upload_path}")
     
-    logging.info(f"Initializing Tessact client for workspace: {workspace_id}")
     token = get_access_token(cloud_config_data)
     if not token:
         logging.error("Failed to get Token. Exiting.")
