@@ -81,17 +81,18 @@ def get_link_address_and_port():
     logging.info(f"Server connection details - Address: {ip}, Port: {port}")
     return ip, port
 
-def prepare_metadata_to_upload( backlink_url, properties_file):    
-    if not os.path.exists(properties_file):
-        logging.error(f"Properties file not found: {properties_file}")
-        sys.exit(1)
-
+def prepare_metadata_to_upload( backlink_url, properties_file = None):    
     metadata = {
         "fabric URL": backlink_url
     }
+    
+    if not properties_file or not os.path.exists(properties_file):
+        logging.error(f"Properties file not found: {properties_file}")
+        return metadata
+
     logging.debug(f"Reading properties from: {properties_file}")
-    file_ext = properties_file.lower()
     try:
+        file_ext = properties_file.lower()
         if file_ext.endswith(".json"):
             with open(properties_file, 'r') as f:
                 metadata = json.load(f)
@@ -110,7 +111,6 @@ def prepare_metadata_to_upload( backlink_url, properties_file):
                 logging.debug(f"Loaded XML properties: {metadata}")
             else:
                 logging.error("No <meta-data> section found in XML.")
-                sys.exit(1)     
         else:
             with open(properties_file, 'r') as f:
                 for line in f:
@@ -121,7 +121,6 @@ def prepare_metadata_to_upload( backlink_url, properties_file):
                 logging.debug(f"Loaded CSV properties: {metadata}")
     except Exception as e:
         logging.error(f"Failed to parse metadata file: {e}")
-        sys.exit(1)
     
     return metadata
 

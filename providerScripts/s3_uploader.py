@@ -98,14 +98,15 @@ def upload_file_to_s3(config_data, bucket_name, source_path, upload_path, metada
             "detail": str(e)
         }
 
-def prepare_metadata_to_upload( backlink_url, properties_file):    
-    if not os.path.exists(properties_file):
-        logging.error(f"Properties file not found: {properties_file}")
-        sys.exit(1)
-
+def prepare_metadata_to_upload( backlink_url, properties_file = None):    
     metadata = {
         "fabric URL": backlink_url
     }
+    
+    if not properties_file or not os.path.exists(properties_file):
+        logging.error(f"Properties file not found: {properties_file}")
+        return metadata
+    
     logging.debug(f"Reading properties from: {properties_file}")
     file_ext = properties_file.lower()
     try:
@@ -127,7 +128,6 @@ def prepare_metadata_to_upload( backlink_url, properties_file):
                 logging.debug(f"Loaded XML properties: {metadata}")
             else:
                 logging.error("No <meta-data> section found in XML.")
-                sys.exit(1)     
         else:
             with open(properties_file, 'r') as f:
                 for line in f:
@@ -138,10 +138,8 @@ def prepare_metadata_to_upload( backlink_url, properties_file):
                 logging.debug(f"Loaded CSV properties: {metadata}")
     except Exception as e:
         logging.error(f"Failed to parse metadata file: {e}")
-        sys.exit(1)
     
     return metadata
-
 
 
 
@@ -240,14 +238,13 @@ if __name__ == '__main__':
     
     #  upload file along with meatadata
     meta_file = args.metadata_file
-    if meta_file:
-        logging.info("Preparing metadata to be uploaded ...")
-        metadata_obj = prepare_metadata_to_upload(backlink_url, meta_file)
-        if metadata_obj is not None:
-            parsed = metadata_obj
-        else:
-            parsed = None
-            logging.error("Failed to find metadata .")
+    logging.info("Preparing metadata to be uploaded ...")
+    metadata_obj = prepare_metadata_to_upload(backlink_url, meta_file)
+    if metadata_obj is not None:
+        parsed = metadata_obj
+    else:
+        parsed = None
+        logging.error("Failed to find metadata .")
     
     #  upload file
     response = upload_file_to_s3(cloud_config_data, args.bucket_name, args.source_path, args.upload_path, parsed)
