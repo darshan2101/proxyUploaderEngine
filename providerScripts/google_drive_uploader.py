@@ -2,7 +2,7 @@ import argparse
 import sys
 import os
 import json
-# from action_functions import *
+import time
 import logging
 import urllib.parse
 from configparser import ConfigParser
@@ -13,6 +13,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
+from googleapiclient.errors import HttpError
 
 
 SCOPES = ['https://www.googleapis.com/auth/drive']
@@ -195,28 +196,46 @@ def get_drive_service(token):
  
     return build('drive', 'v3', credentials=creds)
 
-def upload_file(token, file_path, folder_id,  metadata=None):
-    try:
-        service = get_drive_service(token)
-        # Only replace spaces with underscores in metadata keys
-        sanitized_metadata = None
-        if metadata:
-            sanitized_metadata = {str(k).replace(' ', '_'): str(v) for k, v in metadata.items()}
+def upload_file(token, file_path, folder_id, metadata=None, retries=3):
+    service = get_drive_service(token)
+    file_size = os.path.getsize(file_path)
+    use_resumable = file_size > 5 * 1024 * 1024
+    media = MediaFileUpload(file_path, resumable=use_resumable)
 
-        file_metadata = {
-            'name': os.path.basename(os.path.normpath(file_path)),
-            'parents': [folder_id],
-            'Source': sanitized_metadata['fabric_host'],
-        }
+    sanitized_metadata = None
+    if metadata:
+        sanitized_metadata = {str(k).replace(' ', '_'): str(v) for k, v in metadata.items()}
 
-        media = MediaFileUpload(file_path, resumable=True)
+    file_metadata = {
+        'name': os.path.basename(os.path.normpath(file_path)),
+        'parents': [folder_id],
+        'Source': sanitized_metadata['fabric_host'],
+    }
 
-        file = service.files().create(body=file_metadata,media_body=media).execute()
-        print(f"File uploaded successfully: {file}")
-        return True
-    except Exception as e:
-        return str(e)
+    for attempt in range(1, retries + 1):
+        try:
+            logging.info("Uploading '%s' (%d bytes) to folder %s [Attempt %d, Resumable=%s]",
+                         file_path, file_size, folder_id, attempt, use_resumable)
+            uploaded = service.files().create(body=file_metadata, media_body=media).execute()
+            logging.info("Upload successful: %s", uploaded)
+            print(f"File uploaded successfully: {uploaded}")
+            return True
+        except HttpError as e:
+            logging.warning("HTTP error during upload (attempt %d): %s", attempt, e)
+            if e.resp.status not in [500, 502, 503, 504, 410]:
+                logging.error("Non-retryable HTTP error", exc_info=True)
+                return str(e)
+        except Exception as e:
+            logging.error("Unexpected error during upload (attempt %d)", attempt, exc_info=True)
+            return str(e)
 
+        if attempt < retries:
+            backoff = 2 ** attempt
+            logging.info("Retrying upload in %d seconds...", backoff)
+            time.sleep(backoff)
+
+    logging.error("Upload failed after %d attempts: %s", retries, file_path)
+    return f"Upload failed after {retries} attempts"
 
 
 if __name__ == '__main__':
