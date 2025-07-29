@@ -535,7 +535,6 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
             # If no upload_path, use "/" as the base and dir_path directly
             normalized_folder_key = os.path.join("/", dir_path) if dir_path else "/"
 
-
         if config["provider"] in PATH_BASED_PROVIDERS:
             upload_path_id = None
         else:
