@@ -313,8 +313,11 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
         base_source_path = original_source_path
         relative_upload_path = os.path.basename(original_source_path)
 
-    upload_base = config["upload_path"].split(":")[-1]
-    full_upload_path = os.path.join(upload_base, relative_upload_path)
+    if "upload_path" in config and config["upload_path"]:
+        upload_base = config["upload_path"].split(":")[-1]
+        full_upload_path = os.path.join(upload_base, relative_upload_path)
+    else:
+        full_upload_path = relative_upload_path
 
     # Determine the correct source path using the helper
     source_path, error = resolve_source_path_for_upload_asset(record, config, override_source_path, proxy_map)
