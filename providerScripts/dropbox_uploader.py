@@ -10,6 +10,7 @@ import plistlib
 import dropbox
 from dropbox.exceptions import ApiError
 from dropbox.files import WriteMode, FolderMetadata
+from dropbox.file_properties import PropertyField, PropertyGroup
 
 # Constants
 VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet"]
@@ -126,14 +127,14 @@ def upload_file_to_dropbox(token, file_path, target_path, metadata=None, propert
         dbx = dropbox.Dropbox(token)
         logging.debug(f"Attempting to upload '{file_path}' to Dropbox path: '{target_path}'")
         with open(file_path, "rb") as f:
-            res = dbx.files_upload(f.read(), target_path, mode=dropbox.files.WriteMode("overwrite"))
-        
+            res = dbx.files_upload(f.read(), target_path, mode=dropbox.files.WriteMode.overwrite)
+
         # Attach custom metadata if provided and template_id is given
         if metadata and property_template_id:
-            from dropbox.file_properties import PropertyField, PropertyGroup, AddPropertiesArg
             fields = [PropertyField(name=k, value=str(v)) for k, v in metadata.items()]
             prop_group = PropertyGroup(template_id=property_template_id, fields=fields)
-            dbx.file_properties_properties_add(AddPropertiesArg(path=target_path, property_groups=[prop_group]))
+            dbx.file_properties.properties_add(path=target_path, property_groups=[prop_group])
+
             return {
                 "status": 200,
                 "detail": f"Uploaded file and attached metadata to {target_path}",

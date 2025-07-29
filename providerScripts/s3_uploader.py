@@ -78,22 +78,37 @@ def get_link_address_and_port():
 
 def upload_file_to_s3(config_data, bucket_name, source_path, upload_path, metadata=None):
     try:
-        s3 = boto3.client(
-            's3',
-            aws_access_key_id=config_data['access_key_id'],
-            aws_secret_access_key=config_data['secret_access_key'],
-            endpoint_url=config_data['endpoint_url']
-        )
+        client_kwargs = {
+            'service_name': 's3',
+            'aws_access_key_id': config_data['access_key_id'],
+            'aws_secret_access_key': config_data['secret_access_key']
+        }
+        if 'region' in config_data:
+            client_kwargs['region_name'] = config_data['region']
+        if 'endpoint_url' in config_data:
+            client_kwargs['endpoint_url'] = config_data['endpoint_url']
 
-        # Upload the file
-        s3.upload_file(Filename=source_path, Bucket=bucket_name, Key=upload_path, ExtraArgs={'Metadata': metadata} if metadata else {})
+        s3 = boto3.client(**client_kwargs)
+
+        upload_path = upload_path.lstrip('/')
+
+        sanitized_metadata = None
+        if metadata:
+            sanitized_metadata = {k.lower().replace(' ', '-'): str(v) for k, v in metadata.items()}
+
+        s3.upload_file(
+            Filename=source_path,
+            Bucket=bucket_name,
+            Key=upload_path,
+            ExtraArgs={'Metadata': sanitized_metadata} if sanitized_metadata else {}
+        )
         return {
             "status": 200,
             "detail": "uploaded asset successfully"
         }
     except Exception as e:
         logging.debug(f"Error: {e}")
-        return  {
+        return {
             "status": 500,
             "detail": str(e)
         }
@@ -248,7 +263,7 @@ if __name__ == '__main__':
     
     #  upload file
     response = upload_file_to_s3(cloud_config_data, args.bucket_name, args.source_path, args.upload_path, parsed)
-    if response["status_code"] != 200:
+    if response["status"] != 200:
         print(f"Failed to upload file parts: {response['detail']}")
         sys.exit(1)
     else:

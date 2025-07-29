@@ -18,7 +18,7 @@ DEBUG_TO_FILE = True
 
 PROXY_GENERATION_HOST = "http://127.0.0.1:8000"
 PROVIDERS_SUPPORTING_GET_BASE_TARGET = {"frameio_v2", "frameio_v4", "tessact", "overcasthq", "trint"}
-PATH_BASED_PROVIDERS = ["dropbox", "AWS"]
+PATH_BASED_PROVIDERS = ["cloud", "AWS"]
 
 # Mapping provider names to their respective upload scripts
 PROVIDER_SCRIPTS = {
@@ -27,11 +27,11 @@ PROVIDER_SCRIPTS = {
     "frameio_v4": "frame_io_v4_uploader.py",
     "tessact": "tessact_uploader.py",
     "overcasthq": "overcasthq_uploader.py",
-    "AWS": "s3_uploder.py",
+    "AWS": "s3_uploader.py",
     "trint": "trint_uploder.py",
     "twelvelabs": "twelvelabs_uploader.py",
     "box": "box_uploader.py",
-    "dropbox": "dropbox_uploader.py",
+    "cloud": "dropbox_uploader.py",
     "googledrive": "google_drive_uploader.py",
     "iconik": "iconik_uploader.py",
 }
@@ -712,6 +712,11 @@ if __name__ == '__main__':
     optional_keys = ["proxy_output_base_path", "proxy_extra_params", "controller_address"]
 
     mode = request_data.get("mode")
+    
+    if not (request_data.get("upload_path") or "").strip() or request_data["upload_path"] == "/":
+        if "bucket" in request_data and ":" in request_data["bucket"]:
+            bucket_id, bucket_name = request_data["bucket"].split(":", 1)
+            request_data["upload_path"] = f"/{bucket_id}:/{bucket_name}"
 
     if mode in ("original"):
         optional_keys.append("original_file_size_limit")

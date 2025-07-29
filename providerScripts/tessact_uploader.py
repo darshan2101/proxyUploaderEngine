@@ -108,10 +108,10 @@ def create_folder(base_url, token, name, workspace_id, parent_id = None):
     else:
         logging.error("Failed to create Folder")
 
-def list_all_folders(config_data, token, workspace_id, parent_id):
+def list_assets(config_data, token, workspace_id, parent_id, resource_type = 'Folder'):
     headers = {"Authorization": f"Bearer {token}"}
     base_url = config_data['base_url']
-    all_folders = []
+    all_assets = []
 
     url = f"{base_url}/api/v1/library/"
     params = {
@@ -126,16 +126,17 @@ def list_all_folders(config_data, token, workspace_id, parent_id):
             data = response.json().get("data", {})
         else:
             logging.error("Failed to get File Tree")
+            break
 
-        folders = [
+        assets = [
             item for item in data.get("results", [])
-            if item.get("resourcetype") == "Folder"
+            if item.get("resourcetype") == resource_type
         ]
-        all_folders.extend(folders)
+        all_assets.extend(assets)
 
         url = data.get("meta", {}).get("next")
         params = None  # Only used on first call
-    return all_folders
+    return all_assets
 
 def find_upload_id_tessact(upload_path, token, config_data, base_id = None):
     workspace_id = config_data['workspace_id']
@@ -146,7 +147,7 @@ def find_upload_id_tessact(upload_path, token, config_data, base_id = None):
     for segment in upload_path.strip("/").split("/"):
         logging.debug(f"Looking for folder '{segment}' under parent '{current_parent_id}'")
 
-        folders = list_all_folders(config_data, token, workspace_id, current_parent_id)
+        folders = list_assets(config_data, token, workspace_id, current_parent_id)
         matched = next((f for f in folders if f.get("name") == segment), None)
 
         if matched:
@@ -170,11 +171,35 @@ def get_file_parts(file_size, chunk_size):
         })
     return parts
 
+def remove_existing_file_if_present(config_data, token, filename, parent_id=None):
+    logging.info(f"Checking if file '{filename}' already exists in folder ID: {parent_id}")
+    all_assets = list_assets(config_data, token, config_data['workspace_id'], parent_id, resource_type='File')
+    file_match = next((item for item in all_assets if item.get("name") == filename), None)
+
+    if file_match:
+        asset_id = file_match.get("id")
+        if asset_id:
+            headers = {"Authorization": f"Bearer {token}"}
+            delete_url = f"{config_data['base_url']}/api/v1/library/{asset_id}/"
+            del_resp = requests.delete(delete_url, headers=headers)
+            if del_resp.status_code in (200, 204):
+                logging.info(f"Deleted existing file '{filename}' with ID: {asset_id}")
+                return True
+            else:
+                logging.error(f"Failed to delete file '{filename}' (ID: {asset_id}). Status: {del_resp.status_code}, Response: {del_resp.text}")
+    else:
+        logging.info(f"No existing file named '{filename}' found.")
+    return False
+
 def initiate_upload(file_path, config_data, token, parent_id=None):
     url = f"{config_data['base_url']}/api/v1/upload/initiate_upload/"
     workspace_id = config_data['workspace_id']
     file_name = os.path.basename(file_path)
     file_size = os.path.getsize(file_path)
+    
+    # check if file is already uploaded at parent_id
+    remove_existing_file_if_present(config_data, token, file_name, parent_id)
+
     parts = get_file_parts(file_size, CHUNK_SIZE)
     headers = {"Content-Type": "application/json" ,"Authorization": f"Bearer {token}"}
     payload = {
