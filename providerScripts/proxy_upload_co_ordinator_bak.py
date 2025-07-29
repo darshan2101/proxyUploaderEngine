@@ -18,7 +18,7 @@ DEBUG_TO_FILE = True
 
 PROXY_GENERATION_HOST = "http://127.0.0.1:8000"
 PROVIDERS_SUPPORTING_GET_BASE_TARGET = {"frameio_v2", "frameio_v4", "tessact", "overcasthq", "trint"}
-PATH_BASED_PROVIDERS = ["dropbox", "s3"]
+PATH_BASED_PROVIDERS = ["dropbox", "AWS"]
 
 # Mapping provider names to their respective upload scripts
 PROVIDER_SCRIPTS = {
@@ -464,21 +464,24 @@ def calculate_total_size(records, config, proxy_map=None):
 
 def build_folder_id_map(records, config, log_path):
     resolved_ids = {}
-    # Determine base path and parent ID
-    upload_path = config["upload_path"]
-    if ":" in upload_path:
-        parent_id, base_upload_path = upload_path.split(":", 1)
-        base_id = parent_id.strip("/")
-        resolved_ids[base_upload_path] = base_id
-        debug_print(log_path, f"[INIT] Mapping root path '{base_upload_path}' to ID '{base_id}'")
-
+    if "upload_path" in config and config["upload_path"]:
+        upload_path = config["upload_path"]
+        if ":" in upload_path:
+            parent_id, base_upload_path = upload_path.split(":", 1)
+            base_id = parent_id.strip("/")
+            resolved_ids[base_upload_path] = base_id
+            debug_print(log_path, f"[INIT] Mapping root path '{base_upload_path}' to ID '{base_id}'")
+        else:
+            base_upload_path = config["upload_path"]
+            base_id = resolve_base_upload_id(
+                log_path, config["script_path"], config["cloud_config_name"], f"/{base_upload_path}"
+            )
+            resolved_ids[base_upload_path] = base_id
+            debug_print(log_path, f"[INIT] Resolved base path '{base_upload_path}' to ID '{base_id}'")
     else:
-        base_upload_path = config["upload_path"]
-        base_id = resolve_base_upload_id(
-            log_path, config["script_path"], config["cloud_config_name"], f"/{base_upload_path}"
-        )
-        resolved_ids[base_upload_path] = base_id
-        debug_print(log_path, f"[INIT] Resolved base path '{base_upload_path}' to ID '{base_id}'")
+        # If upload_path is not provided, default to root "/" mapped to None
+        resolved_ids["/"] = None
+        debug_print(log_path, f"[INIT] No upload_path in config. Using root '/' mapped to None.")
 
     # Subtree creation for /./ based paths
     for record in records:
@@ -486,8 +489,12 @@ def build_folder_id_map(records, config, log_path):
         if "/./" in original_source_path:
             _, sub_path = original_source_path.split("/./", 1)
             path_segments = [seg for seg in sub_path.split(os.sep) if seg]
-            current_path = base_upload_path
-            current_id = base_id
+            if "upload_path" in config and config["upload_path"]:
+                current_path = base_upload_path # From config
+                current_id = base_id # From config resolution
+            else:
+                current_path = "/" # Default root
+                current_id = resolved_ids["/"] # Should be None
 
             for idx, segment in enumerate(path_segments):
                 if idx < len(path_segments) - 1:
@@ -520,9 +527,14 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
             dir_path = ""
 
         # Compute resolved ID
-        base_path = config["upload_path"]
-        logical_base = base_path.split(":", 1)[-1] if ":" in base_path else base_path
-        normalized_folder_key = os.path.normpath(os.path.join(logical_base, dir_path))
+        if "upload_path" in config and config["upload_path"]:
+            base_path = config["upload_path"]
+            logical_base = base_path.split(":", 1)[-1] if ":" in base_path else base_path
+            normalized_folder_key = os.path.normpath(os.path.join(logical_base, dir_path))
+        else:
+            # If no upload_path, use "/" as the base and dir_path directly
+            normalized_folder_key = os.path.join("/", dir_path) if dir_path else "/"
+
 
         if config["provider"] in PATH_BASED_PROVIDERS:
             upload_path_id = None
@@ -693,7 +705,7 @@ if __name__ == '__main__':
         request_data = json.load(f)
 
     required_keys = [
-        "provider", "progress_path", "logging_path", "thread_count", "files_list", "cloud_config_name", "job_id","upload_path","mode", "run_id", "repo_guid","job_guid"
+        "provider", "progress_path", "logging_path", "thread_count", "files_list", "cloud_config_name", "job_id","mode", "run_id", "repo_guid","job_guid"
     ]
     optional_keys = ["proxy_output_base_path", "proxy_extra_params", "controller_address"]
 
