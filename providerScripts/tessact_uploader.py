@@ -1,3 +1,4 @@
+#tessact_uploader.py
 import os
 import sys
 import json
@@ -127,11 +128,11 @@ def list_assets(config_data, token, workspace_id, parent_id, resource_type = 'Fo
         else:
             logging.error("Failed to get File Tree")
             break
-
-        assets = [
-            item for item in data.get("results", [])
-            if item.get("resourcetype") == resource_type
-        ]
+        results = data.get("results", [])
+        if resource_type == 'File':
+            assets = [item for item in results if item.get("resourcetype") != 'Folder']
+        else:
+            assets = [item for item in results if item.get("resourcetype") == resource_type]
         all_assets.extend(assets)
 
         url = data.get("meta", {}).get("next")
@@ -174,6 +175,7 @@ def get_file_parts(file_size, chunk_size):
 def remove_existing_file_if_present(config_data, token, filename, filesize, parent_id=None):
     logging.info(f"Checking if file '{filename}' already exists in folder ID: {parent_id}")
     all_assets = list_assets(config_data, token, config_data['workspace_id'], parent_id, resource_type='File')
+    logging.debug(f"Found  assets in folder ID: {parent_id}    ---------> {all_assets}")
     file_match = next((item for item in all_assets if item.get("name") == filename and int(item['size']) == int(filesize) ), None)
 
     if file_match:
