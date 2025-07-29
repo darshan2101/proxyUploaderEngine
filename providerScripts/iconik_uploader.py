@@ -124,6 +124,16 @@ def prepare_metadata_to_upload( backlink_url, properties_file = None):
     
     return metadata
 
+def remove_file(config, asset_id):
+    url = f'{DOMAIN}/API/assets/v1/assets/{asset_id}'
+    headers = {"app-id":config["app-id"], "auth-token" : config["auth-token"]}
+    response = requests.delete(url,headers=headers)
+    if response.status_code != 204:
+        logging.error(f"Response error. Status - {response.status_code}, Error - {response.text}")
+        exit(1)
+        return False
+    return True
+
 def calculate_sha1(file_path):
     sha1 = hashlib.sha1()
     
@@ -230,10 +240,22 @@ def get_storage_id(config, storage_name,storage_method):
             storage_id.append(storage["id"])
     return storage_id[0]
 
-def create_asset_id(config, file_name, collection_id=None):
+def create_asset_id(config, file_path, collection_id=None):
     url = f'{DOMAIN}/API/assets/v1/assets/'
     payload = {"title": file_name, "type": "ASSET"}
     params = {"apply_default_acls": "true"}
+    file_name = extract_file_name(file_path)
+    file_size = os.path.getsize(file_path)
+    # check and remove file if is already present
+    assets = get_call_of_collections_content(config, collection_id)
+    for asset in assets:
+        if 'files' in asset:
+            for file in asset['files']:
+                if file['original_name'] == file_name and int(file['size']) == int(file_size):
+                    if remove_file(config, asset['id']) == True:
+                         logging.info(f"Removed existing asset with path: {matched_file}")
+                    else:
+                        logging.error(f"Failed to remove existing asset: {file_name} with path: {matched_file}")
 
     if collection_id:
         payload["collection_id"] = collection_id
@@ -625,7 +647,7 @@ if __name__ == '__main__':
         collection = collection_to_use
         file_name = extract_file_name(matched_file)
         storage_id = get_storage_id(cloud_config_data, storage_name,storage_method)
-        asset_id, user_id = create_asset_id(cloud_config_data, file_name,collection)
+        asset_id, user_id = create_asset_id(cloud_config_data, matched_file, collection)
         logging.debug(f"Adding asset to collection: asset_id={asset_id}, collection_id={collection_id}")
         add_asset_in_collection(cloud_config_data,asset_id,collection)
         upload_path = collection_fullpath(cloud_config_data, collection)

@@ -189,8 +189,93 @@ def get_folder_id(config_data, upload_path, base_id = None):
     logging.debug(f"UUID  after tree traversal/creation ---------------> {current_parent_id}")
     return current_parent_id
 
+def get_assets_id_from_folder(config_data ,folder_id):
+    url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/folders/{folder_id}/asset"
+
+    headers = { 'x-api-key': config_data["api_key"] }
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200:    
+        logging.error(f"Response error. Status - {response.status_code}, Error - {response.text}")
+        exit(1)
+    return response.json()
+
+def remove_file(config_data, asset_id):
+    url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/assets/{asset_id}"
+    headers = { 'x-api-key': config_data["api_key"] }
+    
+    response = requests.delete(url, headers=headers)
+    if response.status_code != 200:
+        logging.error(f"Response error. Status - {response.status_code}, Error - {response.text}")
+        exit(1)
+        return False
+    return True
+
+
+def get_asset_metadata(config_data, asset_id):
+    metadata_dict = {}
+    url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/assets/{asset_id}/metadata"
+    headers = {
+    'x-api-key': config_data["api_key"]
+    }
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200:
+        logging.error(f"Response error. Status - {response.status_code}, Error - {response.text}")
+        exit(1)
+        return metadata_dict
+    response = response.json()
+    for key,value in response['result']['items'].items():
+        for data in value['items']:
+            metadata_dict[f"{key}_{data['key']}"] = data['value']
+    return metadata_dict
+
+def get_asset_details(config_data, asset_id):
+    data_dict = {}
+    url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/assets/{asset_id}"
+    headers = { 'x-api-key': config_data["api_key"] }
+    response = requests.get(url, headers=headers)
+    if response.status_code == 403:
+        return
+    elif response.status_code == 200:
+        response = response.json()
+        if len(response['result']) != 0:
+            folder_path_list = response['result']['folder']
+            folder_path = []
+            if len(folder_path_list) !=0:
+                folder_path = [folder['value'] for folder in folder_path_list['parent']]
+                folder_path.append(folder_path_list['name'])
+            if 'info' in response['result']:
+                file_name = f"{response['result']['name']}.{response['result']['info']['file_type']}"
+                data_dict['path'] = f"{'/'.join(folder_path)}/{file_name}"
+                data_dict['mtime'] = response['result']['updated_at']
+                data_dict['atime'] = response['result']['created_at']
+                data_dict['type'] = "file"
+                data_dict['size'] = response['result']['info']['file_size']
+                data_dict['asset_id'] = asset_id
+                data_dict['metadata'] = get_asset_metadata(config_data, asset_id)
+
+        return data_dict
+    
+    elif response.status_code != 200:
+        logging.error(f"Response error. Status - {response.status_code}, Error - {response.text}")
+        exit(1)
+
 def create_asset(config_data, project_id, folder_id, file_path):
-    logging.debug(f"Folder ID check 2-------------------------> {folder_id}")
+    logging.debug(f"Folder ID check at asset create-------------------------> {folder_id}")
+    
+    # Check and remove if the file exists
+    file_name = extract_file_name(file_path)
+    file_size = os.path.getsize(file_path)
+    asset_list = get_assets_id_from_folder(config_data, folder_id)
+    for asset in asset_list['result']['items']:
+        asset_info = get_asset_details(config_data, asset['uuid'])
+        if not asset_info is None:
+            if asset_info['metadata']['fix_original_name'] == file_name and int(asset_info['metadata']['fix_original_file_size']) == int(file_size):
+                if remove_file(config_data, asset_info['asset_id']) == True:
+                    logging.info(f"Successfully Deleted file {file_path}")
+                else:
+                    logging.error(f"Error while deleting file {file_path}")
+                    exit(1)
+    
     url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/assets"
 
     headers = {

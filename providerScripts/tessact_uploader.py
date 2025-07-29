@@ -171,10 +171,10 @@ def get_file_parts(file_size, chunk_size):
         })
     return parts
 
-def remove_existing_file_if_present(config_data, token, filename, parent_id=None):
+def remove_existing_file_if_present(config_data, token, filename, filesize, parent_id=None):
     logging.info(f"Checking if file '{filename}' already exists in folder ID: {parent_id}")
     all_assets = list_assets(config_data, token, config_data['workspace_id'], parent_id, resource_type='File')
-    file_match = next((item for item in all_assets if item.get("name") == filename), None)
+    file_match = next((item for item in all_assets if item.get("name") == filename and int(item['size']) == int(filesize) ), None)
 
     if file_match:
         asset_id = file_match.get("id")
@@ -198,7 +198,7 @@ def initiate_upload(file_path, config_data, token, parent_id=None):
     file_size = os.path.getsize(file_path)
     
     # check if file is already uploaded at parent_id
-    remove_existing_file_if_present(config_data, token, file_name, parent_id)
+    remove_existing_file_if_present(config_data, token, file_name, file_size, parent_id)
 
     parts = get_file_parts(file_size, CHUNK_SIZE)
     headers = {"Content-Type": "application/json" ,"Authorization": f"Bearer {token}"}

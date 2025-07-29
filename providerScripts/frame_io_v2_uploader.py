@@ -94,9 +94,27 @@ def find_upload_id(path, project_id, token, base_id=None):
         logging.debug(f"Current folder ID: {current_id}")
     return current_id
 
+def remove_file(client, asset_id):
+    try:
+        remove = client.assets.delete(asset_id)
+        return True
+    except Exception as e:
+        print("Error while Removing file :", e.text)
+        return False
+
 def upload_file(client, source_path, up_id, description):
     file_size = os.stat(source_path).st_size
     
+    # check if file exists
+    asset_list = client.assets.get_children(up_id, type='file')
+    existing_asset = next((asset for asset in asset_list if asset['name'] == extract_file_name(source_path) and int(asset['filesize']) == int(file_size) ), None)
+    if existing_asset:
+        if remove_file(client, existing_asset['id']) == True:
+            logging.info(f"Removed existing asset: {existing_asset['name']} with ID: {existing_asset['id']}")
+        else:
+            logging.error(f"Failed to remove existing asset: {existing_asset['name']} with ID: {existing_asset['id']}")
+            return None
+
     logging.debug("Creating asset in Frame.io")
     asset = client.assets.create(
         parent_asset_id=up_id,

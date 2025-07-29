@@ -112,6 +112,43 @@ def get_folders_list(config_data, folder_id):
         logger.error(f"Response error. Status - {response.status_code}, Error - {response.text}")
         return response.text, response.status_code
 
+def get_folders_content(config_data, asset_id, next_page_url = None, asset_data_list = None):
+    if asset_data_list is None:
+        asset_data_list = []
+    if next_page_url is None:
+        url = f"{config_data['domain']}/v4/accounts/{config_data['account_id']}/folders/{asset_id}/children"
+    else:
+        url = f"{config_data['domain']}{next_page_url}"
+    headers = {
+        'Accept': 'application/json',
+        'Authorization': f"Bearer {config_data['token']}"
+        }
+    logging.debug(f"URL: {url}")
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200: 
+        logging.info(f"Response error. Status - {response.status_code}, Error - {response.text}")
+        exit(1)
+    response = response.json()
+    asset_data_list.extend(response['data'])
+    next_page = response['links']['next']
+    if not next_page is None:
+        get_folders_content(asset_id,next_page,asset_data_list)
+    return asset_data_list
+
+def remove_file(config_data, asset_id):
+    url = f"{config_data['domain']}/v4/accounts/{config_data['account_id']}/files/{asset_id}"
+    headers = {
+        'Accept': 'application/json',
+        'Authorization': f"Bearer {config_data['token']}"
+        }
+    logging.debug(f"URL: {url}")
+    response = requests.delete(url, headers=headers)
+    if response.status_code != 204:
+        logging.info(f"Response error. Status - {response.status_code}, Error - {response.text}")
+        exit(1)
+        return False
+    return True
+
 def create_folder(config_data,folder_name,parent_id):
     url = f"{config_data['domain']}/v4/accounts/{config_data['account_id']}/folders/{parent_id}/folders"
     headers = {
@@ -162,6 +199,16 @@ def find_upload_id(upload_path, config_data, base_id = None):
 def create_asset(config_data,folder_id,file_path):
     url = f"{config_data['domain']}/v4/accounts/{config_data['account_id']}/folders/{folder_id}/files/local_upload"
     file_name = extract_file_name(file_path)
+    file_size = os.path.getsize(file_path)
+    # remove if file already exists
+    asset_list = get_folders_content(config_data, folder_id)
+    existing_asset = next((asset for asset in asset_list if asset['name'] == file_name and int(asset['file_size']) == int(file_size) ), None)
+    if existing_asset:
+        logging.info(f"File '{file_name}' already exists in folder ID {folder_id}. Removing existing asset.")
+        if remove_file(config_data, existing_asset['id']) == True:
+            logging.info(f"Removed existing asset: {existing_asset['name']} with ID: {existing_asset['id']}")
+        else:
+            logging.error(f"Failed to remove existing asset: {existing_asset['name']} with ID: {existing_asset['id']}")
 
     payload = {
     "data": {
