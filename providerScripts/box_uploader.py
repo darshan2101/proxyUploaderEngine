@@ -1,3 +1,4 @@
+# box_uploader.py
 import argparse
 import sys
 import os
@@ -249,10 +250,10 @@ def apply_metadata_with_upsert(file_obj, metadata_dict, template='properties', s
         if e.status == 409 and 'conflict' in str(e).lower():
             update_ops = MetadataUpdate()
             for key, value in metadata_dict.items():
-                update_ops.add(key, value)
+                update_ops.replace(key, value)
             return file_obj.metadata(scope, template).update(update_ops)
         else:
-            raise
+            logging.error(f"Failed to apply metadata: {e}", exc_info=True)
 
 def get_or_create_folder(client, folder_name, parent_id):
     try:
@@ -533,11 +534,17 @@ if __name__ == '__main__':
         logging.info(f"File uploaded successfully: {args.source_path}")
         if parsed is not None:
             file_obj = client.file(asset.get("file_id"))
-            apply_metadata_with_upsert(file_obj, parsed)
-            print(f'Applied metadata')
+            try:
+                 apply_metadata_with_upsert(file_obj, parsed)
+                 logging.info('Metadata applied successfully.')
+            except Exception as e:
+                 logging.error(f"Failed to apply metadata: {e}", exc_info=True)
+                 logging.warning("File uploaded successfully, but metadata application failed. Continuing as success.")
+            print(f"File uploaded successfully: {args.source_path} to folder ID: {folder_id} ")
             sys.exit(0)
-        print(f"File uploaded successfully: {args.source_path} to folder ID: {folder_id}")
-        sys.exit(0)
+        else:
+            print(f"File uploaded successfully: {args.source_path} to folder ID: {folder_id}")
+            sys.exit(0)
     else:
         logging.error(f"Failed to upload file: {args.source_path}, Error: {asset.get('error', 'Unknown error')}")
         sys.exit(1)
