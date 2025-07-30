@@ -242,10 +242,10 @@ def get_storage_id(config, storage_name,storage_method):
 
 def create_asset_id(config, file_path, collection_id=None):
     url = f'{DOMAIN}/API/assets/v1/assets/'
-    payload = {"title": file_name, "type": "ASSET"}
-    params = {"apply_default_acls": "true"}
     file_name = extract_file_name(file_path)
     file_size = os.path.getsize(file_path)
+    payload = {"title": file_name, "type": "ASSET"}
+    params = {"apply_default_acls": "true"}
     # check and remove file if is already present
     assets = get_call_of_collections_content(config, collection_id)
     for asset in assets:

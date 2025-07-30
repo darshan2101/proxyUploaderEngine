@@ -220,12 +220,14 @@ def get_asset_metadata(config_data, asset_id):
     response = requests.get(url, headers=headers)
     if response.status_code != 200:
         logging.error(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        exit(1)
         return metadata_dict
-    response = response.json()
-    for key,value in response['result']['items'].items():
-        for data in value['items']:
-            metadata_dict[f"{key}_{data['key']}"] = data['value']
+    try:
+        response = response.json()
+        for key, value in response['result']['items'].items():
+            for data in value['items']:
+                metadata_dict[f"{key}_{data['key']}"] = data['value']
+    except Exception as e:
+        logging.error(f"Error parsing metadata JSON for asset {asset_id}: {e}")
     return metadata_dict
 
 def get_asset_details(config_data, asset_id):
@@ -234,7 +236,8 @@ def get_asset_details(config_data, asset_id):
     headers = { 'x-api-key': config_data["api_key"] }
     response = requests.get(url, headers=headers)
     if response.status_code == 403:
-        return
+        logging.warning(f"403 Forbidden: cannot fetch asset details for {asset_id}")
+        return None
     elif response.status_code == 200:
         response = response.json()
         if len(response['result']) != 0:
@@ -251,7 +254,11 @@ def get_asset_details(config_data, asset_id):
                 data_dict['type'] = "file"
                 data_dict['size'] = response['result']['info']['file_size']
                 data_dict['asset_id'] = asset_id
-                data_dict['metadata'] = get_asset_metadata(config_data, asset_id)
+                try:
+                    data_dict['metadata'] = get_asset_metadata(config_data, asset_id)
+                except Exception as e:
+                    logging.warning(f"Skipping asset {asset_id} due to metadata fetch error: {e}")
+                    data_dict['metadata'] = {}
 
         return data_dict
     
@@ -268,31 +275,43 @@ def create_asset(config_data, project_id, folder_id, file_path):
     asset_list = get_assets_id_from_folder(config_data, folder_id)
     for asset in asset_list['result']['items']:
         asset_info = get_asset_details(config_data, asset['uuid'])
-        if not asset_info is None:
-            if asset_info['metadata']['fix_original_name'] == file_name and int(asset_info['metadata']['fix_original_file_size']) == int(file_size):
-                if remove_file(config_data, asset_info['asset_id']) == True:
-                    logging.info(f"Successfully Deleted file {file_path}")
-                else:
-                    logging.error(f"Error while deleting file {file_path}")
-                    exit(1)
-    
-    url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/assets"
+        if not asset_info:
+            continue
 
-    headers = {
-    'x-api-key': config_data["api_key"]
-    }
+        metadata = asset_info.get('metadata', {})
+        orig_name = metadata.get('fix_original_name')
+        orig_size = metadata.get('fix_original_file_size')
+
+        try:
+            if orig_name == file_name and int(orig_size) == file_size:
+                logging.info(f"Duplicate asset found: {file_name} ({file_size} bytes)")
+                if remove_file(config_data, asset_info['asset_id']):
+                    logging.info(f"Deleted existing asset for: {file_path}")
+                else:
+                    logging.error(f"Failed to delete asset: {file_path}")
+                    sys.exit(1)
+                break  # No need to check further
+        except (TypeError, ValueError):
+            logging.debug(f"Invalid original file size metadata on asset {asset['uuid']}: {orig_size}")
+            continue
+
+    url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/assets"
+    headers = {'x-api-key': config_data["api_key"]}
     payload = {
-        "project" : project_id,
-        "file_name" : extract_file_name(file_path),
-        "file_size" : os.path.getsize(file_path),
-        "folder" : folder_id
+        "project": project_id,
+        "file_name": file_name,
+        "file_size": file_size,
+        "folder": folder_id
     }
-    logging.debug(f"URL: {url}")
-    response = requests.post(url, headers=headers,data=payload)
-    logging.debug(f"response from API: {response.text}")
+
+    logging.debug(f"Creating new asset at: {url}")
+    response = requests.post(url, headers=headers, data=payload)
+    logging.debug(f"Response from asset creation: {response.text}")
+
     if response.status_code != 201:
-        logging.error("failed to create asset")       
-        logging.debug(f"Response error. Status - {response.status_code}, Error - {response.text}")
+        logging.error("Failed to create asset")
+        logging.debug(f"Status: {response.status_code} | Error: {response.text}")
+
     return response, response.status_code
 
 
