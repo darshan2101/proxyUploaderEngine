@@ -432,7 +432,6 @@ if __name__ == '__main__':
     token_manager = BoxTokenManager(
         client_id=cloud_config_data['client_id'],
         client_secret=cloud_config_data['client_secret'],
-        client_secret=cloud_config_data['client_secret'],
         config_path=cloud_config_path,
         config_section=cloud_config_name
     )
