@@ -135,7 +135,15 @@ def list_assets(config_data, token, workspace_id, parent_id, resource_type = 'Fo
             assets = [item for item in results if item.get("resourcetype") == resource_type]
         all_assets.extend(assets)
 
-        url = data.get("meta", {}).get("next")
+        meta = data.get("meta")
+        if meta and meta.get("next"):
+            next_url = meta.get("next")
+            if next_url.startswith("http://"):
+                logging.warning(f"Insecure pagination URL received: {next_url}, converting to HTTPS")
+                next_url = next_url.replace("http://", "https://")
+            url = next_url
+        else:
+            url = None
         params = None  # Only used on first call
     return all_assets
 
