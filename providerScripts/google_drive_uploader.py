@@ -8,16 +8,24 @@ import urllib.parse
 from configparser import ConfigParser
 import xml.etree.ElementTree as ET
 import plistlib
-from google.oauth2 import service_account
+# from google.oauth2 import service_account
+# from googleapiclient.discovery import build
+# from googleapiclient.http import MediaFileUpload
+# from google.oauth2.credentials import Credentials
+# from google.auth.transport.requests import Request
+# from googleapiclient.errors import HttpError
+# from google_auth_httplib2 import AuthorizedHttp
+# import httplib2
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
-from googleapiclient.errors import HttpError
 
 
 SCOPES = ['https://www.googleapis.com/auth/drive']
 VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet"]
+CHUNK_SIZE = 20 * 1024 * 1024
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
@@ -183,60 +191,181 @@ def ensure_path(token, path, base_id=None):
         logging.error(f"Error in ensure_path('{path}', base_id='{base_id}'): {e}", exc_info=True)
         raise
 
+# def get_drive_service(token):
+#     token_info = json.loads(token)
+#     creds = Credentials.from_authorized_user_info(token_info, SCOPES)
+
+#     if not creds.valid:
+#         if creds.expired and creds.refresh_token:
+#             creds.refresh(Request())
+#         else:
+#             print("Provided credentials are not valid and can't be refreshed.")
+#             exit(1)
+
+#     # Attach retry-capable HTTP
+#     authed_http = AuthorizedHttp(creds, http=httplib2.Http(timeout=300))
+
+#     # credentials and http are mutually exclusive — so use only http
+#     return build('drive', 'v3', http=authed_http)
+
 def get_drive_service(token):
-    creds = None
-    token_info = json.loads(token)
-    creds = Credentials.from_authorized_user_info(token_info, SCOPES)
-    if not creds.valid:
-        if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            print("Provided credentials are not valid and can't be refreshed.")
-            exit(1)
- 
-    return build('drive', 'v3', credentials=creds)
+    try:
+        token_info = json.loads(token)
+        creds = Credentials.from_authorized_user_info(token_info, SCOPES)
+        
+        if not creds.valid:
+            if creds.expired and creds.refresh_token:
+                logging.info("Refreshing expired credentials...")
+                creds.refresh(Request())
+            else:
+                raise ValueError("Provided credentials are invalid and cannot be refreshed.")
 
-def upload_file(token, file_path, folder_id, metadata=None, retries=3):
+        service = build('drive', 'v3', credentials=creds)
+        logging.debug("Google Drive service object created successfully.")
+        return service
+    except Exception as e:
+        logging.error(f"Failed to create Drive service: {e}")
+        raise 
+
+# def upload_file(token, file_path, folder_id, metadata=None, retries=3):
+#     service = get_drive_service(token)
+#     file_size = os.path.getsize(file_path)
+#     use_resumable = file_size > 5 * 1024 * 1024
+
+#     sanitized_metadata = None
+#     if metadata:
+#         sanitized_metadata = {str(k).replace(' ', '_'): str(v) for k, v in metadata.items()}
+
+#     file_metadata = {
+#         'name': os.path.basename(os.path.normpath(file_path)),
+#         'parents': [folder_id],
+#         'Source': sanitized_metadata['fabric_host'],
+#     }
+
+#     for attempt in range(1, retries + 1):
+#         try:
+#             media = MediaFileUpload(file_path, resumable=use_resumable)
+#             logging.info("Uploading '%s' (%d bytes) to folder %s [Attempt %d, Resumable=%s]",
+#                          file_path, file_size, folder_id, attempt, use_resumable)
+#             uploaded = service.files().create(body=file_metadata, media_body=media).execute()
+#             logging.info("Upload successful: %s", uploaded)
+#             print(f"File uploaded successfully: {uploaded}")
+#             return True
+#         except HttpError as e:
+#             logging.warning("HTTP error during upload (attempt %d): %s", attempt, e)
+#             if e.resp.status not in [500, 502, 503, 504, 410]:
+#                 logging.error("Non-retryable HTTP error", exc_info=True)
+#                 return str(e)
+#         except Exception as e:
+#             logging.error("Unexpected error during upload (attempt %d)", attempt, exc_info=True)
+#             return str(e)
+
+#         if attempt < retries:
+#             backoff = 2 ** attempt
+#             logging.info("Retrying upload in %d seconds...", backoff)
+#             time.sleep(backoff)
+
+#     logging.error("Upload failed after %d attempts: %s", retries, file_path)
+#     return f"Upload failed after {retries} attempts"
+
+def find_exact_existing_file(service, folder_id, file_name, file_size):
+    query = f"'{folder_id}' in parents and name='{file_name}' and trashed = false"
+    page_token = None
+
+    while True:
+        response = service.files().list(
+            q=query,
+            fields="nextPageToken, files(id, name, size)",
+            pageSize=1000,  # max allowed
+            pageToken=page_token
+        ).execute()
+        
+        files = response.get('files', [])
+        for f in files:
+            if str(f.get('size')) == str(file_size):
+                return f
+        
+        page_token = response.get('nextPageToken')
+        if not page_token:
+            break
+
+    return None
+
+def upload_file(token, file_path, folder_id, file_metadata=None, max_retries=3):
     service = get_drive_service(token)
+    if not os.path.exists(file_path):
+        logging.error(f"File not found: {file_path}")
+        return None
+
     file_size = os.path.getsize(file_path)
-    use_resumable = file_size > 5 * 1024 * 1024
-    media = MediaFileUpload(file_path, resumable=use_resumable)
+    file_name = os.path.basename(file_path)
 
-    sanitized_metadata = None
-    if metadata:
-        sanitized_metadata = {str(k).replace(' ', '_'): str(v) for k, v in metadata.items()}
-
-    file_metadata = {
-        'name': os.path.basename(os.path.normpath(file_path)),
-        'parents': [folder_id],
-        'Source': sanitized_metadata['fabric_host'],
-    }
-
-    for attempt in range(1, retries + 1):
+    # Step 1: Search for and delete existing file if present
+    existing_file = find_exact_existing_file(service, folder_id, file_name, file_size)
+    if existing_file:
         try:
-            logging.info("Uploading '%s' (%d bytes) to folder %s [Attempt %d, Resumable=%s]",
-                         file_path, file_size, folder_id, attempt, use_resumable)
-            uploaded = service.files().create(body=file_metadata, media_body=media).execute()
-            logging.info("Upload successful: %s", uploaded)
-            print(f"File uploaded successfully: {uploaded}")
-            return True
-        except HttpError as e:
-            logging.warning("HTTP error during upload (attempt %d): %s", attempt, e)
-            if e.resp.status not in [500, 502, 503, 504, 410]:
-                logging.error("Non-retryable HTTP error", exc_info=True)
-                return str(e)
+            service.files().delete(fileId=existing_file['id']).execute()
+            logging.info(f"Deleted existing file: {existing_file['name']} (ID: {existing_file['id']})")
         except Exception as e:
-            logging.error("Unexpected error during upload (attempt %d)", attempt, exc_info=True)
-            return str(e)
+            logging.error(f"Failed to delete existing file {existing_file['id']}: {e}")
+            return None
 
-        if attempt < retries:
-            backoff = 2 ** attempt
-            logging.info("Retrying upload in %d seconds...", backoff)
-            time.sleep(backoff)
+    # Step 2: Setup file metadata and begin upload
+    file_metadata = file_metadata or {}
+    file_metadata.setdefault('name', file_name)
+    file_metadata.setdefault('parents', [folder_id])
 
-    logging.error("Upload failed after %d attempts: %s", retries, file_path)
-    return f"Upload failed after {retries} attempts"
+    media = MediaFileUpload(
+        file_path,
+        resumable=True
+    )
 
+    request = service.files().create(body=file_metadata, media_body=media)
+    response = None
+    attempt = 0
+    progress_bytes = 0
+
+    while response is None:
+        try:
+            status, response = request.next_chunk()
+            if status:
+                progress_bytes = status.resumable_progress
+                progress_percent = int((progress_bytes / file_size) * 100)
+                print(f"Upload Progress: {progress_percent}% ({progress_bytes}/{file_size} bytes)")
+                logging.info(f"Upload Progress: {progress_percent}%")
+                attempt = 0  # reset on progress
+        except HttpError as error:
+            if error.resp.status in [500, 502, 503, 504, 408, 429]:
+                attempt += 1
+                if attempt > max_retries:
+                    logging.error(f"Max retries exceeded for transient error {error.resp.status}")
+                    break
+                wait_time = 2 ** attempt
+                logging.warning(f"Transient error {error.resp.status}. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            elif error.resp.status == 401:
+                logging.error(f"Authentication error (401): {error}")
+                raise
+            else:
+                logging.error(f"Upload failed with HTTP error {error.resp.status}: {error}")
+                break
+        except Exception as e:
+            attempt += 1
+            if attempt > max_retries:
+                logging.error(f"Max retries exceeded for unexpected error: {e}")
+                break
+            wait_time = 2 ** attempt
+            logging.error(f"Unexpected error: {e}. Retrying in {wait_time}s...")
+            time.sleep(wait_time)
+
+    if response:
+        logging.info(f"Upload successful! File ID: {response.get('id')}")
+        print(f"Upload successful! File ID: {response.get('id')}")
+        return response
+    else:
+        logging.error(f"Upload failed for file '{file_path}'")
+        print(f"Upload failed for file '{file_path}'")
+        return None
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -379,7 +508,7 @@ if __name__ == '__main__':
     logging.info(f"Upload location ID: {folder_id}")
     
     response = upload_file(cloud_config_data["token"], args.source_path, folder_id, parsed)
-    if response == True:
+    if response:
         print("File uploaded successfully")
         sys.exit(0)
     else:
