@@ -204,7 +204,14 @@ def remove_existing_file_if_present(config_data, token, filename, filesize, pare
 def initiate_upload(file_path, config_data, token, parent_id=None):
     url = f"{config_data['base_url']}/api/v1/upload/initiate_upload/"
     workspace_id = config_data['workspace_id']
-    file_name = os.path.basename(file_path)
+    original_file_name = os.path.basename(file_path)
+    name_part, ext_part = os.path.splitext(original_file_name)
+    sanitized_name_part = name_part.lstrip()
+    sanitized_name_part = sanitized_name_part.rstrip()
+    file_name = sanitized_name_part + ext_part
+    
+    if file_name != original_file_name:
+        logging.info(f"Filename sanitized from '{original_file_name}' to '{file_name}'")
     file_size = os.path.getsize(file_path)
     
     # check if file is already uploaded at parent_id
