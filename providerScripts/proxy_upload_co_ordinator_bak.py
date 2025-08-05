@@ -402,6 +402,9 @@ def read_csv_records(csv_path, logging_path, extensions = [], file_size_limit = 
     records = []
     size_limit_bytes = float(file_size_limit) * 1024 * 1024 if file_size_limit else None
 
+    # Normalizing extensions list for comparison if provided
+    normalized_exts = [ext.lower().lstrip('.') for ext in extensions] if extensions else None
+
     with open(csv_path, 'r') as f:
         reader = csv.reader(f, delimiter='|')
         for row in reader:
@@ -422,12 +425,12 @@ def read_csv_records(csv_path, logging_path, extensions = [], file_size_limit = 
                     debug_print(logging_path, f"[ERROR] Could not stat file {base_source_path}: {e}")
                     continue
 
-                # Check extension
-                if extensions:
+                # Only check extension if extensions list is not empty
+                if normalized_exts is not None:
                     file_ext = os.path.splitext(base_source_path)[-1].lower().lstrip('.')
                     debug_print(logging_path, f"[EXTENSION CHECK] File: {base_source_path}, Extracted: '{file_ext}', Allowed: {extensions}")
 
-                    if file_ext not in [ext.lower().lstrip('.') for ext in extensions]:
+                    if file_ext not in normalized_exts:
                         debug_print(logging_path, f"[SKIP] Extension '{file_ext}' not in allowed list {extensions}")
                         continue
 
@@ -627,7 +630,11 @@ def process_csv_and_upload(config, dry_run=False):
     setup_log_and_progress_paths(config)
     transferred_log, issues_log, client_log = prepare_log_files(config)
 
-    exts = config["extensions"] if config.get("mode") in ("original", "proxy") and config.get("extensions") else []
+    # Determine extensions to use for filtering
+    if config.get("mode") in ("original", "proxy"):
+        exts = config.get("extensions", [])
+    else:
+        exts = []
     file_size_limit = config.get("original_file_size_limit") if config.get("mode") == "original" and config.get("original_file_size_limit") else None
     progressDetails["status"] = "Reading Files"
     send_progress(progressDetails, config["repo_guid"])
@@ -724,7 +731,6 @@ if __name__ == '__main__':
     # Conditionally require proxy_directory and original_file_size_limit
     if mode == "proxy":
         required_keys.append("proxy_directory")
-        required_keys.append("extensions")
     
     if "generate" in mode:
         required_keys.append("proxy_output_base_path")
