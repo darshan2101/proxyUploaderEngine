@@ -6,8 +6,6 @@ import logging
 import plistlib
 import urllib.parse
 from configparser import ConfigParser
-from twelvelabs import TwelveLabs
-from twelvelabs.models.task import Task
 
 # Constants
 VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet"]
@@ -41,25 +39,18 @@ def get_cloud_config_path():
     logging.info(f"Using cloud config path: {path}")
     return path
 
-# Utility function to print the status of a video indexing task
-def on_task_update(task: Task):
-    logger.debug(f"  Status={task.status}")
-
-def upload_asset(client, index_id, file_path):
+def upload_asset(index_id, file_path):
     try:
-        task = client.task.create(
-            index_id=index_id,
-            file=file_path
-        )
-        logger.debug(f"Task id={task.id}")
-
-        task.wait_for_done(sleep_interval=5, callback=on_task_update)
-        if task.status != "ready":
-            raise RuntimeError(f"Indexing failed with status {task.status}")
-
-        logger.info("Asset upload succeeded")
-        logger.debug(f"Video ID: {task.video_id}")
-        return task
+        url = "https://api.twelvelabs.io/v1.3/tasks"
+        files = { "video_file": open(file_path, 'rb') }
+        payload = {
+            "index_id": index_id
+        }
+        headers = {"x-api-key": "tlk_3DBGW0Z2KKPKQT25KN7G82KRD39B"}
+        response = requests.post(url, data=payload, files=files, headers=headers)
+        logging.debug(f"Response ---------------: {response.text}")
+        return response.json()
+    
     except Exception as e:
         raise RuntimeError(f"Asset upload failed: {e}")
 
@@ -69,15 +60,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--mode", required=True, help="mode of Operation proxy or original upload")
     parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
-    parser.add_argument("-j", "--job-guid", help="Job Guid of SDNA job")
-    parser.add_argument("-cp", "--catalog-path", required=True, help="Path where catalog resides")
     parser.add_argument("-sp", "--source-path", required=True, help="Source path of file to look for original upload")
-    parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
     parser.add_argument("-up", "--upload-path", required=True, help="Path where file will be uploaded to frameIO")
     parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")
-    parser.add_argument("--controller-address",help="Link IP/Hostname Port")
+    parser.add_argument("--resolved-upload-id", action="store_true", help="Pass if upload path is already resolved ID")
     args = parser.parse_args()
 
     setup_logging(args.log_level)
@@ -101,7 +89,7 @@ if __name__ == '__main__':
 
     cloud_config_data = cloud_config[cloud_config_name]
 
-    index_id = cloud_config_data['index_id']
+    index_id = args.upload_path if args.resolved_upload_id else cloud_config_data.get('index_id', '')
     print(f"Index Id ----------------------->{index_id}")
 
     logging.info(f"Starting Twelve labs upload process in {mode} mode")
@@ -109,7 +97,6 @@ if __name__ == '__main__':
     logging.debug(f"Source path: {args.source_path}")
     
     logging.info(f"Initializing Twelve labs client")
-    client = TwelveLabs(api_key=cloud_config_data['api_key'])
     
     matched_file = args.source_path
 
@@ -138,8 +125,8 @@ if __name__ == '__main__':
     logging.info(f"Starting upload process to Twelve labs")
 
     try:
-        asset = upload_asset(client, index_id, args.source_path)
-        logging.info(f"Asset uploaded to twelve labs. Asset ID: --> {asset.video_id}")
+        asset = upload_asset(index_id, args.source_path)
+        logging.info(f"Asset uploaded to twelve labs. Asset ID: --> {asset['video_id']}")
         sys.exit(0)
     except Exception as e:
         print(str(e))
