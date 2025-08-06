@@ -39,14 +39,14 @@ def get_cloud_config_path():
     logging.info(f"Using cloud config path: {path}")
     return path
 
-def upload_asset(index_id, file_path):
+def upload_asset(api_key, index_id, file_path):
     try:
         url = "https://api.twelvelabs.io/v1.3/tasks"
         files = { "video_file": open(file_path, 'rb') }
         payload = {
             "index_id": index_id
         }
-        headers = {"x-api-key": "tlk_3DBGW0Z2KKPKQT25KN7G82KRD39B"}
+        headers = {"x-api-key": api_key}
         response = requests.post(url, data=payload, files=files, headers=headers)
         logging.debug(f"Response ---------------: {response.text}")
         return response.json()
@@ -123,9 +123,9 @@ if __name__ == '__main__':
         sys.exit(0)
 
     logging.info(f"Starting upload process to Twelve labs")
-
+    api_key = cloud_config_data.get("api_key")
     try:
-        asset = upload_asset(index_id, args.source_path)
+        asset = upload_asset(api_key, index_id, args.source_path)
         logging.info(f"Asset uploaded to twelve labs. Asset ID: --> {asset['video_id']}")
         sys.exit(0)
     except Exception as e:
