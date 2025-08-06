@@ -1,277 +1,289 @@
-# provider_trint.py
+# provider_trint.py -working
 import argparse
 import sys
 import os
 import json
 import time
-import logging
-import magic # Ensure python-magic is installed
-from configparser import ConfigParser
-from datetime import datetime
-from urllib.parse import urlencode
 import requests
 from requests.auth import HTTPBasicAuth
-import plistlib
+from datetime import datetime
+from urllib.parse import urlencode
+from action_functions import (
+    loadConfigurationMap,
+    get_catalog_path,
+    check_if_catalog_file_exists,
+    add_CDATA_tags_with_id_for_folder,
+    generate_xml_from_file_objects,
+    send_progress,
+    debug_print
+)
 
-# --- Configuration & Platform Detection ---
-IS_LINUX = os.path.isdir("/opt/sdna/bin/")
-IS_WINDOWS = os.name == 'nt'
-
-DNA_CLIENT_SERVICES_LINUX = '/etc/StorageDNA/DNAClientServices.conf'
-DNA_CLIENT_SERVICES_MAC = '/Library/Preferences/com.storagedna.DNAClientServices.plist'
-DNA_CLIENT_SERVICES_WINDOWS = r'D:\etc\StorageDNA\DNAClientServices.conf'
-
-SERVERS_CONF_LINUX = '/etc/StorageDNA/Servers.conf'
-SERVERS_CONF_MAC = '/Library/Preferences/com.storagedna.Servers.plist'
-
+# --- Constants ---
 DEBUG_FILEPATH = '/tmp/trint_debug.out'
 DEBUG_PRINT = False
 DEBUG_TO_FILE = False
 
-def debug_print(filepath, to_stdout, to_file, message):
-    """Unified debug print function"""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_msg = f"[{timestamp}] {message}"
-    if to_stdout:
-        print(log_msg)
-    if to_file:
-        try:
-            with open(filepath, 'a') as f:
-                f.write(log_msg + '\n')
-        except Exception as e:
-            print(f"Failed to write to debug file: {e}")
+DEFAULT_BASE_URL = 'https://api.trint.com'
+DEFAULT_UPLOAD_URL = 'https://upload.trint.com'
 
-def get_dna_client_services_path():
-    if IS_LINUX:
-        return DNA_CLIENT_SERVICES_LINUX
-    elif IS_WINDOWS:
-        return DNA_CLIENT_SERVICES_WINDOWS
-    else:
-        return DNA_CLIENT_SERVICES_MAC
+# Global config map
+config_map = None
+api_key_id = None
+api_key_secret = None
+base_url = None
+upload_url = None
+auth = None
+workspace_id = None  # Optional: from config
 
-def get_servers_conf_path():
-    return SERVERS_CONF_LINUX if IS_LINUX else SERVERS_CONF_MAC
+# --- Initialization ---
+def init_config(args):
+    global config_map, api_key_id, api_key_secret, base_url, upload_url, auth, workspace_id
+    config_map = loadConfigurationMap(args.config)
+    if not config_map:
+        debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, "Failed to load configuration.")
+        print("Failed to load configuration.")
+        sys.exit(1)
 
-def get_cloud_config_path():
+    api_key_id = config_map.get('api_key_id')
+    api_key_secret = config_map.get('api_key_secret')
+    base_url = config_map.get('base_url', DEFAULT_BASE_URL)
+    upload_url = config_map.get('upload_url', DEFAULT_UPLOAD_URL)
+    workspace_id = config_map.get('workspace_id')  # Optional
+
+    if not api_key_id or not api_key_secret:
+        debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, "Missing API Key or Secret in config.")
+        print("Missing API Key or Secret.")
+        sys.exit(1)
+
+    auth = HTTPBasicAuth(api_key_id, api_key_secret)
+
+# --- Helper: Make API Request ---
+def api_request(method, url, **kwargs):
     try:
-        client_config_path = get_dna_client_services_path()
-        debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, f"Reading client config: {client_config_path}")
-
-        if IS_LINUX or IS_WINDOWS:
-            config = ConfigParser()
-            config.read(client_config_path)
-            if config.has_option('General', 'cloudconfigfolder'):
-                config_path = os.path.join(config.get('General', 'cloudconfigfolder'), "cloud_targets.conf")
-            else:
-                raise KeyError("cloudconfigfolder not found in General section")
-        else:
-            with open(client_config_path, 'rb') as fp:
-                plist_data = plistlib.load(fp)
-                config_path = os.path.join(plist_data["CloudConfigFolder"], "cloud_targets.conf")
-
-        debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, f"Using cloud config: {config_path}")
-        return config_path
-    except Exception as e:
-        fallback = r'D:\Dev\(python +node) Wrappers\proxyUploaderEngine\CloudConfig\cloud_targets.conf'
+        response = requests.request(method, url, auth=auth, **kwargs)
         debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE,
-                    f"Config path not found, using fallback: {fallback}\nException: {e}")
-        return fallback
-
-def get_link_address_and_port():
-    path = get_servers_conf_path()
-    ip, port = "", ""
-    try:
-        if IS_LINUX:
-            config = ConfigParser()
-            config.read(path)
-            ip = config.get('General', 'link_address', fallback='')
-            port = config.get('General', 'link_port', fallback='')
-        else:
-            with open(path, 'rb') as fp:
-                plist_data = plistlib.load(fp)
-                ip = plist_data.get('link_address', '')
-                port = str(plist_data.get('link_port', ''))
+                    f"API {method} {url} -> {response.status_code}")
+        if response.status_code >= 400:
+            debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE,
+                        f"Error: {response.status_code} - {response.text}")
+        return response
     except Exception as e:
-        debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, f"Error reading Servers.conf: {e}")
-        sys.exit(5)
-    return ip, port
-
-# --- Trint API Client ---
-class TrintProvider:
-    def __init__(self, config_map, config_name):
-        self.api_key_id = config_map['api_key_id']
-        self.api_key_secret = config_map['api_key_secret']
-        self.base_url = config_map.get('base_url', 'https://api.trint.com')
-        self.upload_url = config_map.get('upload_url', 'https://upload.trint.com')
-        self.config_name = config_name
-        self.auth = HTTPBasicAuth(self.api_key_id, self.api_key_secret)
-        self.session = requests.Session()
-        self.session.auth = self.auth
-        self.current_user = None
-
-    def _request(self, method, url, **kwargs):
-        try:
-            response = self.session.request(method, url, **kwargs)
-            debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE,
-                        f"API {method} {url} -> {response.status_code}")
-            if response.status_code >= 400:
-                debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE,
-                            f"Error response: {response.text}")
-            return response
-        except Exception as e:
-            debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, f"Request failed: {e}")
-            return None
-
-    def list_workspaces(self):
-        """List all Shared Drives (Workspaces)"""
-        url = f"{self.base_url}/workspaces/"
-        response = self._request("GET", url, headers={"accept": "application/json"})
-        if response and response.status_code == 200:
-            return response.json().get("data", [])
-        return []
-
-    def list_folders(self, workspace_id=None):
-        """List folders in a workspace or root"""
-        url = f"{self.base_url}/folders/"
-        params = {}
-        if workspace_id:
-            params["workspaceId"] = workspace_id
-        response = self._request("GET", url, headers={"accept": "application/json"}, params=params)
-        if response and response.status_code == 200:
-            return response.json().get("data", [])
-        return []
-
-    def list_files(self, folder_id=None, workspace_id=None):
-        """List files (transcripts) in a folder or workspace"""
-        url = f"{self.base_url}/transcripts/"
-        params = {}
-        if folder_id:
-            params["folderId"] = folder_id
-        if workspace_id:
-            params["sharedDriveId"] = workspace_id  # or workspaceId for backward compat
-        response = self._request("GET", url, headers={"accept": "application/json"}, params=params)
-        if response and response.status_code == 200:
-            return response.json().get("data", [])
-        return []
-
-    def create_folder(self, folder_name, parent_id=None, workspace_id=None):
-        """Create a folder"""
-        url = f"{self.base_url}/folders/"
-        payload = {"name": folder_name}
-        if parent_id:
-            payload["parentId"] = parent_id
-        if workspace_id:
-            payload["workspaceId"] = workspace_id
-        headers = {
-            "accept": "application/json",
-            "content-type": "application/json"
-        }
-        response = self._request("POST", url, headers=headers, json=payload)
-        if response and response.status_code in [200, 201]:
-            folder_data = response.json()
-            debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE,
-                        f"Folder '{folder_name}' created with ID: {folder_data['_id']}")
-            return folder_data
+        debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, f"Request failed: {e}")
         return None
 
-    def upload_file(self, file_path, folder_id=None, workspace_id=None, language="en", backlink_url=None):
-        """Upload a file to Trint"""
-        file_name = os.path.basename(file_path)
-        mime_type = self._detect_mime(file_path)
-        if not mime_type:
-            debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, f"Cannot detect MIME type for {file_name}")
-            return None
+# --- Mode: actions ---
+def handle_actions():
+    print("list,browse,upload,createfolder,buckets,bucketsfolders")
+    sys.exit(0)
 
-        data = {
-            "filename": file_name,
-            "language": language
-        }
-        if backlink_url:
-            data["metadata"] = backlink_url
-        if folder_id:
-            data["folder-id"] = folder_id
-        if workspace_id:
-            data["workspace-id"] = workspace_id
+# --- Mode: auth ---
+def handle_auth():
+    print("Trint uses API Key/Secret. No interactive auth needed. Ensure keys are in cloud_targets.conf.")
+    sys.exit(0)
 
-        with open(file_path, 'rb') as f:
-            files = {'file': (file_name, f, mime_type)}
-            response = self._request("POST", self.upload_url, data=data, files=files)
+# --- Mode: buckets (list top-level folders in workspace OR personal root) ---
+def handle_buckets(args):
+    """
+    If workspace_id is set → list folders in that workspace (root level only).
+    If not → list folders in user's personal workspace.
+    """
+    url = f"{base_url}/folders/"
+    params = {}
+    if workspace_id:
+        params["workspace-id"] = workspace_id  # Scope to workspace
 
-        if response and response.status_code == 200:
-            result = response.json()
-            debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE,
-                        f"Upload successful: {result.get('trintId')}")
-            return result
-        else:
-            error_msg = response.text if response else "No response"
-            debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, f"Upload failed: {error_msg}")
-            return None
+    response = api_request("GET", url, headers={"accept": "application/json"}, params=params)
+    if response and response.status_code == 200:
+        folders = response.json()
+        # Only root-level folders (no parent)
+        root_folders = [f for f in folders if f.get("parent") is None]
+        buckets = [f"{f['_id']}:{f['name']}" for f in root_folders]
+        print(','.join(buckets))
+    else:
+        print("")
+    sys.exit(0)
 
-    def _detect_mime(self, file_path):
-        try:
-            return magic.from_file(file_path, mime=True)
-        except ImportError:
-            debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, "python-magic not available, using fallback")
-            # Basic fallback
-            if file_path.lower().endswith(('.mp3', '.wav', '.m4a')):
-                return 'audio/mpeg'
-            elif file_path.lower().endswith(('.mp4', '.mov', '.avi')):
-                return 'video/mp4'
-            else:
-                return 'application/octet-stream'
+# --- Mode: bucketsfolders (XML list of top-level folders in workspace) ---
+def handle_bucketsfolders(args):
+    url = f"{base_url}/folders/"
+    params = {}
+    if workspace_id:
+        params["workspace-id"] = workspace_id
 
-# --- Helper Functions ---
-def loadConfigurationMap(config_name):
-    config_path = get_cloud_config_path()
-    if not os.path.exists(config_path):
-        debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, f"Config file not found: {config_path}")
-        return None
-    config = ConfigParser()
-    config.read(config_path)
-    if config_name not in config:
-        debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, f"Config section '{config_name}' not found")
-        return None
-    return dict(config[config_name])
+    response = api_request("GET", url, headers={"accept": "application/json"}, params=params)
+    if response and response.status_code == 200:
+        folders = response.json()
+        root_folders = [{"name": f["name"], "id": f["_id"]} for f in folders if f.get("parent") is None]
+        xml_output = add_CDATA_tags_with_id_for_folder(root_folders)
+        print(xml_output)
+    else:
+        print('<?xml version="1.0" encoding="UTF-8"?><folders></folders>')
+    sys.exit(0)
 
-def replace_file_path(path):
-    """Sanitize path separators"""
-    return path.replace("\\", "/")
+# --- Mode: browse (list immediate children of a folder) ---
+def handle_browse(args):
+    parent_id = args.folder_id
 
-def get_catalog_path(params):
-    """Mock catalog path (as in Box provider)"""
-    return f"{params.get('project_name', 'default')}/{params.get('label', 'default')}"
+    if parent_id is None:
+        print('Asset ID(-id <asset_id>) option required for browse.')
+        exit(1)
 
-def check_if_catalog_file_exists(catalog_path, file_name, mtime):
-    """Placeholder for dedup logic"""
-    return False
+    params = {}
+    if workspace_id:
+        params["workspace-id"] = workspace_id
 
-def generate_xml_from_file_objects(obj_dict, target_path):
-    """Generate XML output (simplified)"""
+    url = f"{base_url}/folders/"
+    response = api_request("GET", url, headers={"accept": "application/json"}, params=params)
+    if response and response.status_code == 200:
+        folders = response.json()
+        children = [f for f in folders if f.get("parent") == parent_id]
+        children = [{"name": f["name"], "id": f["_id"]} for f in children]
+        xml_output = add_CDATA_tags_with_id_for_folder(children)
+        print(xml_output)
+    else:
+        print('<?xml version="1.0" encoding="UTF-8"?><folders></folders>')
+    sys.exit(0)
+
+# --- Mode: list (list transcripts in folder or workspace) ---
+def handle_list(args):
+    if not args.target or not args.indexid:
+        print("Target path (-t) and Index ID (-in) required for list mode.")
+        sys.exit(1)
+
+    folder_id = args.folder_id
+
+    params = {}
+    if folder_id:
+        params["folderId"] = folder_id
+    if workspace_id:
+        params["sharedDriveId"] = workspace_id  # Trint supports both sharedDriveId and workspaceId
+
+    url = f"{base_url}/transcripts/"
+    response = api_request("GET", url, headers={"accept": "application/json"}, params=params)
+    files_list = []
+    if response and response.status_code == 200:
+        files_list = response.json()
+
+    params_map = {
+        "indexid": args.indexid,
+        "project_name": args.projectname or "default",
+        "label": args.label or "",
+        "source": args.source or ""
+    }
+    catalog_path = get_catalog_path(params_map)
+
+    objects_dict = GetObjectDict(files_list, params_map, catalog_path)
+
+    progressDetails = {
+        "duration": int(time.time()),
+        "run_id": args.runid,
+        "job_id": args.jobid,
+        "progress_path": args.progress_path,
+        "totalFiles": objects_dict["scanned_count"],
+        "totalSize": objects_dict["total_size"],
+        "processedFiles": objects_dict["selected_count"],
+        "processedBytes": 0,
+        "status": "COMPLETED"
+    }
+    send_progress(progressDetails, progressDetails["processedFiles"])
+
+    print(f"{objects_dict['scanned_count']}:{objects_dict['total_size']}:{objects_dict['selected_count']}:0")
+
+    if generate_xml_from_file_objects(objects_dict, args.target):
+        debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, f"Generated XML: {args.target}")
+    else:
+        debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, "Failed to generate XML.")
+        print("Failed to generate XML.")
+        sys.exit(1)
+    sys.exit(0)
+
+# --- Mode: createfolder ---
+def handle_createfolder(args):
+    if not args.foldername:
+        print("Folder name (-f) required.")
+        sys.exit(1)
+
+    folder_name = args.foldername
+    parent_id = args.folder_id
+
+    url = f"{base_url}/folders/"
+    payload = {"name": folder_name}
+    if parent_id:
+        payload["parentId"] = parent_id
+    # Only include workspaceId if creating at root (i.e., no parent)
+    if not parent_id and workspace_id:
+        payload["workspaceId"] = workspace_id
+
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json"
+    }
+
+    response = api_request("POST", url, headers=headers, json=payload)
+    if response and response.status_code in [200, 201]:
+        folder_data = response.json()
+        debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE,
+                    f"Folder '{folder_name}' created with ID: {folder_data['_id']}")
+        print(folder_data["_id"])
+        sys.exit(0)
+    else:
+        print("Failed to create folder.")
+        sys.exit(1)
+
+# --- Mode: upload ---
+def handle_upload(args):
+    if not args.source or not args.folder_id:
+        print("Source file (-s) and Folder ID (-id) required for upload.")
+        sys.exit(1)
+
+    file_path = args.source
+    if not os.path.exists(file_path):
+        print(f"File not found: {file_path}")
+        sys.exit(1)
+
+    folder_id = args.folder_id
+    language = args.language or "en"
+    file_name = os.path.basename(file_path)
+
+    # Detect MIME type
     try:
-        with open(target_path, 'w') as f:
-            f.write('<?xml version="1.0" encoding="UTF-8"?>\n<objects>\n')
-            for obj in obj_dict.get("filelist", []):
-                f.write(f'  <object name="{obj["name"]}" size="{obj["size"]}" />\n')
-            f.write('</objects>\n')
-        return True
-    except Exception as e:
-        debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, f"XML generation failed: {e}")
-        return False
+        import magic
+        mime_type = magic.from_file(file_path, mime=True)
+    except ImportError:
+        mime_type = 'application/octet-stream'
 
-def add_CDATA_tags_with_id_for_folder(folders):
-    """Generate XML output for folder browse"""
-    xml = '<?xml version="1.0" encoding="UTF-8"?><folders>'
-    for folder in folders:
-        name = folder["name"].replace("&", "&amp;").replace("<", "<").replace(">", ">")
-        xml += f'<folder id="{folder["id"]}"><![CDATA[{name}]]></folder>'
-    xml += '</folders>'
-    return xml
+    # Prepare upload
+    data = {
+        "filename": file_name,
+        "language": language,
+        "folder-id": folder_id
+    }
+    if workspace_id:
+        data["workspace-id"] = workspace_id  # Scope upload to workspace
 
+    with open(file_path, 'rb') as f:
+        files = {'file': (file_name, f, mime_type)}
+        response = api_request("POST", upload_url, data=data, files=files)
+
+    if response and response.status_code == 200:
+        result = response.json()
+        debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE,
+                    f"Upload successful: {result.get('trintId')}")
+        print(f"File Upload successful: {result.get('trintId')}")
+        sys.exit(0)
+    else:
+        error_msg = response.text if response else "No response"
+        debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, f"Upload failed: {error_msg}")
+        print("Upload failed.")
+        sys.exit(1)
+
+# --- GetObjectDict ---
 def GetObjectDict(files_list, params, catalog_path):
     scanned_files = 0
     selected_count = 0
     total_size = 0
     file_object_list = []
+
     for file_data in files_list:
         try:
             file_name = file_data.get("filename", "Unknown")
@@ -283,12 +295,14 @@ def GetObjectDict(files_list, params, catalog_path):
                 try:
                     dt = datetime.fromisoformat(mtime_str.replace("Z", "+00:00"))
                     mtime_epoch = int(dt.timestamp())
-                except Exception:
-                    pass
+                except Exception as e:
+                    debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, f"Time parse error: {e}")
+
             if check_if_catalog_file_exists(catalog_path, file_name, mtime_epoch):
                 continue
+
             file_object = {
-                "name": replace_file_path(file_name),
+                "name": file_name,
                 "size": str(file_size),
                 "mode": "0",
                 "tmpid": file_id,
@@ -306,6 +320,7 @@ def GetObjectDict(files_list, params, catalog_path):
         except Exception as e:
             debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, f"Error processing file: {e}")
             continue
+
     return {
         "filelist": file_object_list,
         "scanned_count": scanned_files,
@@ -313,7 +328,78 @@ def GetObjectDict(files_list, params, catalog_path):
         "total_size": total_size
     }
 
-# --- Main CLI Handler ---
+# --- get_folder_id: Resolve or create nested path ---
+def get_folder_id(config_data, upload_path, base_id=None):
+    """
+    Resolves or creates the folder hierarchy based on upload_path.
+    Starts from workspace root if no base_id.
+    Uses parent-child relationships to avoid name collisions.
+    """
+    if not upload_path.strip("/"):
+        return base_id  # Return base or None
+
+    folder_parts = [part for part in upload_path.strip("/").split("/") if part]
+    all_folders = list_all_folders(config_data)
+    folder_by_id = {f["_id"]: f for f in all_folders}
+    parent_map = {f["_id"]: f.get("parent") for f in all_folders}
+
+    current_parent_id = base_id  # Can be None → means workspace root
+
+    for folder_name in folder_parts:
+        found_id = None
+
+        # Search for folder with matching name and parent
+        for f in all_folders:
+            if f["name"] == folder_name:
+                parent_id = f.get("parent")
+                if current_parent_id is None:
+                    if parent_id is None:  # Root folder
+                        found_id = f["_id"]
+                        break
+                else:
+                    if parent_id == current_parent_id:
+                        found_id = f["_id"]
+                        break
+
+        if found_id is None:
+            # Create folder
+            payload = {"name": folder_name}
+            if current_parent_id:
+                payload["parentId"] = current_parent_id
+            elif config_data.get("workspace_id"):
+                payload["workspaceId"] = config_data["workspace_id"]
+
+            url = f"{config_data['base_url']}/folders/"
+            headers = {"accept": "application/json", "content-type": "application/json"}
+            auth = HTTPBasicAuth(config_data['api_key_id'], config_data['api_key_secret'])
+            response = requests.post(url, json=payload, headers=headers, auth=auth)
+
+            if response.status_code not in [200, 201]:
+                raise Exception(f"Create folder failed: {response.text}")
+            new_folder = response.json()
+            found_id = new_folder["_id"]
+            all_folders.append(new_folder)
+            folder_by_id[found_id] = new_folder
+            if current_parent_id:
+                parent_map[found_id] = current_parent_id
+
+        current_parent_id = found_id
+
+    return current_parent_id
+
+# --- list_all_folders helper ---
+def list_all_folders(config_data):
+    """Fetch all folders, optionally scoped to workspace."""
+    url = f"{config_data['base_url']}/folders/"
+    params = {}
+    if config_data.get("workspace_id"):
+        params["workspace-id"] = config_data["workspace_id"]
+    response = api_request("GET", url, headers={"accept": "application/json"}, params=params)
+    if response and response.status_code == 200:
+        return response.json().get("data", [])
+    return []
+
+# --- Main ---
 def main():
     parser = argparse.ArgumentParser(description="Trint Provider CLI")
     parser.add_argument('-c', '--config', required=True, help='Configuration name (e.g., trint-prod)')
@@ -321,7 +407,7 @@ def main():
     parser.add_argument('-s', '--source', help='Source file path (for upload)')
     parser.add_argument('-t', '--target', help='Target path (for list output XML)')
     parser.add_argument('-f', '--foldername', help='Folder name to create')
-    parser.add_argument('-tid', '--tempid', help='File ID (unused in Trint)')
+    parser.add_argument('-tid', '--tempid', help='File ID (unused)')
     parser.add_argument('-id', '--folder_id', help='Folder ID (for list, upload, browse)')
     parser.add_argument('-in', '--indexid', help='Index ID (for list)')
     parser.add_argument('-jg', '--jobguid', help='Job GUID')
@@ -331,135 +417,31 @@ def main():
     parser.add_argument('-l', '--label', help='Label')
     parser.add_argument('--progress_path', help='Progress path')
     parser.add_argument('-o', '--overwrite', action='store_true', help='Overwrite (placeholder)')
-    parser.add_argument('--workspace_id', help='Optional workspace ID (Shared Drive)')
     parser.add_argument('--language', default='en', help='Transcription language code (default: en)')
-    parser.add_argument('--controller-address', help='Link IP:Port override')
-
     args = parser.parse_args()
+
+    # Initialize config
+    init_config(args)
+
+    # --- Dispatch Mode ---
     mode = args.mode.lower()
-    file_path = args.source
-    folder_name = args.foldername
-    target_path = args.target
-    folder_id = args.folder_id
-    workspace_id = args.workspace_id
-    job_guid = args.jobguid
 
-    # Load config
-    config_map = loadConfigurationMap(args.config)
-    if not config_map:
-        print("Failed to load configuration")
-        sys.exit(1)
-
-    # Initialize provider
-    trint = TrintProvider(config_map, args.config)
-
-    progressDetails = {
-        "duration": int(time.time()),
-        "run_id": args.runid,
-        "job_id": args.jobid,
-        "progress_path": args.progress_path,
-        "totalFiles": 0,
-        "totalSize": 0,
-        "processedFiles": 0,
-        "processedBytes": 0,
-        "status": "SCANNING"
-    }
-
-    # --- Mode Handling ---
     if mode == 'actions':
-        print("list,browse,upload,createfolder,buckets,bucketsfolders")
-        sys.exit(0)
-
+        handle_actions()
+    elif mode == 'auth':
+        handle_auth()
     elif mode == 'buckets':
-        # List top-level workspaces (Shared Drives)
-        workspaces = trint.list_workspaces()
-        buckets = [f"{w['_id']}:{w['name']}" for w in workspaces]
-        print(','.join(buckets))
-        sys.exit(0)
-
+        handle_buckets(args)
     elif mode == 'bucketsfolders':
-        # List workspaces in XML
-        workspaces = trint.list_workspaces()
-        folders = [{"name": w["name"], "id": w["_id"]} for w in workspaces]
-        xml_output = add_CDATA_tags_with_id_for_folder(folders)
-        print(xml_output)
-        sys.exit(0)
-
+        handle_bucketsfolders(args)
     elif mode == 'browse':
-        # List folders in workspace or folder
-        folders = trint.list_folders(workspace_id=workspace_id)
-        if folder_id:
-            folders = [f for f in folders if f.get("parentId") == folder_id]
-        xml_output = add_CDATA_tags_with_id_for_folder(folders)
-        print(xml_output)
-        sys.exit(0)
-
+        handle_browse(args)
     elif mode == 'list':
-        if not target_path or not args.indexid:
-            print("Target path (-t) and Index ID (-in) required for list mode.")
-            sys.exit(1)
-        files = trint.list_files(folder_id=folder_id, workspace_id=workspace_id)
-        params = {
-            "indexid": args.indexid,
-            "project_name": args.projectname or "default",
-            "label": args.label or ""
-        }
-        catalog_path = get_catalog_path(params)
-        objects_dict = GetObjectDict(files, params, catalog_path)
-        progressDetails.update({
-            "totalFiles": objects_dict["scanned_count"],
-            "totalSize": objects_dict["total_size"],
-            "processedFiles": objects_dict["selected_count"],
-            "processedBytes": 0,
-            "status": "COMPLETED"
-        })
-        send_progress = lambda p, f: None  # Mock if not defined
-        send_progress(progressDetails, progressDetails["processedFiles"])
-        print(f"{progressDetails['totalFiles']}:{progressDetails['totalSize']}:{progressDetails['processedFiles']}:0")
-        if generate_xml_from_file_objects(objects_dict, target_path):
-            debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, f"Generated XML: {target_path}")
-        else:
-            print("Failed to generate XML.")
-            sys.exit(1)
-        sys.exit(0)
-
-    elif mode == 'upload':
-        if not file_path or not folder_id:
-            print("Source file (-s) and Folder ID (-id) required for upload.")
-            sys.exit(1)
-        if not os.path.exists(file_path):
-            print(f"File not found: {file_path}")
-            sys.exit(1)
-
-        # Generate backlink URL
-        client_ip, client_port = args.controller_address.split(":") if args.controller_address and ":" in args.controller_address else get_link_address_and_port()
-        backlink_url = f"https://{client_ip}/dashboard/projects/{job_guid}/browse&search?path=/&filename={os.path.basename(file_path)}"
-        result = trint.upload_file(
-            file_path=file_path,
-            folder_id=folder_id,
-            workspace_id=workspace_id,
-            language=args.language,
-            backlink_url=backlink_url
-        )
-        if result and 'trintId' in result:
-            print(f"File Upload successful: {result['trintId']}")
-            sys.exit(0)
-        else:
-            print("Upload failed.")
-            sys.exit(1)
-
+        handle_list(args)
     elif mode == 'createfolder':
-        if not folder_name:
-            print("Folder name (-f) required.")
-            sys.exit(1)
-        folder = trint.create_folder(folder_name, parent_id=folder_id, workspace_id=workspace_id)
-        if folder:
-            print(folder["_id"])
-            sys.exit(0)
-        else:
-            print("Failed to create folder.")
-            sys.exit(1)
-
+        handle_createfolder(args)
+    elif mode == 'upload':
+        handle_upload(args)
     else:
         print(f"Unsupported mode: {mode}")
         sys.exit(1)
