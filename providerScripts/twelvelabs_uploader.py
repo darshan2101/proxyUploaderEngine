@@ -2,13 +2,12 @@ import requests
 import os
 import sys
 import json
-import boto3
 import argparse
 import logging
+import plistlib
 import urllib.parse
 from configparser import ConfigParser
 import xml.etree.ElementTree as ET
-import plistlib
 from pathlib import Path
 
 # Constants
@@ -121,20 +120,88 @@ def prepare_metadata_to_upload( backlink_url, properties_file = None):
     
     return metadata
 
+def file_exists_in_index(api_key, index_id, filename, file_size):
+    url = f"https://api.twelvelabs.io/v1.3/indexes/{index_id}/videos"
+    headers = {"x-api-key": api_key}
+    params = {
+        "filename": filename,
+        "size": file_size
+    }
+    video_id = None
+    page = 1
+    total_pages = 1
+
+    logging.info(f"Searching for existing video: '{filename}' (Size: {file_size} bytes)")
+
+    while page <= total_pages:
+        params["page"] = page
+        response = requests.get(url, headers=headers, params=params)
+        if response.status_code != 200:
+            logging.error(f"Failed to list videos: {response.text}")
+            return None
+
+        data = response.json()
+        results = data.get("data", [])
+        for video in results:
+            meta = video.get("metadata", {})
+            if meta.get("filename") == filename and meta.get("size") == file_size:
+                video_id = video["_id"]
+                logging.info(f"Matching video found: ID={video_id}, filename='{filename}', size={file_size}")
+                return video_id  # Return on first match
+
+        page_info = data.get("page_info", {})
+        total_pages = page_info.get("total_page", 1)
+        page += 1
+
+    return None  # No match found
+
+def delete_video(api_key, index_id, video_id):
+    url = f"https://api.twelvelabs.io/v1.3/indexes/{index_id}/videos/{video_id}"
+    headers = {"x-api-key": api_key}
+    response = requests.delete(url, headers=headers)
+    if response.status_code in (200, 204):
+        logging.info(f"✅ Deleted existing video ID: {video_id}")
+        return True
+    else:
+        logging.error(f"❌ Failed to delete video {video_id}: {response.text}")
+        return False
+
 def upload_asset(api_key, index_id, file_path):
     try:
+        filename = os.path.basename(file_path)
+        file_size = os.path.getsize(file_path)
+
+        # Check and remove duplicate
+        existing_video_id = file_exists_in_index(api_key, index_id, filename, file_size)
+        if existing_video_id:
+            logging.info(f"Duplicate video found for '{filename}'. Deleting...")
+            if not delete_video(api_key, index_id, existing_video_id):
+                logging.warning("Proceeding with upload despite failed deletion.")
+        else:
+            logging.info(f"No duplicate found for '{filename}'. Proceeding with upload.")
+
         url = "https://api.twelvelabs.io/v1.3/tasks"
-        files = { "video_file": open(file_path, 'rb') }
-        payload = {
-            "index_id": index_id
-        }
+        payload = {"index_id": index_id}
         headers = {"x-api-key": api_key}
-        response = requests.post(url, data=payload, files=files, headers=headers)
-        logging.debug(f"Response ---------------: {response.text}")
+
+        with open(file_path, 'rb') as f:
+            files = {"video_file": f}
+            logging.info(f"Uploading '{filename}' to Twelve Labs index {index_id}...")
+            response = requests.post(url, data=payload, files=files, headers=headers)
+
+        if response.status_code >= 400:
+            logging.error(f"Upload failed with status {response.status_code}: {response.text}")
+            raise RuntimeError(f"Upload failed: {response.text}")
+
+        logging.debug(f"Upload response: {response.text}")
         return response.json()
-    
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Network error during upload: {e}")
+        raise RuntimeError(f"Network error: {e}")
     except Exception as e:
-        raise RuntimeError(f"Asset upload failed: {e}")
+        logging.error(f"Unexpected error in upload_asset: {e}")
+        raise
 
 def add_metadata(api_key, index_id, video_id, metadata):
     try:
