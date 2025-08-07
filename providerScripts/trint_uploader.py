@@ -79,17 +79,15 @@ def get_link_address_and_port():
 
 def create_folder(config_data, folder_name, parent_id=None):
     url = f"{config_data['base_url']}/folders/"
-    headers = {
-        "accept": "application/json",
-        "content-type": "application/json"
-    }
+    headers = {"accept": "application/json", "content-type": "application/json"}
 
     payload = {"name": folder_name}
     if parent_id:
         payload["parentId"] = parent_id
+    if config_data.get("workspace_id"):
+        payload["workspaceId"] = config_data["workspace_id"]
 
-    logging.debug(f"Creating folder '{folder_name}' with parent ID: {parent_id}")
-    logging.debug(f"Payload being sent: {json.dumps(payload)}")
+    logging.debug(f"Creating folder '{folder_name}' with parent {parent_id}: {json.dumps(payload)}")
 
     response = requests.post(
         url,
@@ -98,78 +96,80 @@ def create_folder(config_data, folder_name, parent_id=None):
         data=json.dumps(payload)
     )
 
-    logging.debug(f"POST /folders/ response: {response.status_code} - {response.text}")
-
-    if response.status_code not in [200, 201]:
-        logging.error(f"Unexpected response when creating folder '{folder_name}': {response.text}")
+    if response.status_code not in (200, 201):
+        logging.error(f"Create folder failed '{folder_name}': {response.text}")
         raise Exception(f"Failed to create folder '{folder_name}': {response.text}")
 
     folder_data = response.json()
-    logging.info(f"Folder '{folder_name}' created or exists: {folder_data}")
+    logging.info(f"Created folder '{folder_name}': {folder_data}")
     return folder_data
 
 def list_all_folders(config_data):
-    url = f"{config_data['base_url']}/folders/"
-    headers = {"accept": "application/json"}
+    base_url = f"{config_data['base_url']}/folders/"
+    params = {"workspace-id": config_data["workspace_id"]} if config_data.get("workspace_id") else {}
+    url = f"{base_url}?{urlencode(params)}" if params else base_url
 
     response = requests.get(
         url,
         auth=HTTPBasicAuth(config_data['api_key_id'], config_data['api_key_secret']),
-        headers=headers
+        headers={"accept": "application/json"}
     )
-
-    if response.status_code not in [200, 201]:
-        logging.error(f"Failed to fetch folders: {response.text}")
+    if response.status_code not in (200, 201):
+        logging.error(f"Listing folders failed: {response.text}")
         raise Exception(f"Could not list folders: {response.text}")
 
     return response.json()
 
+def get_folder_id(config_data, upload_path, base_id=None):
+    upload_path = upload_path.strip("/")
+    if not upload_path:
+        return base_id or None
 
-def get_folder_id(config_data, upload_path, base_id = None):
-    """
-    Resolves or creates the folder hierarchy based on upload_path and returns the final folder ID.
-    """
-    # Strip filename and leading/trailing slashes
-    folder_path = upload_path.strip("/")
-    folder_parts = folder_path.split("/")
-
-    # Fetch all existing folders
+    parts = [p for p in upload_path.split("/") if p]
     folders = list_all_folders(config_data)
+    has_workspace = bool(config_data.get("workspace_id"))
 
-    # Map full path -> folder metadata
-    folder_map = {folder["name"]: folder for folder in folders}
+    if has_workspace:
+        # Map by parent
+        current_parent = base_id
+        for part in parts:
+            # Find child folder with given name and current parent
+            found = next(
+                (f for f in folders if f["name"] == part and f.get("parent") == current_parent),
+                None
+            )
+            if not found:
+                # Create folder under current parent
+                found = create_folder(config_data, part, parent_id=current_parent)
+                folders.append(found)
+            current_parent = found["_id"]
+        return current_parent
 
-    # Try to find the deepest existing folder path
-    current_parent_id = base_id
-    current_path_parts = []
-    matched_index = -1
+    else:
+        # Names are full paths, so build map
+        path_map = {f["name"]: f for f in folders}
+        current_parent = base_id
+        matched_index = -1
 
-    for i, part in enumerate(folder_parts):
-        current_path_parts.append(part)
-        current_path = "/".join(current_path_parts)
+        # Match longest existing path segment
+        for i in range(len(parts)):
+            current_path = "/".join(parts[:i+1])
+            if current_path in path_map:
+                current_parent = path_map[current_path]["_id"]
+                matched_index = i
+            else:
+                break
 
-        if current_path in folder_map:
-            current_parent_id = folder_map[current_path]["_id"]
-            matched_index = i
-        else:
-            break
+        # Create missing folders
+        for part in parts[matched_index+1:]:
+            new_folder = create_folder(config_data, part, parent_id=current_parent)
+            current_parent = new_folder["_id"]
+            path_map["/".join(parts[:matched_index+1])] = new_folder
+            matched_index += 1
 
-    # Create folders from where match stopped
-    for part in folder_parts[matched_index + 1:]:
-        current_path_parts.append(part)
-        folder_name = part
-        current_path = "/".join(current_path_parts)
+        return current_parent
 
-        folder_data = create_folder(config_data, folder_name, parent_id=current_parent_id)
-        current_parent_id = folder_data["_id"]
-
-        # Update folder_map with newly created folder
-        folder_map[current_path] = folder_data
-
-    logging.info(f"Resolved final folder ID for '{folder_path}': {current_parent_id}")
-    return current_parent_id
-
-def create_asset(config_data, file_path, backlink_url=None, folder_id=None, workspace_id=None, language="en"):
+def create_asset(config_data, file_path, folder_id=None, workspace_id=None, language="en"):
     key_id = config_data.get("api_key_id")
     key_secret = config_data.get("api_key_secret")
     base_upload_url = config_data.get("upload_url") or "https://upload.trint.com"
@@ -189,8 +189,6 @@ def create_asset(config_data, file_path, backlink_url=None, folder_id=None, work
         "language": language
     }
 
-    if backlink_url:
-        data["metadata"] = backlink_url
     if folder_id:
         data["folder-id"] = folder_id
     if workspace_id:
@@ -307,17 +305,6 @@ if __name__ == '__main__':
         relative_path = normalized_path.split("/1/", 1)[-1]
     else:
         relative_path = normalized_path
-    catalog_url = urllib.parse.quote(relative_path)
-    filename_enc = urllib.parse.quote(file_name_for_url)
-    job_guid = args.job_guid
-
-    if args.controller_address is not None and len(args.controller_address.split(":")) == 2:
-        client_ip, client_port = args.controller_address.split(":")
-    else:
-        client_ip, client_port = get_link_address_and_port()
-
-    backlink_url = f"https://{client_ip}/dashboard/projects/{job_guid}/browse&search?path={catalog_url}&filename={filename_enc}"
-    logging.debug(f"Generated dashboard URL: {backlink_url}")
 
     if args.dry_run:
         logging.info("[DRY RUN] Upload skipped.")
@@ -339,7 +326,13 @@ if __name__ == '__main__':
         folder_id = get_folder_id(cloud_config_data, args.upload_path)
     logging.debug(f"Folder ID check -------------------------> {folder_id}")
 
-    asset, creation_status = create_asset(cloud_config_data, args.source_path, backlink_url, folder_id)
+    workspace_id = cloud_config_data.get("workspace_id") if "workspace_id" in cloud_config_data else None
+    asset, creation_status = create_asset(
+        cloud_config_data,
+        args.source_path,
+        folder_id,
+        workspace_id=workspace_id
+    )
     response = asset.json() if isinstance(asset, requests.Response) else asset
     if creation_status in [200, 201] and 'trintId' in response:
         logging.info(f"asset upload completed ==============================> {response['trintId']}")

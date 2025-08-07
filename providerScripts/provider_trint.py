@@ -81,29 +81,43 @@ def handle_auth():
     print("Trint uses API Key/Secret. No interactive auth needed. Ensure keys are in cloud_targets.conf.")
     sys.exit(0)
 
-# --- Mode: buckets (list top-level folders in workspace OR personal root) ---
+# --- Mode: buckets (top-level folders as buckets) ---
 def handle_buckets(args):
-    """
-    If workspace_id is set → list folders in that workspace (root level only).
-    If not → list folders in user's personal workspace.
-    """
     url = f"{base_url}/folders/"
     params = {}
     if workspace_id:
-        params["workspace-id"] = workspace_id  # Scope to workspace
+        params["workspace-id"] = workspace_id
 
     response = api_request("GET", url, headers={"accept": "application/json"}, params=params)
-    if response and response.status_code == 200:
-        folders = response.json()
-        # Only root-level folders (no parent)
-        root_folders = [f for f in folders if f.get("parent") is None]
-        buckets = [f"{f['_id']}:{f['name']}" for f in root_folders]
-        print(','.join(buckets))
-    else:
+    if not response or response.status_code != 200:
         print("")
+        sys.exit(0)
+
+    folders = response.json()
+    root_folders = []
+
+    if workspace_id:
+        # Use parent field: root if no parent
+        root_folders = [f for f in folders if f.get("parent") is None]
+    else:
+        # No workspace → name contains path; root = top-level only
+        seen_roots = set()
+        for f in folders:
+            name = f.get("name", "")
+            parts = name.split("/")
+            if parts and parts[0] not in seen_roots:
+                seen_roots.add(parts[0])
+                # Fake a root folder with ID of first folder using that name
+                root_folders.append({
+                    "_id": f["_id"],
+                    "name": parts[0]
+                })
+
+    buckets = [f"{f['_id']}:{f['name']}" for f in root_folders]
+    print(','.join(buckets))
     sys.exit(0)
 
-# --- Mode: bucketsfolders (XML list of top-level folders in workspace) ---
+# --- Mode: bucketsfolders (XML list of top-level folders) ---
 def handle_bucketsfolders(args):
     url = f"{base_url}/folders/"
     params = {}
@@ -111,22 +125,37 @@ def handle_bucketsfolders(args):
         params["workspace-id"] = workspace_id
 
     response = api_request("GET", url, headers={"accept": "application/json"}, params=params)
-    if response and response.status_code == 200:
-        folders = response.json()
-        root_folders = [{"name": f["name"], "id": f["_id"]} for f in folders if f.get("parent") is None]
-        xml_output = add_CDATA_tags_with_id_for_folder(root_folders)
-        print(xml_output)
-    else:
+    if not response or response.status_code != 200:
         print('<?xml version="1.0" encoding="UTF-8"?><folders></folders>')
+        sys.exit(0)
+
+    folders = response.json()
+    root_folders = []
+
+    if workspace_id:
+        root_folders = [{"name": f["name"], "id": f["_id"]} for f in folders if f.get("parent") is None]
+    else:
+        seen_roots = set()
+        for f in folders:
+            name = f.get("name", "")
+            parts = name.split("/")
+            if parts and parts[0] not in seen_roots:
+                seen_roots.add(parts[0])
+                root_folders.append({
+                    "name": parts[0],
+                    "id": f["_id"]
+                })
+
+    xml_output = add_CDATA_tags_with_id_for_folder(root_folders)
+    print(xml_output)
     sys.exit(0)
 
 # --- Mode: browse (list immediate children of a folder) ---
 def handle_browse(args):
     parent_id = args.folder_id
-
-    if parent_id is None:
+    if not parent_id:
         print('Asset ID(-id <asset_id>) option required for browse.')
-        exit(1)
+        sys.exit(1)
 
     params = {}
     if workspace_id:
@@ -134,14 +163,35 @@ def handle_browse(args):
 
     url = f"{base_url}/folders/"
     response = api_request("GET", url, headers={"accept": "application/json"}, params=params)
-    if response and response.status_code == 200:
-        folders = response.json()
-        children = [f for f in folders if f.get("parent") == parent_id]
-        children = [{"name": f["name"], "id": f["_id"]} for f in children]
-        xml_output = add_CDATA_tags_with_id_for_folder(children)
-        print(xml_output)
-    else:
+    if not response or response.status_code != 200:
         print('<?xml version="1.0" encoding="UTF-8"?><folders></folders>')
+        sys.exit(0)
+
+    all_folders = response.json()
+    children = []
+
+    if workspace_id:
+        # Use parent ID
+        children = [f for f in all_folders if f.get("parent") == parent_id]
+    else:
+        # Find folder with this ID and get its name
+        parent_folder = next((f for f in all_folders if f["_id"] == parent_id), None)
+        if not parent_folder:
+            print('<?xml version="1.0" encoding="UTF-8"?><folders></folders>')
+            sys.exit(0)
+
+        parent_path = parent_folder["name"]  # e.g., "Test-08-05"
+        # Children: folders where name starts with parent_path/ and has one more segment
+        for f in all_folders:
+            name = f.get("name", "")
+            if name.startswith(parent_path + "/"):
+                relative = name[len(parent_path)+1:]
+                if "/" not in relative:  # Direct child
+                    children.append(f)
+
+    children = [{"name": f["name"].split("/")[-1], "id": f["_id"]} for f in children]
+    xml_output = add_CDATA_tags_with_id_for_folder(children)
+    print(xml_output)
     sys.exit(0)
 
 # --- Mode: list (list transcripts in folder or workspace) ---
