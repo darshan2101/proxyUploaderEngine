@@ -4,9 +4,7 @@ from action_functions import *
 import requests
 import logging
 
-SCOPES = ['https://www.googleapis.com/auth/drive']
-
-DEBUG_FILEPATH = '/tmp/googledrive_debug.out'
+DEBUG_FILEPATH = '/tmp/twelvelabs.out'
 DEBUG_PRINT = False
 DEBUG_TO_FILE = False
 BASE_URL = "https://api.twelvelabs.io/v1.3"
@@ -145,7 +143,7 @@ if __name__ == "__main__":
 
     elif mode == 'buckets':
         buckets = []
-        folders = handle_buckets(config_map)
+        folders = handle_buckets()
         for folder in folders:
             buckets.append(f"{folder['id']}:{folder['name']}")
         print(','.join(buckets))
