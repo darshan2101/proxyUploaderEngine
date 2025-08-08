@@ -143,7 +143,7 @@ def file_exists_in_index(api_key, index_id, filename, file_size):
         data = response.json()
         results = data.get("data", [])
         for video in results:
-            meta = video.get("metadata", {})
+            meta = video.get("system_metadata", {})
             if meta.get("filename") == filename and meta.get("size") == file_size:
                 video_id = video["_id"]
                 logging.info(f"Matching video found: ID={video_id}, filename='{filename}', size={file_size}")
