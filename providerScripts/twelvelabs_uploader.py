@@ -77,9 +77,11 @@ def get_cloud_config_path():
     logging.info(f"Using cloud config path: {path}")
     return path
 
-def prepare_metadata_to_upload( backlink_url, properties_file = None):    
+def prepare_metadata_to_upload(repo_guid ,job_guid, backlink_url, properties_file = None):    
     metadata = {
-        "fabric URL": backlink_url
+        "fabric Job GUID": job_guid,
+        "fabric-repoGuid": repo_guid,
+        "fabric-URL": backlink_url
     }
     
     if not properties_file or not os.path.exists(properties_file):
@@ -295,9 +297,12 @@ if __name__ == '__main__':
         except Exception as e:
             logging.warning(f"Could not validate size limit: {e}")
 
-    catalog_path = remove_file_name_from_path(matched_file)
+    catalog_path = remove_file_name_from_path(args.catalog_path)
+
     normalized_path = catalog_path.replace("\\", "/")
     if "/1/" in normalized_path:
+        cache_path, relative_path = normalized_path.split("/1/")
+        repo_guid = cache_path.split("/")[-1]        
         relative_path = normalized_path.split("/1/", 1)[-1]
     else:
         relative_path = normalized_path
@@ -324,7 +329,7 @@ if __name__ == '__main__':
         
     meta_file = args.metadata_file
     logging.info("Preparing metadata to be uploaded ...")
-    metadata_obj = prepare_metadata_to_upload(backlink_url, meta_file)
+    metadata_obj = prepare_metadata_to_upload(repo_guid, job_guid, backlink_url, meta_file)
     if metadata_obj is not None:
         parsed = metadata_obj
     else:
