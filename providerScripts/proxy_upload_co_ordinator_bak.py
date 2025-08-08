@@ -28,7 +28,7 @@ PROVIDER_SCRIPTS = {
     "tessact": "tessact_uploader.py",
     "overcasthq": "overcasthq_uploader.py",
     "AWS": "s3_uploader.py",
-    "trint": "trint_uploder.py",
+    "trint": "trint_uplaoder.py",
     "twelvelabs": "twelvelabs_uploader.py",
     "box": "box_uploader.py",
     "cloud": "dropbox_uploader.py",
@@ -492,6 +492,8 @@ def build_folder_id_map(records, config, log_path):
     # Subtree creation for /./ based paths
     for record in records:
         original_source_path = record[0]
+        if config.get("provider") == "twelvelabs":
+            return resolved_ids
         if "/./" in original_source_path:
             _, sub_path = original_source_path.split("/./", 1)
             path_segments = [seg for seg in sub_path.split(os.sep) if seg]
@@ -539,9 +541,13 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
             normalized_folder_key = os.path.normpath(os.path.join(logical_base, dir_path))
         else:
             # If no upload_path, use "/" as the base and dir_path directly
+            logical_base = "/"
             normalized_folder_key = os.path.join("/", dir_path) if dir_path else "/"
 
-        if config["provider"] in PATH_BASED_PROVIDERS:
+        # Special handling for twelvelabs: always use root resolved ID
+        if config.get("provider") == "twelvelabs":
+            upload_path_id = resolved_ids.get(logical_base)
+        elif config["provider"] in PATH_BASED_PROVIDERS:
             upload_path_id = None
         else:
             upload_path_id = resolved_ids.get(normalized_folder_key, list(resolved_ids.values())[0])
