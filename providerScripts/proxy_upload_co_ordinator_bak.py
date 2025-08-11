@@ -325,13 +325,15 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
     if error:
         debug_print(config["logging_path"], error)
         logging.error(error)
-
-        if os.path.exists(catalog_path):
-            try:
-                os.remove(catalog_path)
-                logging.info(f"Deleted catalog file: {catalog_path}")
-            except Exception as e:
-                logging.error(f"Failed to delete catalog file {catalog_path}: {e}")
+        try:
+            if os.stat(base_source_path).st_size > 0 and os.path.exists(catalog_path):
+                try:
+                    os.remove(catalog_path)
+                    logging.info(f"Deleted catalog file: {catalog_path}")
+                except Exception as e:
+                    logging.error(f"Failed to delete catalog file {catalog_path}: {e}")
+        except Exception as e:
+            logging.error(f"Failed to delete catalog file {catalog_path}: {e}")
 
         return {"success": False, "error": error}, base_source_path
 

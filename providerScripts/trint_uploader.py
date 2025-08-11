@@ -191,8 +191,11 @@ def create_asset(config_data, file_path, folder_id=None, workspace_id=None, lang
 
     if folder_id:
         data["folder-id"] = folder_id
+
+    # workspace-id must be sent as a query parameter, not in the form data
+    params = {}
     if workspace_id:
-        data["workspace-id"] = workspace_id
+        params["workspace-id"] = workspace_id
 
     # Upload file using multipart/form-data
     with open(file_path, "rb") as file_data:
@@ -203,12 +206,14 @@ def create_asset(config_data, file_path, folder_id=None, workspace_id=None, lang
         logger.info(f"Uploading file '{file_name}' to Trint...")
         logger.debug(f"Upload URL: {base_upload_url}")
         logger.debug(f"Form Data: {data}")
+        logger.debug(f"Query Params: {params}")
 
         response = requests.post(
             base_upload_url,
             auth=HTTPBasicAuth(key_id, key_secret),
             data=data,
-            files=files
+            files=files,
+            params=params
         )
 
     if response.status_code == 200:
