@@ -87,7 +87,7 @@ def create_folder(config_data, folder_name, parent_id=None):
     if config_data.get("workspace_id"):
         payload["workspaceId"] = config_data["workspace_id"]
 
-    logging.debug(f"Creating folder '{folder_name}' with parent {parent_id}: {json.dumps(payload)}")
+    logging.debug(f"Creating folder '{folder_name}' with parent ID: {parent_id}")
 
     response = requests.post(
         url,

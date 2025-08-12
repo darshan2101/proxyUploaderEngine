@@ -77,10 +77,11 @@ def get_cloud_config_path():
     logging.info(f"Using cloud config path: {path}")
     return path
 
-def prepare_metadata_to_upload(repo_guid ,job_guid, backlink_url, properties_file = None):    
+def prepare_metadata_to_upload(repo_guid ,relative_path, file_name, properties_file = None):    
     metadata = {
-        "fabric Job GUID": job_guid,
-        "fabric-repoGuid": repo_guid,
+        "relativePath": relative_path,
+        "repoGuid": repo_guid,
+        "fileName": file_name,
         "fabric-URL": backlink_url
     }
     
@@ -243,7 +244,8 @@ if __name__ == '__main__':
     parser.add_argument("-up", "--upload-path", required=True, help="Path where file will be uploaded google Drive")
     parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
-    parser.add_argument("--log-level", default="debug", help="Logging level")    
+    parser.add_argument("--log-level", default="debug", help="Logging level")
+    parser.add_argument("-r", "--repo-guid", "repo GUID of provided file")  
     parser.add_argument("--resolved-upload-id", action="store_true", help="Pass if upload path is already resolved ID")
     parser.add_argument("--controller-address",help="Link IP/Hostname Port")
     args = parser.parse_args()
@@ -329,7 +331,7 @@ if __name__ == '__main__':
         
     meta_file = args.metadata_file
     logging.info("Preparing metadata to be uploaded ...")
-    metadata_obj = prepare_metadata_to_upload(repo_guid, job_guid, backlink_url, meta_file)
+    metadata_obj = prepare_metadata_to_upload(args.repo_guid, catalog_url, filename_enc, backlink_url, meta_file)
     if metadata_obj is not None:
         parsed = metadata_obj
     else:

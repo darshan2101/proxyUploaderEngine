@@ -362,6 +362,8 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
         cmd += ["--controller-address", config["controller_address"]]
     if config.get("provider") in PATH_BASED_PROVIDERS:
         cmd += ["--bucket-name", config["bucket"]]
+    if config.get("provider") == "twelvelabs":
+        cmd += ["--repo-guid", config["repo_guid"]] 
     if dry_run:
         cmd.append("--dry-run")
     if upload_path_id:
