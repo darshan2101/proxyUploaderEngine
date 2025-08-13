@@ -2,11 +2,13 @@ import requests
 import time
 import csv
 import os
+import posixpath
 import subprocess
 import logging
 import time
 import json
 import sys
+import random
 import argparse
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -97,6 +99,7 @@ def resolve_base_upload_id(logging_path,script_path, cloud_config_name, upload_p
         if parent_id:
             cmd.extend(["--parent-id", parent_id])
         debug_print(logging_path, f"Command block copy for resolve folder ---------------------> {' '.join(cmd)}")
+        time.sleep(0.15 + random.random() * 0.2)  # 150–300ms
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             return upload_path  # fallback
@@ -107,24 +110,43 @@ def resolve_base_upload_id(logging_path,script_path, cloud_config_name, upload_p
     except Exception as e:
         return upload_path
 
-def build_proxy_map(records, config):
+def build_proxy_map(records, config, progressDetails):
     proxy_map = {}
     proxy_dir = config["proxy_directory"]
     log_path = config["logging_path"]
+    total_records = len(records)
 
     def resolve_proxy(record):
         original_source_path = record[0]
         base_source_path = os.path.join(*original_source_path.split("/./")) if "/./" in original_source_path else original_source_path
         base_name = os.path.splitext(os.path.basename(base_source_path))[0]
         pattern = f"{base_name}*.*"
-        proxy = resolve_proxy_file(proxy_dir, base_source_path, pattern, log_path)
-        return (base_source_path, proxy)
+        return base_source_path, resolve_proxy_file(proxy_dir, base_source_path, pattern, log_path)
+
+    # Initialize progress
+    progressDetails["processedFiles"] = 0
+    progressDetails["totalFiles"] = total_records
+    progressDetails["status"] = "Resolving proxy files"
+    progressDetails["duration"] = int(time.time())  # Initial timestamp
+
+    last_send = time.time()
+    SEND_INTERVAL = 30  # seconds
 
     with ThreadPoolExecutor(max_workers=config.get("thread_count", 2)) as executor:
         future_to_record = {executor.submit(resolve_proxy, r): r for r in records}
         for future in as_completed(future_to_record):
             base_source_path, proxy_path = future.result()
             proxy_map[base_source_path] = proxy_path
+
+            # Update counter in main thread only
+            progressDetails["processedFiles"] += 1
+            now = time.time()
+
+            # Send progress every 30 seconds OR on the last file
+            if (now - last_send >= SEND_INTERVAL) or (progressDetails["processedFiles"] == total_records):
+                progressDetails["duration"] = int(now)  # Unix timestamp
+                send_progress(progressDetails, config["repo_guid"])
+                last_send = now  # Reset timer
 
     debug_print(log_path, f"[PROXY MAP] Pre-resolved {len(proxy_map)} proxies.")
     return proxy_map
@@ -477,6 +499,7 @@ def build_folder_id_map(records, config, log_path, progressDetails):
     base_upload_path = "/"
     base_id = None
 
+    # === Stage 0: Handle base upload path ===
     if "upload_path" in config and config["upload_path"]:
         upload_path = config["upload_path"]
         if ":" in upload_path:
@@ -496,13 +519,14 @@ def build_folder_id_map(records, config, log_path, progressDetails):
             if config.get("provider") == "twelvelabs":
                 return resolved_ids
     else:
+        # If upload_path is not provided, default to root "/" mapped to None
         resolved_ids["/"] = None
-        debug_print(log_path, f"[INIT] No upload_path in config. Using root '/' mapped to None.")
+        debug_print(log_path, "[INIT] No upload_path in config. Using root '/' mapped to None.")
         if config.get("provider") == "twelvelabs":
             return resolved_ids
 
-    # Stage 1 - Collect all unique paths
-    progressDetails["status"] = "Getting unique paths"
+    # === Stage 1: Collect all unique paths ===
+    progressDetails["status"] = "Collecting unique paths"
     progressDetails["processedFiles"] = 0
     progressDetails["duration"] = int(time.time())
     send_progress(progressDetails, config["repo_guid"])
@@ -516,21 +540,27 @@ def build_folder_id_map(records, config, log_path, progressDetails):
             path_segments = [seg for seg in sub_path.split(os.sep) if seg]
             current_path = base_upload_path if config.get("upload_path") else "/"
             for seg_idx, segment in enumerate(path_segments):
-                if seg_idx < len(path_segments) - 1:
+                if seg_idx < len(path_segments) - 1:  # Exclude last segment (file)
                     next_path = posixpath.join(current_path, segment)
                     all_needed_paths.add(next_path)
                     current_path = next_path
-        if idx % 500 == 0:  # batch every 500 records
+        # Send progress every 100 records
+        if idx % 100 == 0:
             progressDetails["duration"] = int(time.time())
             send_progress(progressDetails, config["repo_guid"])
 
     sorted_paths = sorted(all_needed_paths, key=lambda p: p.count("/"))
+    total_folders = len(sorted_paths)
 
-    # Stage 2 - Start creating folders
+    # === Stage 2: Create folders and resolve IDs ===
     progressDetails["status"] = "Creating unique Folders"
     progressDetails["processedFiles"] = 0
+    progressDetails["totalFiles"] = total_folders  # ✅ Set total
     progressDetails["duration"] = int(time.time())
-    send_progress(progressDetails, config["repo_guid"])
+    send_progress(progressDetails, config["repo_guid"])  # Initial update
+
+    last_send = time.time()
+    SEND_INTERVAL = 30  # seconds
 
     for p_idx, path in enumerate(sorted_paths, start=1):
         if path not in resolved_ids:
@@ -546,6 +576,16 @@ def build_folder_id_map(records, config, log_path, progressDetails):
                 parent_id=parent_id
             )
             resolved_ids[path] = resolved_id
+
+        # Update progress
+        progressDetails["processedFiles"] = p_idx
+        now = time.time()
+
+        # Send progress every 30 seconds OR on last folder
+        if (now - last_send >= SEND_INTERVAL) or (p_idx == total_folders):
+            progressDetails["duration"] = int(now)
+            send_progress(progressDetails, config["repo_guid"])
+            last_send = now
 
     return resolved_ids
 
@@ -684,7 +724,7 @@ def process_csv_and_upload(config, dry_run=False):
     if config["mode"] == "proxy":
         progressDetails["status"] = "Building Proxy Map"
         send_progress(progressDetails, config["repo_guid"])
-        proxy_map = build_proxy_map(records, config)
+        proxy_map = build_proxy_map(records, config, progressDetails)
         debug_print(config["logging_path"], f"Proxy map ----------> {proxy_map}")
 
     progressDetails["status"] = "Calculating Total Size"
@@ -706,6 +746,8 @@ def process_csv_and_upload(config, dry_run=False):
     upload_results = []
     progressDetails["status"] = "Uploading Files"
     progressDetails["processedFiles"] = 0
+    progressDetails["totalFiles"] = len(records)
+    
     send_progress(progressDetails, config["repo_guid"])
 
     with ThreadPoolExecutor(max_workers=config["thread_count"]) as executor:

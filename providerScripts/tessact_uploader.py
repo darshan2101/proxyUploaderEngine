@@ -18,6 +18,8 @@ from pathlib import Path
 # Constants
 VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet"]
 CHUNK_SIZE = 5 * 1024 * 1024 
+CONFLICT_RESOLUTION_MODES = ["skip", "overwrite"]
+DEFAULT_CONFLICT_RESOLUTION = "skip"
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
@@ -180,26 +182,28 @@ def get_file_parts(file_size, chunk_size):
         })
     return parts
 
-def remove_existing_file_if_present(config_data, token, filename, filesize, parent_id=None):
+
+def find_existing_file(config_data, token, filename, filesize, parent_id=None):
     logging.info(f"Checking if file '{filename}' already exists in folder ID: {parent_id}")
     all_assets = list_assets(config_data, token, config_data['workspace_id'], parent_id, resource_type='File')
-    logging.debug(f"Found  assets in folder ID: {parent_id}    ---------> {all_assets}")
-    file_match = next((item for item in all_assets if item.get("name") == filename and int(item['size']) == int(filesize) ), None)
-
+    logging.debug(f"Found assets in folder ID: {parent_id}    ---------> {all_assets}")
+    file_match = next((item for item in all_assets if item.get("name") == filename and int(item['size']) == int(filesize)), None)
     if file_match:
-        asset_id = file_match.get("id")
-        if asset_id:
-            headers = {"Authorization": f"Bearer {token}"}
-            delete_url = f"{config_data['base_url']}/api/v1/library/{asset_id}/"
-            del_resp = requests.delete(delete_url, headers=headers)
-            if del_resp.status_code in (200, 204):
-                logging.info(f"Deleted existing file '{filename}' with ID: {asset_id}")
-                return True
-            else:
-                logging.error(f"Failed to delete file '{filename}' (ID: {asset_id}). Status: {del_resp.status_code}, Response: {del_resp.text}")
+        logging.info(f"Existing file found: {file_match}")
     else:
         logging.info(f"No existing file named '{filename}' found.")
-    return False
+    return file_match
+
+def delete_existing_file(config_data, token, asset_id, filename=None):
+    headers = {"Authorization": f"Bearer {token}"}
+    delete_url = f"{config_data['base_url']}/api/v1/library/{asset_id}/"
+    del_resp = requests.delete(delete_url, headers=headers)
+    if del_resp.status_code in (200, 204):
+        logging.info(f"Deleted existing file '{filename or asset_id}' with ID: {asset_id}")
+        return True
+    else:
+        logging.error(f"Failed to delete file '{filename or asset_id}' (ID: {asset_id}). Status: {del_resp.status_code}, Response: {del_resp.text}")
+        return False
 
 def initiate_upload(file_path, config_data, token, parent_id=None):
     url = f"{config_data['base_url']}/api/v1/upload/initiate_upload/"
@@ -214,8 +218,20 @@ def initiate_upload(file_path, config_data, token, parent_id=None):
         logging.info(f"Filename sanitized from '{original_file_name}' to '{file_name}'")
     file_size = os.path.getsize(file_path)
     
-    # check if file is already uploaded at parent_id
-    remove_existing_file_if_present(config_data, token, file_name, file_size, parent_id)
+
+    # Conflict resolution logic
+    conflict_resolution = config_data.get('conflict_resolution', DEFAULT_CONFLICT_RESOLUTION)
+    existing_file = find_existing_file(config_data, token, file_name, file_size, parent_id)
+    if existing_file:
+        if conflict_resolution == "skip":
+            logging.info(f"File '{file_name}' already exists and conflict resolution is set to 'skip'. Skipping upload.")
+            print(f"File '{file_name}' already exists. Skipping upload.")
+            sys.exit(0)
+        elif conflict_resolution == "overwrite":
+            deleted = delete_existing_file(config_data, token, existing_file["id"], file_name)
+            if not deleted:
+                logging.error(f"Failed to delete existing file '{file_name}'. Aborting upload.")
+                sys.exit(1)
 
     parts = get_file_parts(file_size, CHUNK_SIZE)
     headers = {"Content-Type": "application/json" ,"Authorization": f"Bearer {token}"}
@@ -401,11 +417,6 @@ if __name__ == '__main__':
     logging.debug(f"Using cloud config: {cloud_config_path}")
     logging.debug(f"Source path: {args.source_path}")
     logging.debug(f"Upload path: {args.upload_path}")
-    
-    token = get_access_token(cloud_config_data)
-    if not token:
-        logging.error("Failed to get Token. Exiting.")
-        sys.exit(1)
         
     if mode == "get_base_target":
         upload_path = args.upload_path
@@ -419,6 +430,10 @@ if __name__ == '__main__':
             print(args.upload_path)
             sys.exit(0)
 
+        token = get_access_token(cloud_config_data)
+        if not token:
+            logging.error("Failed to get Token. Exiting.")
+            sys.exit(1)
         logging.info(f"Fetching upload target ID for path: {upload_path}")
         base_id = args.parent_id or None
         up_id = find_upload_id_tessact(upload_path, token, cloud_config_data, base_id) if '/' in upload_path else upload_path
@@ -476,6 +491,11 @@ if __name__ == '__main__':
     logging.info(f"Starting upload process to Tessact")
     upload_path = args.upload_path
     
+    token = get_access_token(cloud_config_data)
+    if not token:
+        logging.error("Failed to get Token. Exiting.")
+        sys.exit(1)
+        
     if args.resolved_upload_id:
         folder_id = upload_path
     else:
