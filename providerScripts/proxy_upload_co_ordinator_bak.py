@@ -472,8 +472,11 @@ def calculate_total_size(records, config, proxy_map=None):
     debug_print(config['logging_path'], f"[STEP] Total size to upload: {total_size} bytes")
     return total_size
 
-def build_folder_id_map(records, config, log_path):
+def build_folder_id_map(records, config, log_path, progressDetails):
     resolved_ids = {}
+    base_upload_path = "/"
+    base_id = None
+
     if "upload_path" in config and config["upload_path"]:
         upload_path = config["upload_path"]
         if ":" in upload_path:
@@ -481,6 +484,8 @@ def build_folder_id_map(records, config, log_path):
             base_id = parent_id.strip("/")
             resolved_ids[base_upload_path] = base_id
             debug_print(log_path, f"[INIT] Mapping root path '{base_upload_path}' to ID '{base_id}'")
+            if config.get("provider") == "twelvelabs":
+                return resolved_ids
         else:
             base_upload_path = config["upload_path"]
             base_id = resolve_base_upload_id(
@@ -488,41 +493,59 @@ def build_folder_id_map(records, config, log_path):
             )
             resolved_ids[base_upload_path] = base_id
             debug_print(log_path, f"[INIT] Resolved base path '{base_upload_path}' to ID '{base_id}'")
+            if config.get("provider") == "twelvelabs":
+                return resolved_ids
     else:
-        # If upload_path is not provided, default to root "/" mapped to None
         resolved_ids["/"] = None
         debug_print(log_path, f"[INIT] No upload_path in config. Using root '/' mapped to None.")
-
-    # Subtree creation for /./ based paths
-    for record in records:
-        original_source_path = record[0]
         if config.get("provider") == "twelvelabs":
             return resolved_ids
+
+    # Stage 1 - Collect all unique paths
+    progressDetails["status"] = "Getting unique paths"
+    progressDetails["processedFiles"] = 0
+    progressDetails["duration"] = int(time.time())
+    send_progress(progressDetails, config["repo_guid"])
+
+    all_needed_paths = set()
+    for idx, record in enumerate(records, start=1):
+        progressDetails["processedFiles"] += 1
+        original_source_path = record[0]
         if "/./" in original_source_path:
             _, sub_path = original_source_path.split("/./", 1)
             path_segments = [seg for seg in sub_path.split(os.sep) if seg]
-            if "upload_path" in config and config["upload_path"]:
-                current_path = base_upload_path # From config
-                current_id = base_id # From config resolution
-            else:
-                current_path = "/" # Default root
-                current_id = resolved_ids["/"] # Should be None
-
-            for idx, segment in enumerate(path_segments):
-                if idx < len(path_segments) - 1:
-                    next_path = os.path.join(current_path, segment)
-                    if next_path not in resolved_ids:
-                        debug_print(log_path, f"[STEP] Resolving segment: {segment} under {current_path}")
-                        resolved_id = resolve_base_upload_id(
-                            config["logging_path"],
-                            config["script_path"],
-                            config["cloud_config_name"],
-                            f"/{segment}",
-                            parent_id=current_id
-                        )
-                        resolved_ids[next_path] = resolved_id
+            current_path = base_upload_path if config.get("upload_path") else "/"
+            for seg_idx, segment in enumerate(path_segments):
+                if seg_idx < len(path_segments) - 1:
+                    next_path = posixpath.join(current_path, segment)
+                    all_needed_paths.add(next_path)
                     current_path = next_path
-                    current_id = resolved_ids[next_path]
+        if idx % 500 == 0:  # batch every 500 records
+            progressDetails["duration"] = int(time.time())
+            send_progress(progressDetails, config["repo_guid"])
+
+    sorted_paths = sorted(all_needed_paths, key=lambda p: p.count("/"))
+
+    # Stage 2 - Start creating folders
+    progressDetails["status"] = "Creating unique Folders"
+    progressDetails["processedFiles"] = 0
+    progressDetails["duration"] = int(time.time())
+    send_progress(progressDetails, config["repo_guid"])
+
+    for p_idx, path in enumerate(sorted_paths, start=1):
+        if path not in resolved_ids:
+            parent_path = posixpath.dirname(path)
+            parent_id = resolved_ids.get(parent_path)
+            segment = posixpath.basename(path)
+            debug_print(log_path, f"[STEP] Resolving segment: {segment} under {parent_path}")
+            resolved_id = resolve_base_upload_id(
+                log_path,
+                config["script_path"],
+                config["cloud_config_name"],
+                f"/{segment}",
+                parent_id=parent_id
+            )
+            resolved_ids[path] = resolved_id
 
     return resolved_ids
 
@@ -673,8 +696,8 @@ def process_csv_and_upload(config, dry_run=False):
     # Resolve folder IDs if needed
     if config["provider"] not in PATH_BASED_PROVIDERS:
         progressDetails["status"] = "Building Folder Map"
-        resolved_ids = build_folder_id_map(records, config, config["logging_path"])
         send_progress(progressDetails, config["repo_guid"])
+        resolved_ids = build_folder_id_map(records, config, config["logging_path"], progressDetails)
         debug_print(config["logging_path"], f"Resolved ids directory ---------------------------> {resolved_ids}")
     else:
         resolved_ids = {}
@@ -682,6 +705,7 @@ def process_csv_and_upload(config, dry_run=False):
     # Upload process
     upload_results = []
     progressDetails["status"] = "Uploading Files"
+    progressDetails["processedFiles"] = 0
     send_progress(progressDetails, config["repo_guid"])
 
     with ThreadPoolExecutor(max_workers=config["thread_count"]) as executor:
