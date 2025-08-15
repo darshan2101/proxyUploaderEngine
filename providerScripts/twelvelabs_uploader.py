@@ -245,7 +245,7 @@ if __name__ == '__main__':
     parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")
-    parser.add_argument("-r", "--repo-guid", "repo GUID of provided file")  
+    parser.add_argument("-r", "--repo-guid",  help="repo GUID of provided file")  
     parser.add_argument("--resolved-upload-id", action="store_true", help="Pass if upload path is already resolved ID")
     parser.add_argument("--controller-address",help="Link IP/Hostname Port")
     args = parser.parse_args()
