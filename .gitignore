@@ -5,6 +5,7 @@ Demo
 CloudConfig
 csv_logs
 test/newOnes
+test/video data
 proxyUploaderScripts
 providerScripts/framIO/test/
 providerScripts/frameIO/test/frame.py
@@ -13,3 +14,15 @@ providerScripts/frameIO/test/original_file_config.json
 providerScripts/frameIO/test/requirement.txt
 providerScripts/frameIO/test/proxy_file_config.json
 providerScripts/frameIO/test/upload_proxy_controller.py
+reolved_ids.txt
+resolved_ids_14_14.txt
+test/cloud_targets.conf
+input.txt
+input_14_17.txt
+failed_files.json
+bulk_twelvelabs_upload.py
+1.py
+none_entries_14_17.json
+non_uuid_entries.json
+non_uuid_entries_14_17.json
+none_entries.json
