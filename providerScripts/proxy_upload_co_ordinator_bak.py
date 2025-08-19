@@ -99,7 +99,7 @@ def resolve_base_upload_id(logging_path,script_path, cloud_config_name, upload_p
         if parent_id:
             cmd.extend(["--parent-id", parent_id])
         debug_print(logging_path, f"Command block copy for resolve folder ---------------------> {' '.join(cmd)}")
-        time.sleep(0.15 + random.random() * 0.2)  # 150–300ms
+        time.sleep(1 + 2 * random.random())  # 1–3 seconds
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             return upload_path  # fallback

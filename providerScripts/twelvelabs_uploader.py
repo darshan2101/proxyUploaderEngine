@@ -77,12 +77,13 @@ def get_cloud_config_path():
     logging.info(f"Using cloud config path: {path}")
     return path
 
-def prepare_metadata_to_upload(repo_guid ,relative_path, file_name, properties_file = None):    
+def prepare_metadata_to_upload(repo_guid ,relative_path, file_name, file_size, backlink_url, properties_file = None):    
     metadata = {
-        "relativePath": relative_path,
+        "relativePath": relative_path if relative_path.startswith("/") else "/" + relative_path,
         "repoGuid": repo_guid,
         "fileName": file_name,
-        "fabric-URL": backlink_url
+        "fabric-URL": backlink_url,
+        "fabric_size": file_size
     }
     
     if not properties_file or not os.path.exists(properties_file):
@@ -331,7 +332,7 @@ if __name__ == '__main__':
         
     meta_file = args.metadata_file
     logging.info("Preparing metadata to be uploaded ...")
-    metadata_obj = prepare_metadata_to_upload(args.repo_guid, catalog_url, filename_enc, backlink_url, meta_file)
+    metadata_obj = prepare_metadata_to_upload(args.repo_guid, catalog_url, file_name_for_url, matched_file_size, backlink_url, meta_file)
     if metadata_obj is not None:
         parsed = metadata_obj
     else:
