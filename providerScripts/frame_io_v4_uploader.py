@@ -4,12 +4,22 @@ import sys
 import argparse
 import logging
 import plistlib
+import time
+import random
 import urllib.parse
 from configparser import ConfigParser
+from json import dumps
+from requests.exceptions import RequestException, SSLError, ConnectionError, Timeout
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 
 # Constants
 VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet"]
-CHUNK_SIZE = 5 * 1024 * 1024 
+CHUNK_SIZE = 5 * 1024 * 1024
+CONFLICT_RESOLUTION_MODES = ["skip", "overwrite"]
+DEFAULT_CONFLICT_RESOLUTION = "skip"
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
@@ -71,7 +81,45 @@ def get_link_address_and_port():
         sys.exit(5)
 
     logging.info(f"Server connection details - Address: {ip}, Port: {port}")
-    return ip, port   
+    return ip, port
+
+def get_retry_session(retries=3, backoff_factor_range=(1.0, 2.0)):
+    session = requests.Session()
+    # handling retry delays manually via backoff in the range
+    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+def make_request_with_retries(method, url, **kwargs):
+    session = get_retry_session()
+    last_exception = None
+
+    for attempt in range(3):  # Max 3 attempts
+        try:
+            response = session.request(method, url, timeout=(10, 30), **kwargs)
+            if response.status_code < 500:
+                return response
+            else:
+                logging.warning(f"Received {response.status_code} from {url}. Retrying...")
+        except (SSLError, ConnectionError, Timeout) as e:
+            last_exception = e
+            if attempt < 2:  # Only sleep if not last attempt
+                base_delay = [1, 3, 10][attempt]
+                jitter = random.uniform(0, 1)
+                delay = base_delay + jitter * ([1, 1, 5][attempt])  # e.g., 1-2, 3-4, 10-15
+                logging.warning(f"Attempt {attempt + 1} failed due to {type(e).__name__}: {e}. "
+                                f"Retrying in {delay:.2f}s...")
+                time.sleep(delay)
+            else:
+                logging.error(f"All retry attempts failed for {url}. Last error: {e}")
+        except RequestException as e:
+            logging.error(f"Request failed: {e}")
+            raise
+
+    if last_exception:
+        raise last_exception
+    return None  # Should not reach here
 
 def get_root_asset_id(config_data):
     url = f"{config_data['domain']}/v4/accounts/{config_data['account_id']}/projects/{config_data['project_id']}"
@@ -80,13 +128,23 @@ def get_root_asset_id(config_data):
         'Authorization': f"Bearer {config_data['token']}"
     }
     logger.debug(f"URL :------------------------------------------->  {url}")
-    response = requests.get(url, headers=headers)
-    logger.debug(f"root asset fetch response :--------------------> {response.text}")
-    if response.status_code not in (200, 201):
-        logger.info(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        exit(1)
-    response = response.json()
-    return response['data']['root_folder_id']
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("GET", url, headers=headers)
+            if response and response.status_code in (200, 201):
+                logging.info("Root asset ID acquired Successfully.")
+                return response.json()['data']['root_folder_id']
+            else:
+                logger.info(f"Response error. Status - {response.status_code}, Error - {response.text}")
+                return None
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to Root asset ID after 3 attempts: {e}")
+                return None
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return None 
 
 def get_folders_list(config_data, folder_id):
     url = f"{config_data['domain']}/v4/accounts/{config_data['account_id']}/folders/{folder_id}/children"
@@ -95,22 +153,33 @@ def get_folders_list(config_data, folder_id):
         'Authorization': f"Bearer {config_data['token']}"
         }
     logger.debug(f"URL :------------------------------------------->  {url}")
-    response = requests.get(url, headers=headers)
-    if response.status_code in (200, 201):
-        items = response.json()['data']
-        all_folders = []
-        for item in items:
-            if item['type'] == 'folder':
-                all_folders.append(
-                    {
-                        "name": item['name'],
-                        "id": item["id"]
-                    }
-                )
-        return all_folders, response.status_code
-    else:
-        logger.error(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        return response.text, response.status_code
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("GET", url, headers=headers)
+            if response and response.status_code in (200, 201):
+                logging.info("Folder list acquired successfully.")
+                items = response.json()['data']
+                all_folders = []
+                for item in items:
+                    if item['type'] == 'folder':
+                        all_folders.append(
+                            {
+                                "name": item['name'],
+                                "id": item["id"]
+                            }
+                        )
+                return all_folders
+            else:
+                logger.info(f"Response error. Status - {response.status_code}, Error - {response.text}")
+                return None
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to get Folder list after 3 attempts: {e}")
+                return None
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return None 
 
 def get_folders_content(config_data, asset_id, next_page_url = None, asset_data_list = None):
     if asset_data_list is None:
@@ -119,21 +188,29 @@ def get_folders_content(config_data, asset_id, next_page_url = None, asset_data_
         url = f"{config_data['domain']}/v4/accounts/{config_data['account_id']}/folders/{asset_id}/children"
     else:
         url = f"{config_data['domain']}{next_page_url}"
-    headers = {
-        'Accept': 'application/json',
-        'Authorization': f"Bearer {config_data['token']}"
-        }
+    headers = { 'Accept': 'application/json', 'Authorization': f"Bearer {config_data['token']}" }
     logging.debug(f"URL: {url}")
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200: 
-        logging.info(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        exit(1)
-    response = response.json()
-    asset_data_list.extend(response['data'])
-    next_page = response['links']['next']
-    if not next_page is None:
-        get_folders_content(asset_id,next_page,asset_data_list)
-    return asset_data_list
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("GET", url, headers=headers)
+            if response and response.status_code in (200, 201):
+                logging.info("contents of folder acquired successfully.")
+                asset_data_list.extend(response.json()['data'])
+                next_page = response.json()['links']['next']
+                if not next_page is None:
+                    get_folders_content(asset_id,next_page,asset_data_list)
+                return asset_data_list
+            else:
+                logger.info(f"Response error. Status - {response.status_code}, Error - {response.text}")
+                return None
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to get contents of folder after 3 attempts: {e}")
+                return None
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return None
 
 def remove_file(config_data, asset_id):
     url = f"{config_data['domain']}/v4/accounts/{config_data['account_id']}/files/{asset_id}"
@@ -142,12 +219,23 @@ def remove_file(config_data, asset_id):
         'Authorization': f"Bearer {config_data['token']}"
         }
     logging.debug(f"URL: {url}")
-    response = requests.delete(url, headers=headers)
-    if response.status_code != 204:
-        logging.info(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        exit(1)
-        return False
-    return True
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("DELETE", url, headers=headers)
+            if response and response.status_code == 204:
+                logging.info("Asset removed successfully.")
+                return True
+            else:
+                logger.info(f"Response error. Status - {response.status_code}, Error - {response.text}")
+                return False
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to remove asset after 3 attempts: {e}")
+                return None
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return None    
 
 def create_folder(config_data,folder_name,parent_id):
     url = f"{config_data['domain']}/v4/accounts/{config_data['account_id']}/folders/{parent_id}/folders"
@@ -161,27 +249,38 @@ def create_folder(config_data,folder_name,parent_id):
             }
         }
     logger.debug(f"URL :------------------------------------------->  {url}")
-    response = requests.post(url, headers=headers,json=payload)
-    logger.debug(f"RESPONSE: {response.text}")
-    if response.status_code not in (200, 201):
-        logger.info(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        exit(1)
-    response = response.json()
-    return response['data']['id']
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("POST", url, json=payload, headers=headers)
+            if response and response.status_code in (200, 201):
+                folder_id = response.json()['data']['id']
+                logging.debug(f"Created folder '{folder_name}' with ID: {folder_id}")
+                return folder_id
+            else:
+                logging.warning(f"Failed to create folder '{folder_name}' (attempt {attempt + 1}): {response.text if response else 'No response'}")
+                return None
+        except Exception as e:
+            logging.warning(f"Exception during folder creation (attempt {attempt + 1}): {e}")
+            if attempt == 2:
+                logging.error("Failed to create folder after 3 attempts.")
+                return None
+            time.sleep(random.uniform(*([1, 2], [3, 4], [10, 15])[attempt]))
+    return None
 
-def find_upload_id(upload_path, config_data, base_id = None):
+def find_upload_id(upload_path, config_data, base_id=None):
     current_parent_id = base_id or get_root_asset_id(config_data)
-
+    if not current_parent_id:
+        logging.error("Unable to get base/root folder id.")
+        return None
     folder_path = upload_path
     logging.info(f"Finding or creating folder path: '{folder_path}'")
 
     for segment in folder_path.strip("/").split("/"):
         logging.debug(f"Looking for folder '{segment}' under parent '{current_parent_id}'")
-
-        folders, response_code = get_folders_list(config_data, current_parent_id)
-        if not isinstance(folders, list) or response_code not in (200, 201):
-            print(f"Failed to get folders list: {folders}")
-            sys.exit(1)
+        folders = get_folders_list(config_data, current_parent_id)
+        if not isinstance(folders, list):
+            logging.error(f"Failed to get folders list: {folders}")
+            return None
         matched = next((f for f in folders if f.get("name") == segment), None)
 
         if matched:
@@ -190,6 +289,9 @@ def find_upload_id(upload_path, config_data, base_id = None):
             logging.debug(f"Found existing folder '{segment}' (ID: {current_parent_id})")
         else:
             current_parent_id = create_folder(config_data, segment, current_parent_id)
+            if not current_parent_id:
+                logging.error(f"Failed to create folder '{segment}'")
+                return None
             logging.info(f"Created new folder '{segment}' under parent ID {current_parent_id}, new ID: {current_parent_id}")
             logging.debug(f"Created folder '{segment}' (ID: {current_parent_id})")
 
@@ -198,35 +300,55 @@ def find_upload_id(upload_path, config_data, base_id = None):
 
 def create_asset(config_data,folder_id,file_path):
     url = f"{config_data['domain']}/v4/accounts/{config_data['account_id']}/folders/{folder_id}/files/local_upload"
-    file_name = extract_file_name(file_path)
+    original_file_name = os.path.basename(file_path)
+    name_part, ext_part = os.path.splitext(original_file_name)
+    sanitized_name_part = name_part.strip()
+    file_name = sanitized_name_part + ext_part
+
+    if file_name != original_file_name:
+        logging.info(f"Filename sanitized from '{original_file_name}' to '{file_name}'")
     file_size = os.path.getsize(file_path)
-    # remove if file already exists
+    # Conflict resolution logic
+    conflict_resolution = config_data.get('conflict_resolution', DEFAULT_CONFLICT_RESOLUTION)
     asset_list = get_folders_content(config_data, folder_id)
     existing_asset = next((asset for asset in asset_list if asset['name'] == file_name and int(asset['file_size']) == int(file_size) ), None)
     if existing_asset:
-        logging.info(f"File '{file_name}' already exists in folder ID {folder_id}. Removing existing asset.")
-        if remove_file(config_data, existing_asset['id']) == True:
-            logging.info(f"Removed existing asset: {existing_asset['name']} with ID: {existing_asset['id']}")
-        else:
-            logging.error(f"Failed to remove existing asset: {existing_asset['name']} with ID: {existing_asset['id']}")
-
+        if conflict_resolution == "skip":
+            logging.info(f"File '{file_name}' exists. Skipping upload.")
+            print(f"File '{file_name}' already exists. Skipping upload.")
+            sys.exit(0)
+        elif conflict_resolution == "overwrite":
+            is_deleted = remove_file(config_data, existing_asset['id'])
+            if is_deleted == True:
+                logging.info(f"Removed existing asset: {existing_asset['name']} with ID: {existing_asset['id']}")
+            else:
+                logging.error(f"Failed to remove existing asset: {existing_asset['name']} with ID: {existing_asset['id']}")
     payload = {
-    "data": {
-        "name": file_name,
-        "file_size": os.path.getsize(file_path)
-    }
+        "data": {
+            "name": file_name,
+            "file_size": os.path.getsize(file_path)
+        }
     }
     headers = {
         'Content-Type': 'application/json',
-        'Authorization': f"Bearer {cloud_config_data['token']}"
+        'Authorization': f"Bearer {config_data['token']}"
     }
-    response = requests.post(url, headers=headers, json=payload)
-    if response.status_code in (200, 201):
-        logging.info(f"Created asset '{file_name}' with size {os.path.getsize(file_path)} bytes in folder ID {folder_id}")
-    else:
-        logging.error(f"Failed to create asset for file '{file_path}'. Status: {response.status_code}, Response: {response.text}")
-        logging.debug(f"Response error. Status - {response.status_code}, Error - {response.text}")
-    return response, response.status_code
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("POST", url, json=payload, headers=headers)
+            if response and response.status_code in (200, 201):
+                logging.info(f"Created asset '{file_name}' with size {os.path.getsize(file_path)} bytes in folder ID {folder_id}")
+                return response.json(), response.status_code
+            else:
+                logging.error(f"Failed to create asset for file '{file_path}'. Status: {response.status_code}, Response: {response.text}")
+        except Exception as e:
+            logging.warning(f"Initiate upload error (attempt {attempt + 1}): {e}")
+            if attempt == 2:
+                logging.error("Failed to initiate upload after 3 attempts.")
+                return None, 500
+            time.sleep(random.uniform(*([1, 2], [3, 4], [10, 15])[attempt]))
+
+    return None, 500
         
 def upload_parts(file_path, asset_info):
     upload_urls = asset_info['data']['upload_urls']
@@ -237,25 +359,26 @@ def upload_parts(file_path, asset_info):
             part_size = part["size"]
             part_data = f.read(part_size)
             
-            logging.debug(f"Uploading part {i + 1} to {part_url[:80]}...")
-            logging.info(f"Uploading part {i + 1}/{len(upload_urls)} of file '{file_path}' to Frame.io")
-
-            response = requests.put(
-                part_url,
-                data=part_data,
-                headers={"Content-Type": content_type, "x-amz-acl": "private"}
-            )
-
-            if response.status_code == 200:
-                logging.debug(f"Part {i + 1} uploaded successfully.")
-                logging.info(f"Successfully uploaded part {i + 1}")
-            else:
-                logging.debug(f"Failed to upload part {i + 1}: {response.status_code} - {response.text}")
-                logging.error(f"Failed to upload part {i + 1}: HTTP {response.status_code} - {response.text}")
-                return {
-                    "detail": response.text,
-                    "status_code": response.status_code
-                }
+            for attempt in range(3):
+                try:
+                    logging.info(f"Uploading part {i + 1}/{len(upload_urls)} of file '{file_path}' to Frame.io")
+                    response = make_request_with_retries("PUT", part_url, data=part_data, headers={"Content-Type": content_type, "x-amz-acl": "private"})
+                    if response.status_code == 200:
+                        logging.debug(f"Part {i + 1} uploaded successfully.")
+                        logging.info(f"Successfully uploaded part {i + 1}")
+                    else:
+                        logging.debug(f"Failed to upload part {i + 1}: {response.status_code} - {response.text}")
+                        logging.error(f"Failed to upload part {i + 1}: HTTP {response.status_code} - {response.text}")
+                        return {
+                            "detail": response.text,
+                            "status_code": response.status_code
+                        }
+                except RequestException as e:
+                    logging.warning("Part %d upload failed (attempt %d): %s", i, attempt + 1, e)
+                    if attempt == 2:
+                        logging.error("Failed to upload part %d after 3 attempts.", i)
+                        raise
+                    time.sleep(random.uniform(*([1, 2], [3, 4], [10, 15])[attempt]))                    
     return {
         "detail": "uploaded all part",
         "status_code": 200
@@ -328,17 +451,12 @@ if __name__ == '__main__':
     if mode == 'buckets':
         asset_id = get_root_asset_id(cloud_config_data)
         buckets = []
-        # folders = get_folders_content(cloud_config_data, asset_id)
-        # for folder in folders:
-        #     if folder['type'] == 'folder':
-        #         buckets.append(f"{folder['id']}:{folder['name']}")
-        # print(','.join(buckets))
-        response, response_code = get_folders_list(cloud_config_data, asset_id)
+        response = get_folders_list(cloud_config_data, asset_id)
 
-        if response_code not in (200, 201):
-            logging.error(f"Failed to fetch folders. Status: {response_code}")
+        if not response:
+            logging.error(f"Failed to fetch Buckets.")
             sys.exit(1)
-        print(f"Response of folder list -----> {response}")
+        print(f"Response of Buckets list -----> {response}")
         sys.exit(0)
 
 
@@ -403,15 +521,20 @@ if __name__ == '__main__':
         folder_id = upload_path
     else:
         folder_id = find_upload_id(upload_path, cloud_config_data, args.parent_id)
+    
+    if not folder_id:
+        logging.warning(f"failed to find location no upload asset")
+        sys.exit(1)
 
     asset_info, creation_status = create_asset(cloud_config_data, folder_id, args.source_path)
-    if creation_status not in (200, 201):
-        print(f"Failed to create asset: {asset_info.text}")
+    if creation_status not in (200, 201) or asset_info is None:
+        logging.error(f"Failed to create asset: {getattr(asset_info, 'text', asset_info)}")
         sys.exit(1)
 
     parts_info = upload_parts(args.source_path, asset_info.json())
-    if parts_info["status_code"] not in (200, 201):
-        print(f"Failed to upload file parts: {parts_info['detail']}")
+    if not parts_info or parts_info.get("status_code", 0) not in (200, 201):
+        detail = parts_info['detail'] if parts_info else 'No detail available'
+        logging.error(f"Failed to upload file parts: {detail}")
         sys.exit(1)
     else:
         logging.info("All parts uploaded successfully to Frame.io")
