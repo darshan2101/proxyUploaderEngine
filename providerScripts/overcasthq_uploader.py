@@ -6,17 +6,26 @@ from datetime import datetime
 import logging
 import urllib.parse
 import requests
+import time
+import random
+from json import dumps
+from requests.exceptions import RequestException, SSLError, ConnectionError, Timeout
 from configparser import ConfigParser
 import plistlib
 import hashlib
 import urllib.parse
 import xml.etree.ElementTree as ET
+from pathlib import Path
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # Constants
 VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet"]
-CHUNK_SIZE = 5 * 1024 * 1024 
+CHUNK_SIZE = 5 * 1024 * 1024
+CONFLICT_RESOLUTION_MODES = ["skip", "overwrite"]
+DEFAULT_CONFLICT_RESOLUTION = "overwrite"
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
@@ -78,7 +87,45 @@ def get_link_address_and_port():
         sys.exit(5)
 
     logging.info(f"Server connection details - Address: {ip}, Port: {port}")
-    return ip, port 
+    return ip, port
+
+def get_retry_session(retries=3, backoff_factor_range=(1.0, 2.0)):
+    session = requests.Session()
+    # handling retry delays manually via backoff in the range
+    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+def make_request_with_retries(method, url, **kwargs):
+    session = get_retry_session()
+    last_exception = None
+
+    for attempt in range(3):  # Max 3 attempts
+        try:
+            response = session.request(method, url, timeout=(10, 30), **kwargs)
+            if response.status_code < 500:
+                return response
+            else:
+                logging.warning(f"Received {response.status_code} from {url}. Retrying...")
+        except (SSLError, ConnectionError, Timeout) as e:
+            last_exception = e
+            if attempt < 2:  # Only sleep if not last attempt
+                base_delay = [1, 3, 10][attempt]
+                jitter = random.uniform(0, 1)
+                delay = base_delay + jitter * ([1, 1, 5][attempt])  # e.g., 1-2, 3-4, 10-15
+                logging.warning(f"Attempt {attempt + 1} failed due to {type(e).__name__}: {e}. "
+                                f"Retrying in {delay:.2f}s...")
+                time.sleep(delay)
+            else:
+                logging.error(f"All retry attempts failed for {url}. Last error: {e}")
+        except RequestException as e:
+            logging.error(f"Request failed: {e}")
+            raise
+
+    if last_exception:
+        raise last_exception
+    return None  # Should not reach here
 
 def get_first_project(config_data):
     logging.debug("Fetching first project from OvercastHQ")
@@ -86,31 +133,37 @@ def get_first_project(config_data):
     headers = {
         'x-api-key': config_data["api_key"]
     }
-    response = requests.get(url, headers=headers)
-
-    if response.status_code in (200, 201):
-        result = response.json().get("result", {})
-        items = result.get("items", [])
-        if items:
-            first_project = items[0]
-            first_project_id = first_project.get("uuid")
-            logging.info(f"First project ID: {first_project_id}")
-            return first_project_id
-        else:
-            logging.error("No projects found in OvercastHQ")
-            raise RuntimeError("No projects found in OvercastHQ")
-    else:
-        logging.error(f"Failed to fetch projects: {response.status_code} {response.text}")
-        raise RuntimeError(f"Failed to fetch projects: {response.status_code} {response.text}")
+    logger.debug(f"URL :------------------------------------------->  {url}")
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("GET", url, headers=headers)
+            if response and response.status_code in (200, 201):
+                result = response.json().get("result", {})
+                items = result.get("items", [])
+                if items:
+                    logging.info(f"First project ID: { items[0].get("uuid")}")
+                    return items[0].get("uuid")
+                else:
+                    return None
+            else:
+                logging.error(f"Failed to fetch projects: {response.status_code} {response.text}")
+                return None
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to Root asset ID after 3 attempts: {e}")
+                return None
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return None
 
 def create_folder(config_data, name, project_id, parent_id=None):
     logging.info(f"Creating folder: {name}, project: {project_id}, parent: {parent_id}")
     url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/folders"
-
     headers = {
         'x-api-key': config_data["api_key"]
     }
-
+    logger.debug(f"URL :------------------------------------------->  {url}")
     payload = {
         "name": name,
         "project": project_id,
@@ -118,43 +171,62 @@ def create_folder(config_data, name, project_id, parent_id=None):
     if parent_id is not None:
         payload["parent"] = parent_id
     logging.debug(f"data payload (form-data) -------------------------> {payload}")
-    response = requests.post(url, headers=headers, data=payload)
-    logging.info(f"Response for folder creation: {response.text}")
 
-    if response.status_code in (200, 201):
-        resp_json = response.json()
-        uuid = resp_json.get("uuid") or resp_json.get("result", {}).get("uuid")
-        if uuid:
-            return uuid
-        else:
-            logging.error("UUID not found in folder creation response")
-            raise RuntimeError("UUID not found in folder creation response")
-    else:
-        logging.error(f"Failed to create Folder: {response.status_code} {response.text}")
-        raise RuntimeError(f"Failed to create Folder: {response.status_code} {response.text}")
-
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("POST", url, headers=headers, data=payload)
+            if response and response.status_code in (200, 201):
+                resp_json = response.json()
+                uuid = resp_json.get("uuid") or resp_json.get("result", {}).get("uuid")
+                if uuid:
+                    logging.debug(f"Created folder '{name}' with UUID: {uuid}")
+                    return uuid
+                else:
+                    logging.error("UUID not found in folder creation response")
+                    return None
+            else:
+                logging.error(f"Failed to create Folder: {response.status_code} {response.text}")
+                return None
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to create folder after 3 attempts: {e}")
+                return None
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return None
+    
 def list_all_folders(config_data, project_id, parent_id):
     logging.debug(f"parameter to get folder tree =================> {parent_id}")
-    headers = { 'x-api-key': config_data["api_key"]}
     url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/folders"
-    all_folders = []
-
+    headers = {
+        'x-api-key': config_data["api_key"]
+    }
+    logger.debug(f"URL :------------------------------------------->  {url}")
     params = {
         "project": project_id
     }
     if parent_id is not None:
         params["parent"] = parent_id
-    logging.debug(f"Fetching folders from: {url}")
-    response = requests.get( url, headers=headers, params=params)
-    # 
-    if response.status_code in (200, 201):
-        logging.info("File Tree Successfully")
-        data = response.json().get("result", {})
-    else:
-        logging.error("Failed to get File Tree")
-
-    all_folders.extend(data['items'])
-    return all_folders
+    logging.debug(f"params payload -------------------------> {params}")
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("GET", url, headers=headers, params=params)
+            if response and response.status_code in (200, 201):
+                logging.info("File Tree Successfully")
+                data = response.json().get("result", {})
+                return data.get("items", [])
+            else:
+                logging.error(f"Failed to get File Tree: {response.status_code} {response.text}")
+                return []
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to list folders after 3 attempts: {e}")
+                return []
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return []
 
 def get_folder_id(config_data, upload_path, base_id = None):
     project_id = config_data['project_id']
@@ -189,90 +261,150 @@ def get_folder_id(config_data, upload_path, base_id = None):
     logging.debug(f"UUID  after tree traversal/creation ---------------> {current_parent_id}")
     return current_parent_id
 
-def get_assets_id_from_folder(config_data ,folder_id):
+def get_assets_id_from_folder(config_data, folder_id):
     url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/folders/{folder_id}/asset"
+    headers = {
+        'x-api-key': config_data["api_key"]
+    }
+    logger.debug(f"URL :------------------------------------------->  {url}")
 
-    headers = { 'x-api-key': config_data["api_key"] }
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:    
-        logging.error(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        exit(1)
-    return response.json()
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("GET", url, headers=headers)
+            if response and response.status_code == 200:
+                return response.json()
+            else:
+                logging.error(f"Response error. Status - {response.status_code}, Error - {response.text}")
+                return None
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to fetch assets from folder after 3 attempts: {e}")
+                return None
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return None
 
 def remove_file(config_data, asset_id):
     url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/assets/{asset_id}"
-    headers = { 'x-api-key': config_data["api_key"] }
-    
-    response = requests.delete(url, headers=headers)
-    if response.status_code != 200:
-        logging.error(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        exit(1)
-        return False
-    return True
+    headers = {
+        'x-api-key': config_data["api_key"]
+    }
+    logger.debug(f"URL :------------------------------------------->  {url}")
+
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("DELETE", url, headers=headers)
+            if response and response.status_code == 200:
+                logging.info(f"Successfully deleted existing asset {asset_id}")
+                return True
+            elif response:
+                logging.warning(f"Delete failed: {response.status_code} {response.text}")
+            return False
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to delete asset {asset_id} after 3 attempts: {e}")
+                return False
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return False
 
 
 def get_asset_metadata(config_data, asset_id):
     metadata_dict = {}
     url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/assets/{asset_id}/metadata"
     headers = {
-    'x-api-key': config_data["api_key"]
+        'x-api-key': config_data["api_key"]
     }
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        logging.error(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        return metadata_dict
-    try:
-        response = response.json()
-        for key, value in response['result']['items'].items():
-            for data in value['items']:
-                metadata_dict[f"{key}_{data['key']}"] = data['value']
-    except Exception as e:
-        logging.error(f"Error parsing metadata JSON for asset {asset_id}: {e}")
+    logger.debug(f"URL :------------------------------------------->  {url}")
+
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("GET", url, headers=headers)
+            if response and response.status_code == 200:
+                response_data = response.json()
+                for key, value in response_data['result']['items'].items():
+                    for data in value['items']:
+                        metadata_dict[f"{key}_{data['key']}"] = data['value']
+                return metadata_dict
+            else:
+                logging.warning(f"Metadata fetch failed: {response.status_code} {response.text}")
+        except Exception as e:
+            if attempt == 2:
+                logging.warning(f"Skipping metadata fetch after 3 attempts: {e}")
+                return metadata_dict
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
     return metadata_dict
 
 def get_asset_details(config_data, asset_id):
     data_dict = {}
     url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/assets/{asset_id}"
-    headers = { 'x-api-key': config_data["api_key"] }
-    response = requests.get(url, headers=headers)
-    if response.status_code == 403:
-        logging.warning(f"403 Forbidden: cannot fetch asset details for {asset_id}")
-        return None
-    elif response.status_code == 200:
-        response = response.json()
-        if len(response['result']) != 0:
-            folder_path_list = response['result']['folder']
-            folder_path = []
-            if len(folder_path_list) !=0:
-                folder_path = [folder['value'] for folder in folder_path_list['parent']]
-                folder_path.append(folder_path_list['name'])
-            if 'info' in response['result']:
-                file_name = f"{response['result']['name']}.{response['result']['info']['file_type']}"
-                data_dict['path'] = f"{'/'.join(folder_path)}/{file_name}"
-                data_dict['mtime'] = response['result']['updated_at']
-                data_dict['atime'] = response['result']['created_at']
-                data_dict['type'] = "file"
-                data_dict['size'] = response['result']['info']['file_size']
-                data_dict['asset_id'] = asset_id
-                try:
-                    data_dict['metadata'] = get_asset_metadata(config_data, asset_id)
-                except Exception as e:
-                    logging.warning(f"Skipping asset {asset_id} due to metadata fetch error: {e}")
-                    data_dict['metadata'] = {}
+    headers = {
+        'x-api-key': config_data["api_key"]
+    }
+    logger.debug(f"URL :------------------------------------------->  {url}")
 
-        return data_dict
-    
-    elif response.status_code != 200:
-        logging.error(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        exit(1)
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("GET", url, headers=headers)
+            if response.status_code == 403:
+                logging.warning(f"403 Forbidden: cannot fetch asset details for {asset_id}")
+                return None
+            elif response.status_code == 200:
+                response_data = response.json()
+                if not response_data.get("result"):
+                    return None
+                result = response_data["result"]
+                folder_path_list = result.get("folder", {})
+                folder_path = []
+                if folder_path_list and "parent" in folder_path_list:
+                    folder_path = [f.get("value") for f in folder_path_list["parent"] if f.get("value")]
+                if "name" in folder_path_list:
+                    folder_path.append(folder_path_list["name"])
+                info = result.get("info", {})
+                file_name = f"{result['name']}.{info.get('file_type', '')}" if 'name' in result else None
+                if not file_name:
+                    return None
+                data_dict['path'] = f"{'/'.join(folder_path)}/{file_name}"
+                data_dict['mtime'] = result.get('updated_at')
+                data_dict['atime'] = result.get('created_at')
+                data_dict['type'] = "file"
+                data_dict['size'] = info.get('file_size')
+                data_dict['asset_id'] = asset_id
+                data_dict['metadata'] = get_asset_metadata(config_data, asset_id)
+                return data_dict
+            else:
+                logging.error(f"Response error. Status - {response.status_code}, Error - {response.text}")
+                return None
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to get asset details after 3 attempts: {e}")
+                return None
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return None
 
 def create_asset(config_data, project_id, folder_id, file_path):
     logging.debug(f"Folder ID check at asset create-------------------------> {folder_id}")
+    url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/assets"
+    headers = {
+        'x-api-key': config_data["api_key"]
+    }
+    logger.debug(f"URL :------------------------------------------->  {url}")
+    original_file_name = extract_file_name(file_path)
+    name_part, ext_part = os.path.splitext(original_file_name)
+    sanitized_name_part = name_part.strip()
+    file_name = sanitized_name_part + ext_part
     
-    # Check and remove if the file exists
-    file_name = extract_file_name(file_path)
+    if file_name != original_file_name:
+        logging.info(f"Filename sanitized from '{original_file_name}' to '{file_name}'")
     file_size = os.path.getsize(file_path)
     asset_list = get_assets_id_from_folder(config_data, folder_id)
+    conflict_resolution = config_data.get('conflict_resolution', DEFAULT_CONFLICT_RESOLUTION)
     for asset in asset_list['result']['items']:
         asset_info = get_asset_details(config_data, asset['uuid'])
         if not asset_info:
@@ -285,12 +417,16 @@ def create_asset(config_data, project_id, folder_id, file_path):
         try:
             if orig_name == file_name and int(orig_size) == file_size:
                 logging.info(f"Duplicate asset found: {file_name} ({file_size} bytes)")
-                if remove_file(config_data, asset_info['asset_id']):
-                    logging.info(f"Deleted existing asset for: {file_path}")
-                else:
-                    logging.error(f"Failed to delete asset: {file_path}")
-                    sys.exit(1)
-                break  # No need to check further
+                if conflict_resolution == "skip":
+                    logging.info(f"File '{file_name}' exists. Skipping upload.")
+                    print(f"File '{file_name}' already exists. Skipping upload.")
+                    sys.exit(0)
+                elif conflict_resolution == "overwrite":
+                    if remove_file(config_data, asset_info['asset_id']):
+                        logging.info(f"Deleted existing asset for: {file_path}")
+                    else:
+                        logging.error(f"Failed to delete asset: {file_path}")
+            break  # No need to check further
         except (TypeError, ValueError):
             logging.debug(f"Invalid original file size metadata on asset {asset['uuid']}: {orig_size}")
             continue
@@ -303,17 +439,25 @@ def create_asset(config_data, project_id, folder_id, file_path):
         "file_size": file_size,
         "folder": folder_id
     }
+    logging.debug(f"data payload (form-data) -------------------------> {payload}")
 
-    logging.debug(f"Creating new asset at: {url}")
-    response = requests.post(url, headers=headers, data=payload)
-    logging.debug(f"Response from asset creation: {response.text}")
-
-    if response.status_code != 201:
-        logging.error("Failed to create asset")
-        logging.debug(f"Status: {response.status_code} | Error: {response.text}")
-
-    return response, response.status_code
-
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("POST", url, headers=headers, data=payload)
+            if response and response.status_code == 201:
+                logging.debug(f"Asset creation response: {response.text}")
+                return response, 201
+            else:
+                logging.error(f"Failed to create asset: {response.status_code} {response.text}")
+                return None, response.status_code
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to create asset after 3 attempts: {e}")
+                return None, 500
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return None, 500
 
 def multipart_upload_to_s3(asset_res, config_data,file_path):
     upload_id = upload_file_to_s3(asset_res,config_data)
@@ -519,188 +663,222 @@ def parse_metadata_file(properties_file):
 
     return metadata
 
-def upload_metadata_to_asset(hostname, api_key, backlink_url, asset_id, properties_file = None):
+def upload_metadata_to_asset(hostname, api_key, backlink_url, asset_id, properties_file=None):
     logging.info(f"Updating asset {asset_id} with properties from {properties_file}")
+    url = f"https://api-{hostname}.overcasthq.com/v1/assets/{asset_id}/metadata"
+    headers = {
+        'x-api-key': api_key
+    }
+    logger.debug(f"URL :------------------------------------------->  {url}")
 
     metadata = {"fabric URL": backlink_url}
     parsed_metadata = parse_metadata_file(properties_file)
     metadata.update(parsed_metadata)
 
-    headers = {'x-api-key': api_key}
-    url = f"https://api-{hostname}.overcasthq.com/v1/assets/{asset_id}/metadata"
-
     for key, value in metadata.items():
-        payload = { "key": key, "value": value if value not in (None, '', [], {}) else "N/A" }
-        logging.debug(f"Sending: {payload}")
-        
-        try:
-            response = requests.post(url, headers=headers, data=payload)
-            if response.status_code in (200, 201):
-                logging.info(f"Uploaded: {key} = {value}")
-            else:
-                logging.error(f"Failed [{response.status_code}]: {response.text}")
-                return {"status_code": response.status_code, "detail": response.text}
-        except Exception as e:
-            logging.error(f"Request error for key '{key}': {e}")
-            return {"status_code": 500, "detail": str(e)}
+        value = value if value not in (None, '', [], {}) else "N/A"
+        payload = {"key": key, "value": value}
+        logging.debug(f"Sending metadata: {payload}")
 
-    logging.info("All metadata uploaded successfully.")
+        for attempt in range(3):
+            try:
+                response = make_request_with_retries("POST", url, headers=headers, data=payload)
+                if response and response.status_code in (200, 201):
+                    logging.info(f"Uploaded: {key} = {value}")
+                    break
+                else:
+                    if attempt == 2:
+                        logging.error(f"Failed to upload metadata '{key}': {response.status_code} {response.text}")
+                        return {"status_code": response.status_code, "detail": response.text}
+                    base_delay = [1, 3, 10][attempt]
+                    delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+                    time.sleep(delay)
+            except Exception as e:
+                if attempt == 2:
+                    logging.error(f"Request error for key '{key}': {e}")
+                    return {"status_code": 500, "detail": str(e)}
+                base_delay = [1, 3, 10][attempt]
+                delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+                time.sleep(delay)
+
     return {"status_code": 200, "detail": "Metadata uploaded successfully"}
 
 
-
-
 if __name__ == '__main__':
+    # Random delay to avoid thundering herd
+    time.sleep(random.uniform(0.0, 1.5))
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("-m", "--mode", required=True, help="mode of Operation proxy or original upload")
-    parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
-    parser.add_argument("-j", "--job-guid", help="Job Guid of SDNA job")
-    parser.add_argument("--parent-id", help="Optional parent folder ID to resolve relative upload paths from")
+    parser.add_argument("-m", "--mode", required=True, help="Mode: proxy, original, get_base_target, etc.")
+    parser.add_argument("-c", "--config-name", required=True, help="Name of cloud configuration")
+    parser.add_argument("-j", "--job-guid", help="Job GUID of SDNA job")
+    parser.add_argument("--parent-id", help="Optional parent folder ID for path resolution")
     parser.add_argument("-p", "--project-id", help="Project ID for OvercastHQ")
     parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
-    parser.add_argument("-sp", "--source-path", help="Source path of file to look for original upload")
-    parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
-    parser.add_argument("-up", "--upload-path", required=True, help="Path where file will be uploaded to Overcast HQ")
-    parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
-    parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
-    parser.add_argument("--log-level", default="debug", help="Logging level")
-    parser.add_argument("--resolved-upload-id", action="store_true", help="Pass if upload path is already resolved ID")
-    parser.add_argument("--controller-address",help="Link IP/Hostname Port")
+    parser.add_argument("-sp", "--source-path", help="Source file path for upload")
+    parser.add_argument("-mp", "--metadata-file", help="Path to metadata file (JSON/CSV/XML)")
+    parser.add_argument("-up", "--upload-path", required=True, help="Target path or ID in Overcast HQ")
+    parser.add_argument("-sl", "--size-limit", help="File size limit in MB for original upload")
+    parser.add_argument("--dry-run", action="store_true", help="Perform dry run without uploading")
+    parser.add_argument("--log-level", default="debug", help="Logging level (debug, info, warning, error)")
+    parser.add_argument("--resolved-upload-id", action="store_true", help="Treat upload-path as resolved folder ID")
+    parser.add_argument("--controller-address", help="Controller IP:Port override")
+
     args = parser.parse_args()
 
     setup_logging(args.log_level)
 
     mode = args.mode
     if mode not in VALID_MODES:
-        logging.error(f"Only allowed modes: {VALID_MODES}")
+        logging.error(f"Invalid mode. Use one of: {VALID_MODES}")
         sys.exit(1)
 
     cloud_config_path = get_cloud_config_path()
     if not os.path.exists(cloud_config_path):
-        logging.error(f"Missing cloud config: {cloud_config_path}")
+        logging.error(f"Cloud config not found: {cloud_config_path}")
         sys.exit(1)
 
     cloud_config = ConfigParser()
     cloud_config.read(cloud_config_path)
-    cloud_config_name = args.config_name
-    if cloud_config_name not in cloud_config:
-        logging.error(f"Missing cloud config section: {cloud_config_name}")
+    if args.config_name not in cloud_config:
+        logging.error(f"Cloud config section '{args.config_name}' not found.")
         sys.exit(1)
 
-    cloud_config_data = cloud_config[cloud_config_name]
+    cloud_config_data = cloud_config[args.config_name]
 
+    # Resolve project ID
     if args.project_id:
         project_id = args.project_id
     elif "project_id" in cloud_config_data:
         project_id = cloud_config_data["project_id"]
     else:
         project_id = get_first_project(cloud_config_data)
-    logging.debug(f"Project id ----------------------->{project_id}")
+        if not project_id:
+            logging.error("Could not retrieve project ID from OvercastHQ.")
+            sys.exit(1)
 
     if not cloud_config_data.get('hostname'):
         cloud_config_data['hostname'] = "keycode"
-    
-    if mode == "get_base_target":
-        upload_path = args.upload_path
-        if not upload_path:
-            logging.error("Upload path must be provided for get_base_target mode")
-            sys.exit(1)
 
-        logging.info(f"Fetching upload target ID for path: {upload_path}")
-        
+    logging.info(f"Starting OvercastHQ upload process in {mode} mode")
+    logging.debug(f"Using cloud config: {cloud_config_path}")
+    logging.debug(f"Project ID: {project_id}")
+    logging.debug(f"Source path: {args.source_path}")
+    logging.debug(f"Upload path: {args.upload_path}")
+
+    if mode == "get_base_target":
         if args.resolved_upload_id:
             print(args.upload_path)
             sys.exit(0)
 
-        logging.info(f"Fetching upload target ID for path: {upload_path}")
-        base_id = args.parent_id or None
-        up_id = get_folder_id(cloud_config_data, upload_path, base_id) if '/' in upload_path else upload_path
-        print(up_id)
-        sys.exit(0)
+        try:
+            base_id = args.parent_id or None
+            folder_id = get_folder_id(cloud_config_data, args.upload_path, base_id)
+            if not folder_id:
+                logging.error("Failed to resolve folder ID for get_base_target.")
+                sys.exit(1)
+            print(folder_id)
+            sys.exit(0)
+        except Exception as e:
+            logging.critical(f"Failed to resolve upload target: {e}")
+            sys.exit(1)
 
-    logging.info(f"Starting OvercastHQ upload process in {mode} mode")
-    logging.debug(f"Using cloud config: {cloud_config_path}")
-    logging.debug(f"Source path: {args.source_path}")
-    logging.debug(f"Upload path: {args.upload_path}")
-    
-    logging.info(f"Initialized OvercastHQ client for project: {project_id}")
-    
+    # Validate source file
     matched_file = args.source_path
-    catalog_path = args.catalog_path
-    file_name_for_url = extract_file_name(matched_file) if mode == "original" else extract_file_name(catalog_path)
-
-    if not os.path.exists(matched_file):
-        logging.error(f"File not found: {matched_file}")
+    if not matched_file or not os.path.exists(matched_file):
+        logging.error(f"Source file not found: {matched_file}")
         sys.exit(4)
 
-    matched_file_size = os.stat(matched_file).st_size
-    file_size_limit = args.size_limit
-    if mode == "original" and file_size_limit:
+    # Size limit check
+    if mode == "original" and args.size_limit:
         try:
-            size_limit_bytes = float(file_size_limit) * 1024 * 1024
-            if matched_file_size > size_limit_bytes:
-                logging.error(f"File too large: {matched_file_size / (1024 * 1024):.2f} MB > limit of {file_size_limit} MB")
+            limit_bytes = float(args.size_limit) * 1024 * 1024
+            file_size = os.path.getsize(matched_file)
+            if file_size > limit_bytes:
+                logging.error(f"File too large: {file_size / 1024 / 1024:.2f} MB > {args.size_limit} MB")
                 sys.exit(4)
-        except Exception as e:
-            logging.warning(f"Could not validate size limit: {e}")
+        except (ValueError, TypeError):
+            logging.warning(f"Invalid size limit format: {args.size_limit}")
 
-    catalog_path = remove_file_name_from_path(catalog_path)
-    normalized_path = catalog_path.replace("\\", "/")
-    if "/1/" in normalized_path:
-        relative_path = normalized_path.split("/1/", 1)[-1]
-    else:
-        relative_path = normalized_path
-    catalog_url = urllib.parse.quote(relative_path)
+    # Prepare backlink URL
+    catalog_path = args.catalog_path or matched_file
+    file_name_for_url = extract_file_name(matched_file) if mode == "original" else extract_file_name(catalog_path)
+    rel_path = remove_file_name_from_path(catalog_path).replace("\\", "/")
+    rel_path = rel_path.split("/1/", 1)[-1] if "/1/" in rel_path else rel_path
+    catalog_url = urllib.parse.quote(rel_path)
     filename_enc = urllib.parse.quote(file_name_for_url)
-    job_guid = args.job_guid
+    job_guid = args.job_guid or ""
 
-    if args.controller_address is not None and len(args.controller_address.split(":")) == 2:
-        client_ip, client_port = args.controller_address.split(":")
+    # Resolve controller address
+    if args.controller_address and ":" in args.controller_address:
+        client_ip, _ = args.controller_address.split(":", 1)
     else:
-        client_ip, client_port = get_link_address_and_port()
+        ip, _ = get_link_address_and_port()
+        client_ip = ip
 
     backlink_url = f"https://{client_ip}/dashboard/projects/{job_guid}/browse&search?path={catalog_url}&filename={filename_enc}"
-    logging.debug(f"Generated dashboard URL: {backlink_url}")
+    logging.debug(f"Generated backlink URL: {backlink_url}")
 
     if args.dry_run:
         logging.info("[DRY RUN] Upload skipped.")
-        logging.info(f"[DRY RUN] File to upload: {matched_file}")
+        logging.info(f"[DRY RUN] File: {matched_file}")
         logging.info(f"[DRY RUN] Upload path: {args.upload_path} => Overcast HQ")
-        meta_file = args.metadata_file
-        if meta_file:
-            logging.info(f"[DRY RUN] Metadata would be applied from: {meta_file}")
+        if args.metadata_file:
+            logging.info(f"[DRY RUN] Metadata will be applied from: {args.metadata_file}")
         else:
-            logging.warning("[DRY RUN] Metadata upload enabled but no metadata file specified.")
+            logging.warning("[DRY RUN] No metadata file specified.")
         sys.exit(0)
 
-    logging.info(f"Starting upload process to Overcast HQ")
-    upload_path = args.upload_path
-
-    if args.resolved_upload_id:
-        folder_id = upload_path
-    else:
-        folder_id = get_folder_id(cloud_config_data, upload_path)
-    logging.debug(f"Folder ID check -------------------------> {folder_id}")
-
-    response, status_code = create_asset(cloud_config_data, project_id, folder_id, args.source_path)
-    if status_code not in (200, 201):
-        print(f"Failed to create asset: {response.status_code} {response.text}")
+    # Resolve folder ID
+    try:
+        folder_id = args.upload_path if args.resolved_upload_id else get_folder_id(cloud_config_data, args.upload_path)
+        if not folder_id:
+            logging.error("Failed to resolve upload folder ID.")
+            sys.exit(1)
+        logging.info(f"Resolved upload folder ID: {folder_id}")
+    except Exception as e:
+        logging.critical(f"Folder resolution failed: {e}")
         sys.exit(1)
-    parsed_response = response.json()
-    asset_id = parsed_response['result']['uuid']
-    logging.info(f"Asset upload Initiated. Asset id: {asset_id}")
 
-    multipart_upload_to_s3(parsed_response['result'], cloud_config_data, args.source_path)
-    logging.info(f"asset upload completed")
+    # Create asset
+    try:
+        response, status_code = create_asset(cloud_config_data, project_id, folder_id, matched_file)
+        if status_code not in (200, 201):
+            logging.error(f"Asset creation failed: {status_code} {response.text if response else 'No response'}")
+            sys.exit(1)
 
-    meta_file = args.metadata_file
-    logging.info("Applying metadata to uploaded asset...")
-
-    response = upload_metadata_to_asset(cloud_config_data['hostname'] ,cloud_config_data['api_key'], backlink_url, asset_id, meta_file)
-    if response['status_code']  != 200:
-        print(f"Failed to upload file parts: {response['detail']}")
+        parsed = response.json()
+        asset_id = parsed["result"]["uuid"]
+        logging.info(f"Asset created successfully. Asset ID: {asset_id}")
+    except Exception as e:
+        logging.critical(f"Failed to create asset: {e}")
         sys.exit(1)
-    else:
-        logging.info("All parts uploaded successfully to Overcast HQ")
-        
+
+    # Upload file parts
+    try:
+        multipart_upload_to_s3(parsed["result"], cloud_config_data, matched_file)
+        logging.info("File upload completed successfully.")
+    except Exception as e:
+        logging.critical(f"File upload failed: {e}")
+        sys.exit(1)
+
+    # Upload metadata
+    try:
+        meta_response = upload_metadata_to_asset(
+            hostname=cloud_config_data['hostname'],
+            api_key=cloud_config_data['api_key'],
+            backlink_url=backlink_url,
+            asset_id=asset_id,
+            properties_file=args.metadata_file
+        )
+        if meta_response["status_code"] != 200:
+            logging.error(f"Metadata upload failed: {meta_response['detail']}")
+            print("File uploaded, but metadata failed.")
+            # Don't exit with error — file is uploaded
+        else:
+            logging.info("Metadata uploaded successfully.")
+    except Exception as e:
+        logging.warning(f"Metadata upload encountered error: {e}")
+
+    logging.info("OvercastHQ upload process completed.")
     sys.exit(0)

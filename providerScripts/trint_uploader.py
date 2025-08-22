@@ -3,14 +3,17 @@ import sys
 import json
 import argparse
 import logging
-import urllib.parse
+import plistlib
+import xml.etree.ElementTree as ET
+from configparser import ConfigParser
 from urllib.parse import urlencode
 import magic
+import random
+import time
 import requests
+from requests.adapters import HTTPAdapter
 from requests.auth import HTTPBasicAuth
-from configparser import ConfigParser
-import plistlib
-from pathlib import Path
+from requests.exceptions import RequestException, SSLError, ConnectionError, Timeout
 
 # Constants
 VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet"]
@@ -77,8 +80,47 @@ def get_link_address_and_port():
     logging.info(f"Server connection details - Address: {ip}, Port: {port}")
     return ip, port
 
+def get_retry_session(retries=3, backoff_factor_range=(1.0, 2.0)):
+    session = requests.Session()
+    # handling retry delays manually via backoff in the range
+    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+def make_request_with_retries(method, url, **kwargs):
+    session = get_retry_session()
+    last_exception = None
+
+    for attempt in range(3):  # Max 3 attempts
+        try:
+            response = session.request(method, url, timeout=(10, 30), **kwargs)
+            if response.status_code < 500:
+                return response
+            else:
+                logging.warning(f"Received {response.status_code} from {url}. Retrying...")
+        except (SSLError, ConnectionError, Timeout) as e:
+            last_exception = e
+            if attempt < 2:  # Only sleep if not last attempt
+                base_delay = [1, 3, 10][attempt]
+                jitter = random.uniform(0, 1)
+                delay = base_delay + jitter * ([1, 1, 5][attempt])  # e.g., 1-2, 3-4, 10-15
+                logging.warning(f"Attempt {attempt + 1} failed due to {type(e).__name__}: {e}. "
+                                f"Retrying in {delay:.2f}s...")
+                time.sleep(delay)
+            else:
+                logging.error(f"All retry attempts failed for {url}. Last error: {e}")
+        except RequestException as e:
+            logging.error(f"Request failed: {e}")
+            raise
+
+    if last_exception:
+        raise last_exception
+    return None  # Should not reach here
+
 def create_folder(config_data, folder_name, parent_id=None):
     url = f"{config_data['base_url']}/folders/"
+    logger.debug(f"URL :------------------------------------------->  {url}")
     headers = {"accept": "application/json", "content-type": "application/json"}
 
     payload = {"name": folder_name}
@@ -87,38 +129,62 @@ def create_folder(config_data, folder_name, parent_id=None):
     if config_data.get("workspace_id"):
         payload["workspaceId"] = config_data["workspace_id"]
 
-    logging.debug(f"Creating folder '{folder_name}' with parent ID: {parent_id}")
+    logging.debug(f"data payload (form-data) -------------------------> {payload}")
 
-    response = requests.post(
-        url,
-        auth=HTTPBasicAuth(config_data['api_key_id'], config_data['api_key_secret']),
-        headers=headers,
-        data=json.dumps(payload)
-    )
-
-    if response.status_code not in (200, 201):
-        logging.error(f"Create folder failed '{folder_name}': {response.text}")
-        raise Exception(f"Failed to create folder '{folder_name}': {response.text}")
-
-    folder_data = response.json()
-    logging.info(f"Created folder '{folder_name}': {folder_data}")
-    return folder_data
+    for attempt in range(3):
+        try:
+            response = requests.post(
+                url,
+                auth=HTTPBasicAuth(config_data['api_key_id'], config_data['api_key_secret']),
+                headers=headers,
+                data=json.dumps(payload),
+                timeout=(10, 30)
+            )
+            if response.status_code in (200, 201):
+                folder_data = response.json()
+                logging.info(f"Created folder '{folder_name}': {folder_data['_id']}")
+                return folder_data
+            else:
+                logging.error(f"Create folder failed '{folder_name}': {response.status_code} {response.text}")
+                if attempt == 2:
+                    return None
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to create folder '{folder_name}' after 3 attempts: {e}")
+                return None
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return None
 
 def list_all_folders(config_data):
     base_url = f"{config_data['base_url']}/folders/"
     params = {"workspace-id": config_data["workspace_id"]} if config_data.get("workspace_id") else {}
     url = f"{base_url}?{urlencode(params)}" if params else base_url
+    logger.debug(f"URL :------------------------------------------->  {url}")
 
-    response = requests.get(
-        url,
-        auth=HTTPBasicAuth(config_data['api_key_id'], config_data['api_key_secret']),
-        headers={"accept": "application/json"}
-    )
-    if response.status_code not in (200, 201):
-        logging.error(f"Listing folders failed: {response.text}")
-        raise Exception(f"Could not list folders: {response.text}")
-
-    return response.json()
+    for attempt in range(3):
+        try:
+            response = requests.get(
+                url,
+                auth=HTTPBasicAuth(config_data['api_key_id'], config_data['api_key_secret']),
+                headers={"accept": "application/json"},
+                timeout=(10, 30)
+            )
+            if response.status_code in (200, 201):
+                return response.json()
+            else:
+                logging.error(f"List folders failed: {response.status_code} {response.text}")
+                if attempt == 2:
+                    return []
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to list folders after 3 attempts: {e}")
+                return []
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return []
 
 def get_folder_id(config_data, upload_path, base_id=None):
     upload_path = upload_path.strip("/")
@@ -172,23 +238,18 @@ def get_folder_id(config_data, upload_path, base_id=None):
 def create_asset(config_data, file_path, folder_id=None, workspace_id=None, language="en"):
     key_id = config_data.get("api_key_id")
     key_secret = config_data.get("api_key_secret")
-    base_upload_url = config_data.get("upload_url") or "https://upload.trint.com"
+    base_upload_url = (config_data.get("upload_url") or "https://upload.trint.com").strip()
 
     file_name = os.path.basename(file_path)
-
-    # Detect MIME type using python-magic
     mime_type = magic.from_file(file_path, mime=True)
     if not mime_type:
-        raise ValueError("Could not detect MIME type of file")
+        logging.critical(f"Could not detect MIME type for '{file_name}'")
+        return None, 400
 
-    logger.info(f"Detected MIME type for '{file_name}': {mime_type}")
+    url = base_upload_url
+    logger.debug(f"URL :------------------------------------------->  {url}")
 
-    # Prepare form fields
-    data = {
-        "filename": file_name,
-        "language": language
-    }
-
+    data = {"filename": file_name, "language": language}
     if folder_id:
         data["folder-id"] = folder_id
 
@@ -197,119 +258,118 @@ def create_asset(config_data, file_path, folder_id=None, workspace_id=None, lang
     if workspace_id:
         params["workspace-id"] = workspace_id
 
-    # Upload file using multipart/form-data
-    with open(file_path, "rb") as file_data:
-        files = {
-            "file": (file_name, file_data, mime_type)
-        }
+    files = {"file": (file_name, open(file_path, "rb"), mime_type)}
 
-        logger.info(f"Uploading file '{file_name}' to Trint...")
-        logger.debug(f"Upload URL: {base_upload_url}")
-        logger.debug(f"Form Data: {data}")
-        logger.debug(f"Query Params: {params}")
+    for attempt in range(3):
+        try:
+            with open(file_path, "rb") as f:
+                files = {"file": (file_name, f, mime_type)}
+                logging.info(f"Uploading file '{file_name}' to Trint...")
+                response = requests.post(
+                    url,
+                    auth=HTTPBasicAuth(key_id, key_secret),
+                    data=data,
+                    files=files,
+                    params=params,
+                    timeout=(10, 60)
+                )
 
-        response = requests.post(
-            base_upload_url,
-            auth=HTTPBasicAuth(key_id, key_secret),
-            data=data,
-            files=files,
-            params=params
-        )
-
-    if response.status_code == 200:
-        logger.info("Upload successful.")
-        logger.debug(f"Response: {response.json()}")
-    else:
-        logger.error(f"Upload failed with status: {response.status_code}")
-        logger.error(f"Response: {response.text}")
-    return response, response.status_code
+            if response.status_code == 200:
+                logging.info("Upload successful.")
+                logging.debug(f"Response: {response.text}")
+                return response, 200
+            else:
+                logging.error(f"Upload failed: {response.status_code} {response.text}")
+                if attempt == 2:
+                    return response, response.status_code
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Upload failed after 3 attempts: {e}")
+                return None, 500
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+        finally:
+            if 'f' in locals() and not f.closed:
+                f.close()
+    return None, 500
 
 if __name__ == '__main__':
+    # Random delay to avoid thundering herd
+    time.sleep(random.uniform(0.0, 1.5))
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("-m", "--mode", help="mode of Operation proxy or original upload")
-    parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
-    parser.add_argument("-j", "--job-guid", help="Job Guid of SDNA job")
-    parser.add_argument("--parent-id", help="Optional parent folder ID to resolve relative upload paths from")
-    parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
-    parser.add_argument("-sp", "--source-path", help="Source path of file to look for original upload")
-    parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
-    parser.add_argument("-up", "--upload-path", required=True, help="Path where file will be uploaded to Trint")
-    parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
-    parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
-    parser.add_argument("--log-level", default="debug", help="Logging level")
-    parser.add_argument("--resolved-upload-id", action="store_true", help="Pass if upload path is already resolved ID")
-    parser.add_argument("--controller-address",help="Link IP/Hostname Port")
+    parser.add_argument("-m", "--mode", required=True, help="Mode: proxy, original, get_base_target, etc.")
+    parser.add_argument("-c", "--config-name", required=True, help="Cloud config name")
+    parser.add_argument("-j", "--job-guid", help="Job GUID")
+    parser.add_argument("--parent-id", help="Parent folder ID")
+    parser.add_argument("-cp", "--catalog-path", help="Catalog path")
+    parser.add_argument("-sp", "--source-path", help="Source file path")
+    parser.add_argument("-mp", "--metadata-file", help="Metadata file path")
+    parser.add_argument("-up", "--upload-path", required=True, help="Upload path or ID")
+    parser.add_argument("-sl", "--size-limit", help="Size limit in MB")
+    parser.add_argument("--dry-run", action="store_true", help="Dry run")
+    parser.add_argument("--log-level", default="debug", help="Log level")
+    parser.add_argument("--resolved-upload-id", action="store_true", help="Upload path is already resolved ID")
+    parser.add_argument("--controller-address", help="Controller IP:Port")
+
     args = parser.parse_args()
 
     setup_logging(args.log_level)
 
     mode = args.mode
     if mode not in VALID_MODES:
-        logging.error(f"Only allowed modes: {VALID_MODES}")
+        logging.error(f"Invalid mode. Use one of: {VALID_MODES}")
         sys.exit(1)
 
     cloud_config_path = get_cloud_config_path()
     if not os.path.exists(cloud_config_path):
-        logging.error(f"Missing cloud config: {cloud_config_path}")
+        logging.error(f"Cloud config not found: {cloud_config_path}")
         sys.exit(1)
 
     cloud_config = ConfigParser()
     cloud_config.read(cloud_config_path)
-    cloud_config_name = args.config_name
-    if cloud_config_name not in cloud_config:
-        logging.error(f"Missing cloud config section: {cloud_config_name}")
+    if args.config_name not in cloud_config:
+        logging.error(f"Config '{args.config_name}' not found.")
         sys.exit(1)
 
-    cloud_config_data = cloud_config[cloud_config_name]
-        
-    if mode == "get_base_target":
-        upload_path = args.upload_path
-        if not upload_path:
-            logging.error("Upload path must be provided for get_base_target mode")
-            sys.exit(1)
+    cloud_config_data = cloud_config[args.config_name]
+    if not cloud_config_data.get("base_url"):
+        cloud_config_data["base_url"] = cloud_config_data.get("domain", "https://api.trint.com").strip()
 
-        logging.info(f"Fetching upload target ID for path: {upload_path}")
-        
-        if args.resolved_upload_id:
-            print(args.upload_path)
-            sys.exit(0)
-
-        logging.info(f"Fetching upload target ID for path: {upload_path}")
-        base_id = args.parent_id or None
-        up_id = get_folder_id(cloud_config_data, args.upload_path, base_id) if '/' in upload_path else upload_path
-        print(up_id)
-        sys.exit(0)
-    
     logging.info(f"Starting Trint upload process in {mode} mode")
     logging.debug(f"Using cloud config: {cloud_config_path}")
     logging.debug(f"Source path: {args.source_path}")
     logging.debug(f"Upload path: {args.upload_path}")
-    
-    matched_file = args.source_path
-    catalog_path = args.catalog_path
-    file_name_for_url = extract_file_name(matched_file) if mode == "original" else extract_file_name(catalog_path)
 
+    if mode == "get_base_target":
+        if args.resolved_upload_id:
+            print(args.upload_path)
+            sys.exit(0)
+
+        folder_id = get_folder_id(cloud_config_data, args.upload_path, base_id=args.parent_id)
+        if not folder_id:
+            logging.error("Failed to resolve upload target folder ID.")
+            sys.exit(1)
+
+        print(folder_id)
+        sys.exit(0)
+
+    matched_file = args.source_path
     if not os.path.exists(matched_file):
         logging.error(f"File not found: {matched_file}")
         sys.exit(4)
 
-    matched_file_size = os.stat(matched_file).st_size
-    file_size_limit = args.size_limit
-    if mode == "original" and file_size_limit:
-        try:
-            size_limit_bytes = float(file_size_limit) * 1024 * 1024
-            if matched_file_size > size_limit_bytes:
-                logging.error(f"File too large: {matched_file_size / (1024 * 1024):.2f} MB > limit of {file_size_limit} MB")
-                sys.exit(4)
-        except Exception as e:
-            logging.warning(f"Could not validate size limit: {e}")
+    matched_file_size = os.path.getsize(matched_file)
 
-    catalog_path = remove_file_name_from_path(args.catalog_path)
-    normalized_path = catalog_path.replace("\\", "/")
-    if "/1/" in normalized_path:
-        relative_path = normalized_path.split("/1/", 1)[-1]
-    else:
-        relative_path = normalized_path
+    if args.size_limit and mode == "original":
+        try:
+            limit_mb = float(args.size_limit)
+            if matched_file_size > limit_mb * 1024 * 1024:
+                logging.error(f"File too large: {matched_file_size / 1024 / 1024:.2f} MB > {limit_mb} MB")
+                sys.exit(4)
+        except ValueError:
+            logging.warning("Invalid size limit format.")
 
     if args.dry_run:
         logging.info("[DRY RUN] Upload skipped.")
@@ -322,27 +382,41 @@ if __name__ == '__main__':
             logging.warning("[DRY RUN] Metadata upload enabled but no metadata file specified.")
         sys.exit(0)
 
-    logging.info(f"Starting upload process to Trint")
-    upload_path = args.upload_path
-
-    if args.resolved_upload_id:
-        folder_id = upload_path
-    else:
-        folder_id = get_folder_id(cloud_config_data, args.upload_path)
-    logging.debug(f"Folder ID check -------------------------> {folder_id}")
-
-    workspace_id = cloud_config_data.get("workspace_id") if "workspace_id" in cloud_config_data else None
-    asset, creation_status = create_asset(
-        cloud_config_data,
-        args.source_path,
-        folder_id,
-        workspace_id=workspace_id
-    )
-    response = asset.json() if isinstance(asset, requests.Response) else asset
-    if creation_status in [200, 201] and 'trintId' in response:
-        logging.info(f"asset upload completed ==============================> {response['trintId']}")
-        sys.exit(0)
-    else:
-        logging.error("Asset upload failed or 'trintId' not found in response.")
-        print(f"Error Details: {asset.text}")
+    # Resolve upload folder
+    try:
+        folder_id = args.upload_path if args.resolved_upload_id else get_folder_id(cloud_config_data, args.upload_path, base_id=args.parent_id)
+        if not folder_id:
+            logging.error("Failed to resolve upload folder ID.")
+            sys.exit(1)
+        logging.info(f"Upload location ID: {folder_id}")
+    except Exception as e:
+        logging.critical(f"Folder resolution failed: {e}")
         sys.exit(1)
+
+    # Upload asset
+    try:
+        workspace_id = cloud_config_data.get("workspace_id")
+        response, status_code = create_asset(
+            config_data=cloud_config_data,
+            file_path=matched_file,
+            folder_id=folder_id,
+            workspace_id=workspace_id
+        )
+        if status_code == 200 and isinstance(response, requests.Response):
+            resp_json = response.json()
+            trint_id = resp_json.get("trintId")
+            if trint_id:
+                logging.info(f"asset upload completed ==============================> {trint_id}")
+                sys.exit(0) 
+            else:
+                logging.error("Upload succeeded but 'trintId' missing in response.")
+                sys.exit(1)
+        else:
+            error_detail = response.text if isinstance(response, requests.Response) else "No response"
+            logging.error(f"Upload failed: {error_detail}")
+            sys.exit(1)
+    except Exception as e:
+        logging.critical(f"Upload failed due to unexpected error: {e}")
+        sys.exit(1)
+
+sys.exit(0)         

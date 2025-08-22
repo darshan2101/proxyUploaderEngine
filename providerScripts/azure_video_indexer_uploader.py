@@ -6,7 +6,10 @@ import argparse
 import logging
 import plistlib
 import urllib.parse
-import requests
+import time
+import random
+from requests.adapters import HTTPAdapter
+from requests.exceptions import RequestException, SSLError, ConnectionError, Timeout
 import plistlib
 from configparser import ConfigParser
 from datetime import datetime
@@ -27,17 +30,22 @@ VALID_MODES = [
 API_VERSION = "2024-01-01"
 API_ENDPOINT = "https://api.videoindexer.ai"
 AZURE_RESOURCE_MANAGER = "https://management.azure.com"
-
-# Platform detection
-IS_LINUX = True  # Change if needed
-LINUX_CONFIG_PATH = r"D:\Dev\(python +node) Wrappers\proxyUploaderEngine\extra\Test\DNAClientServices.conf"
+LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
-SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if IS_LINUX else "/Library/Preferences/com.storagedna.Servers.plist"
+SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
+CONFLICT_RESOLUTION_MODES = ["skip", "overwrite", "reindex"]
+DEFAULT_CONFLICT_RESOLUTION = "skip"
+
+# Detect platform
+IS_LINUX = True # os.path.isdir("/opt/sdna/bin")
 DNA_CLIENT_SERVICES = LINUX_CONFIG_PATH if IS_LINUX else MAC_CONFIG_PATH
 
 # Initialize logger
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
-logger = logging.getLogger(__name__)
+logger = logging.getLogger()
+def setup_logging(level):
+    numeric_level = getattr(logging, level.upper(), logging.DEBUG)
+    logging.basicConfig(level=numeric_level, format='%(asctime)s %(levelname)s: %(message)s')
+    logging.info(f"Log level set to: {level.upper()}")
 
 
 # =============================
@@ -139,6 +147,44 @@ def parse_metadata_file(properties_file):
 
     return props
 
+def get_retry_session(retries=3, backoff_factor_range=(1.0, 2.0)):
+    session = requests.Session()
+    # handling retry delays manually via backoff in the range
+    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+def make_request_with_retries(method, url, **kwargs):
+    session = get_retry_session()
+    last_exception = None
+
+    for attempt in range(3):  # Max 3 attempts
+        try:
+            response = session.request(method, url, timeout=(10, 30), **kwargs)
+            if response.status_code < 500:
+                return response
+            else:
+                logging.warning(f"Received {response.status_code} from {url}. Retrying...")
+        except (SSLError, ConnectionError, Timeout) as e:
+            last_exception = e
+            if attempt < 2:  # Only sleep if not last attempt
+                base_delay = [1, 3, 10][attempt]
+                jitter = random.uniform(0, 1)
+                delay = base_delay + jitter * ([1, 1, 5][attempt])  # e.g., 1-2, 3-4, 10-15
+                logging.warning(f"Attempt {attempt + 1} failed due to {type(e).__name__}: {e}. "
+                                f"Retrying in {delay:.2f}s...")
+                time.sleep(delay)
+            else:
+                logging.error(f"All retry attempts failed for {url}. Last error: {e}")
+        except RequestException as e:
+            logging.error(f"Request failed: {e}")
+            raise
+
+    if last_exception:
+        raise last_exception
+    return None  # Should not reach here
+
 # =============================
 # Dataclass: Consts
 # =============================
@@ -165,7 +211,6 @@ class Consts:
 # =============================
 
 def get_arm_access_token(consts: Consts) -> str:
-    """Get ARM token using client credentials"""
     url = f"https://login.microsoftonline.com/{consts.tenant_id}/oauth2/v2.0/token"
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
     data = {
@@ -174,13 +219,26 @@ def get_arm_access_token(consts: Consts) -> str:
         "scope": f"{AZURE_RESOURCE_MANAGER}/.default",
         "grant_type": "client_credentials"
     }
-    resp = requests.post(url, data=data, headers=headers)
-    resp.raise_for_status()
-    return resp.json()["access_token"]
+    logger.debug(f"URL :------------------------------------------->  {url}")
 
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("POST", url, headers=headers, data=data)
+            if response and response.status_code == 200:
+                return response.json()["access_token"]
+            else:
+                if attempt == 2:
+                    raise RuntimeError(f"ARM token fetch failed: {response.status_code} {response.text}")
+        except Exception as e:
+            if attempt == 2:
+                logger.critical(f"Failed to get ARM token after 3 attempts: {e}")
+                raise
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    raise RuntimeError("get_arm_access_token failed")
 
 def get_account_access_token_async(consts: Consts, arm_access_token: str, permission_type='Contributor', scope='Account', video_id=None) -> str:
-    """Get Video Indexer account access token"""
     url = (
         f"{AZURE_RESOURCE_MANAGER}/subscriptions/{consts.SubscriptionId}"
         f"/resourceGroups/{consts.ResourceGroup}/providers/Microsoft.VideoIndexer/accounts/{consts.AccountName}"
@@ -190,17 +248,29 @@ def get_account_access_token_async(consts: Consts, arm_access_token: str, permis
         "Authorization": f"Bearer {arm_access_token}",
         "Content-Type": "application/json"
     }
-    payload = {
-        "permissionType": permission_type,
-        "scope": scope
-    }
+    payload = {"permissionType": permission_type, "scope": scope}
     if video_id:
         payload["videoId"] = video_id
 
-    resp = requests.post(url, json=payload, headers=headers)
-    resp.raise_for_status()
-    return resp.json()["accessToken"]
+    logger.debug(f"URL :------------------------------------------->  {url}")
+    logger.debug(f"Payload -------------------------> {payload}")
 
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("POST", url, json=payload, headers=headers)
+            if response and response.status_code == 200:
+                return response.json()["accessToken"]
+            else:
+                if attempt == 2:
+                    raise RuntimeError(f"VI token fetch failed: {response.status_code} {response.text}")
+        except Exception as e:
+            if attempt == 2:
+                logger.critical(f"Failed to get VI token after 3 attempts: {e}")
+                raise
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    raise RuntimeError("get_account_access_token_async failed")
 
 # =============================
 # VideoIndexerClient Class
@@ -221,7 +291,6 @@ class VideoIndexerClient:
         logger.info("Authentication successful.")
 
     def get_account(self):
-        """Get account details (accountId, location)"""
         if self.account:
             return self.account
 
@@ -231,11 +300,151 @@ class VideoIndexerClient:
             f"/resourceGroups/{self.consts.ResourceGroup}/providers/Microsoft.VideoIndexer/accounts/{self.consts.AccountName}"
             f"?api-version={API_VERSION}"
         )
-        resp = requests.get(url, headers=headers)
-        resp.raise_for_status()
-        self.account = resp.json()
-        logger.info(f"[Account] ID: {self.account['properties']['accountId']}, Location: {self.account['location']}")
-        return self.account
+        logger.debug(f"URL :------------------------------------------->  {url}")
+
+        for attempt in range(3):
+            try:
+                response = make_request_with_retries("GET", url, headers=headers)
+                if response and response.status_code == 200:
+                    self.account = response.json()
+                    logger.info(f"[Account] ID: {self.account['properties']['accountId']}, Location: {self.account['location']}")
+                    return self.account
+                else:
+                    if attempt == 2:
+                        raise RuntimeError(f"Account fetch failed: {response.status_code} {response.text}")
+            except Exception as e:
+                if attempt == 2:
+                    logger.critical(f"Failed to get account after 3 attempts: {e}")
+                    raise
+                base_delay = [1, 3, 10][attempt]
+                delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+                time.sleep(delay)
+        raise RuntimeError("get_account failed")
+
+    def list_videos(self, partition: str = None) -> list:
+        self.get_account()
+
+        videos = []
+        skip = 0
+        page_size = 1000  # Max allowed
+        location = self.account['location']
+        account_id = self.account['properties']['accountId']
+
+        logger.info(f"Fetching videos from Azure Video Indexer (Partition: {partition or 'All'})")
+
+        while True:
+            url = f"{API_ENDPOINT}/{location}/Accounts/{account_id}/Videos"
+            params = {
+                "accessToken": self.vi_access_token,
+                "pageSize": page_size,
+                "skip": skip
+            }
+            if partition:
+                params["partitions"] = json.dumps([partition])
+
+            logger.debug(f"URL :------------------------------------------->  {url}")
+            logger.debug(f"Query params -------------------------> {params}")
+
+            # Outer retry loop (3 attempts per page)
+            response = None
+            for attempt in range(3):
+                try:
+                    response = make_request_with_retries("GET", url, params=params, timeout=(10, 30))
+                    if response and response.status_code == 200:
+                        break
+                    else:
+                        if attempt == 2:
+                            if response:
+                                raise RuntimeError(f"List videos failed: {response.status_code} {response.text}")
+                            else:
+                                raise RuntimeError("No response from server")
+                except Exception as e:
+                    if attempt == 2:
+                        logger.critical(f"Failed to fetch page (skip={skip}) after 3 attempts: {e}")
+                        raise
+                    base_delay = [1, 3, 10][attempt]
+                    delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+                    time.sleep(delay)
+
+            if not response or response.status_code != 200:
+                logger.error("Final response failed")
+                raise RuntimeError("Failed to fetch video list")
+
+            data = response.json()
+            page_results = data.get("results", [])
+            videos.extend(page_results)
+            logger.debug(f"Fetched {len(page_results)} videos (skip={skip}, total so far={len(videos)})")
+
+            # Check for nextPage
+            next_page = data.get("nextPage", {})
+            if next_page.get("done", True):
+                break
+
+            skip = next_page.get("skip", skip + page_size)
+            # Optional: Validate consistency
+            if skip <= 0 or skip >= next_page.get("totalCount", 0):
+                break
+
+        return videos
+
+    def delete_video(self, video_id: str) -> bool:
+        self.get_account()
+        url = (
+            f"{API_ENDPOINT}/{self.account['location']}/"
+            f"Accounts/{self.account['properties']['accountId']}/Videos/{video_id}"
+        )
+        params = {"accessToken": self.vi_access_token}
+        logger.debug(f"URL :------------------------------------------->  {url}")
+
+        for attempt in range(3):
+            try:
+                response = make_request_with_retries("DELETE", url, params=params)
+                if response and response.status_code in (200, 204):
+                    logger.info(f"✅ Deleted existing video: {video_id}")
+                    return True
+                elif response and response.status_code == 404:
+                    logger.info(f"Video {video_id} not found (already deleted)")
+                    return True
+                else:
+                    if attempt == 2:
+                        logger.error(f"Delete failed: {response.status_code} {response.text}")
+                        return False
+            except Exception as e:
+                if attempt == 2:
+                    logger.critical(f"Failed to delete video {video_id}: {e}")
+                    return False
+                base_delay = [1, 3, 10][attempt]
+                delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+                time.sleep(delay)
+        return False
+
+    def reindex_video(self, video_id: str) -> bool:
+        self.get_account()
+        url = (
+            f"{API_ENDPOINT}/{self.account['location']}/"
+            f"Accounts/{self.account['properties']['accountId']}/Videos/{video_id}/ReIndex"
+        )
+        params = {"accessToken": self.vi_access_token, "sendSuccessEmail": "false"}
+        logger.debug(f"URL :------------------------------------------->  {url}")
+
+        for attempt in range(3):
+            try:
+                response = make_request_with_retries("PUT", url, params=params)
+                if response and response.status_code in (200, 204):
+                    logger.info(f"🔄 Reindex triggered for video: {video_id}")
+                    return True
+                else:
+                    if attempt == 2:
+                        logger.error(f"Reindex failed: {response.status_code} {response.text}")
+                        return False
+            except Exception as e:
+                if attempt == 2:
+                    logger.critical(f"Failed to reindex video {video_id}: {e}")
+                    return False
+                base_delay = [1, 3, 10][attempt]
+                delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+                time.sleep(delay)
+        return False
 
     def file_upload_async(
         self,
@@ -275,24 +484,52 @@ class VideoIndexerClient:
         }
 
         if excluded_ai:
-            params["excludedAI"] = excluded_ai
+            params["excludedAI"] = ",".join(excluded_ai)
 
-        # Only add metadata if not empty
         if metadata:
             params["metadata"] = json.dumps(metadata, ensure_ascii=False)
 
         logger.info(f"Uploading '{video_name}'...")
-        with open(media_path, 'rb') as f:
-            files = {'file': (video_name, f, 'video/mp4')}
-            response = requests.post(url, params=params, files=files)
+        logger.debug(f"URL :------------------------------------------->  {url}")
+        logger.debug(f"Query params -------------------------> {params}")
 
-        response.raise_for_status()
-        video_id = response.json().get("id")
-        logger.info(f"✅ Upload successful. Video ID: {video_id}")
-        return video_id
-    
+        for attempt in range(3):
+            try:
+                with open(media_path, 'rb') as f:
+                    files = {'file': (video_name, f, 'video/mp4')}
+                    response = requests.post(url, params=params, files=files)
+
+                if response.status_code in (200, 201):
+                    video_id = response.json().get("id")
+                    logger.info(f"✅ Upload successful. Video ID: {video_id}")
+                    return video_id
+                elif 400 <= response.status_code < 500:
+                    error_msg = f"Client error: {response.status_code} {response.text}"
+                    logger.error(error_msg)
+                    raise RuntimeError(error_msg)
+                else:
+                    logger.warning(f"Server error {response.status_code}: {response.text}")
+                    if attempt == 2:
+                        raise RuntimeError(f"Upload failed after 3 attempts: {response.text}")
+
+            except (ConnectionError, Timeout, requests.exceptions.ChunkedEncodingError, OSError) as e:
+                logger.warning(f"Network error on attempt {attempt + 1}: {e}")
+            except Exception as e:
+                if "Client error" in str(e):
+                    raise
+                logger.warning(f"Transient error on attempt {attempt + 1}: {e}")
+
+            if attempt < 2:
+                base_delay = [1, 3, 10][attempt]
+                delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+                time.sleep(delay)
+            else:
+                logger.critical(f"Upload failed after 3 attempts: {video_name}")
+                raise RuntimeError("Upload failed after retries.")
+
+        raise RuntimeError("file_upload_async failed")
+
     def wait_for_index_async(self, video_id: str, timeout_sec: int = 14400) -> str:
-        """Poll until video is processed or failed"""
         self.get_account()
 
         url = (
@@ -301,18 +538,29 @@ class VideoIndexerClient:
         )
         params = {"accessToken": self.vi_access_token}
 
+        logger.debug(f"URL :------------------------------------------->  {url}")
         start_time = datetime.now()
-        while (datetime.now() - start_time).total_seconds() < timeout_sec:
-            try:
-                resp = requests.get(url, params=params)
-                if resp.status_code == 401:  # Token expired
-                    logger.warning("Token expired. Refreshing...")
-                    self.vi_access_token = get_account_access_token_async(self.consts, self.arm_access_token)
-                    params["accessToken"] = self.vi_access_token
-                    resp = requests.get(url, params=params)
 
-                resp.raise_for_status()
-                result = resp.json()
+        while (datetime.now() - start_time).total_seconds() < timeout_sec:
+            attempt_counter = 0
+            try:
+                response = make_request_with_retries("GET", url, params=params)
+                if not response or response.status_code != 200:
+                    if response and response.status_code == 401:
+                        logger.warning("Token expired. Refreshing...")
+                        self.vi_access_token = get_account_access_token_async(self.consts, self.arm_access_token)
+                        params["accessToken"] = self.vi_access_token
+                        continue
+                    if attempt_counter < 2:
+                        attempt_counter += 1
+                        delay = [1, 3, 10][attempt_counter-1] + random.uniform(0, [1, 1, 5][attempt_counter-1])
+                        time.sleep(delay)
+                        continue
+                    else:
+                        logger.error(f"Index check failed: {response.status_code} {response.text}")
+                        return "Failed"
+
+                result = response.json()
                 state = result.get("state", "Unknown")
 
                 if state == "Processed":
@@ -326,20 +574,77 @@ class VideoIndexerClient:
                 logger.info(f"🟡 Indexing... State: {state}")
                 time.sleep(10)
 
-            except requests.RequestException as e:
-                logger.error(f"Request failed: {e}")
-                time.sleep(10)
+            except Exception as e:
+                if attempt_counter < 2:
+                    attempt_counter += 1
+                    delay = [1, 3, 10][attempt_counter-1] + random.uniform(0, [1, 1, 5][attempt_counter-1])
+                    time.sleep(delay)
+                    continue
+                logger.warning(f"Polling error: {e}")
 
         logger.error("⏰ Polling timeout reached.")
         return "Timeout"
 
+    def resolve_conflict_and_upload(
+        self,
+        media_path: str,
+        conflict_mode: str,
+        video_name: Optional[str] = None,
+        **upload_kwargs
+    ) -> tuple[str, bool]:
+
+        if conflict_mode not in CONFLICT_RESOLUTION_MODES:
+            raise ValueError(f"Invalid conflict_mode: {conflict_mode}. Use: {CONFLICT_RESOLUTION_MODES}")
+
+        file_name = extract_file_name(media_path)
+        base_name = os.path.splitext(file_name)[0]
+        file_size = os.path.getsize(media_path)
+        
+        metadata = upload_kwargs.get("metadata", {})
+        partition = metadata.get("repoGuid")
+        if not partition:
+            logger.warning("No 'repoGuid' found in metadata. Falling back to unfiltered search.")
+
+        videos = self.list_videos(partition=partition)
+        matching_video = next(
+            (v for v in videos if v["name"] == base_name and v.get("sourceFiles", [{}])[0].get("size") == file_size),
+            None
+        )
+
+        if not matching_video:
+            video_id = self.file_upload_async(media_path, video_name=video_name, **upload_kwargs)
+            return video_id, True
+
+        video_id = matching_video["id"]
+        logger.info(f"Found matching video: ID={video_id}, Name='{file_name}', Size={file_size}")
+
+        if conflict_mode == "skip":
+            logger.info("Conflict mode 'skip'. Skipping upload.")
+            return video_id, False
+
+        elif conflict_mode == "overwrite":
+            logger.info("Conflict mode 'overwrite'. Deleting and re-uploading.")
+            if not self.delete_video(video_id):
+                raise RuntimeError("Failed to delete existing video for overwrite.")
+            video_id = self.file_upload_async(media_path, video_name=video_name, **upload_kwargs)
+            return video_id, True
+
+        elif conflict_mode == "reindex":
+            logger.info("Conflict mode 'reindex'. Triggering reindex.")
+            if self.reindex_video(video_id):
+                return video_id, False
+            else:
+                raise RuntimeError("Reindex failed.")
+
+        # Should not reach
+        raise RuntimeError(f"Unhandled conflict mode: {conflict_mode}")
 
 # =============================
 # Main Execution
 # =============================
 
 if __name__ == "__main__":
-    import time  # Import here to avoid top-level conflict
+    time.sleep(random.uniform(0.0, 1.5))  # Avoid herd
 
     parser = argparse.ArgumentParser(description="Upload video to Azure Video Indexer")
     parser.add_argument("-m", "--mode", required=True, help="Operation mode")
@@ -358,7 +663,7 @@ if __name__ == "__main__":
     parser.add_argument("--log-level", default="info", help="Log level")
 
     args = parser.parse_args()
-    logging.getLogger().setLevel(getattr(logging, args.log_level.upper(), logging.INFO))
+    setup_logging(args.log_level)
 
     # Validate mode
     if args.mode not in VALID_MODES:
@@ -378,36 +683,44 @@ if __name__ == "__main__":
         sys.exit(1)
 
     section = cloud_config[args.config_name]
-    consts = Consts(
-        SubscriptionId=section.get("subscription_id"),
-        ResourceGroup=section.get("resource_group"),
-        AccountName=section.get("account_name"),
-        tenant_id=section.get("tenant_id"),
-        client_id=section.get("client_id"),
-        client_secret=section.get("client_secret"),
-        location=section.get("location", "trial")
-    )
+    try:
+        consts = Consts(
+            SubscriptionId=section.get("subscription_id"),
+            ResourceGroup=section.get("resource_group"),
+            AccountName=section.get("account_name"),
+            tenant_id=section.get("tenant_id"),
+            client_id=section.get("client_id"),
+            client_secret=section.get("client_secret"),
+            location=section.get("location", "trial")
+        )
+    except ValueError as e:
+        logger.error(f"Missing config value: {e}")
+        sys.exit(1)
 
-    # File and path setup
-    if not args.source_path or not os.path.exists(args.source_path):
-        logger.error(f"Source file not found: {args.source_path}")
+    matched_file = args.source_path
+    if not matched_file or not os.path.exists(matched_file):
+        logger.error(f"Source file not found: {matched_file}")
         sys.exit(4)
 
-    file_size = os.path.getsize(args.source_path)
     if args.size_limit:
-        limit = float(args.size_limit) * 1024 * 1024
-        if file_size > limit:
-            logger.error(f"File too large: {file_size / 1024 / 1024:.2f} MB > {args.size_limit} MB")
-            sys.exit(4)
+        try:
+            limit_bytes = float(args.size_limit) * 1024 * 1024
+            file_size = os.path.getsize(matched_file)
+            if file_size > limit_bytes:
+                logger.error(f"File too large: {file_size / 1024 / 1024:.2f} MB > {args.size_limit} MB")
+                sys.exit(4)
+        except ValueError:
+            logger.warning(f"Invalid size limit: {args.size_limit}")
 
-    file_name = extract_file_name(args.source_path) if args.mode == "original" else extract_file_name(args.catalog_path)
-    catalog_dir = remove_file_name_from_path(args.catalog_path or args.source_path)
+    # Paths and backlink
+    file_name = extract_file_name(matched_file)
+    catalog_dir = remove_file_name_from_path(args.catalog_path or matched_file)
     normalized_path = catalog_dir.replace("\\", "/")
     relative_path = normalized_path.split("/1/", 1)[-1] if "/1/" in normalized_path else normalized_path
-    repo_guid = args.repo_guid or (normalized_path.split("/1/")[0].split("/")[-1] if "/1/" in normalized_path else "unknown")
+    repo_guid = args.repo_guid or (normalized_path.split("/1/")[0].split("/")[-1] if "/1/" in normalized_path else "")
 
     # Backlink URL
-    job_guid = args.job_guid or "unknown"
+    job_guid = args.job_guid or ""
     client_ip, _ = (args.controller_address.split(":", 1) if args.controller_address and ":" in args.controller_address
                     else get_link_address_and_port())
     backlink_url = (
@@ -416,12 +729,13 @@ if __name__ == "__main__":
         f"&filename={urllib.parse.quote(file_name)}"
     )
 
-    # Prepare metadata
+    # Metadata
     metadata = {
         "relativePath": "/" + relative_path if not relative_path.startswith("/") else relative_path,
         "repoGuid": repo_guid,
         "fileName": file_name,
-        "fabric_size": file_size
+        "fabric_size": os.path.getsize(matched_file),
+        "fabric-URL": backlink_url
     }
 
     if args.metadata_file and os.path.exists(args.metadata_file):
@@ -431,7 +745,7 @@ if __name__ == "__main__":
 
     if args.dry_run:
         logger.info("[DRY RUN] Upload skipped.")
-        logger.info(f"[DRY RUN] File: {args.source_path}")
+        logger.info(f"[DRY RUN] File: {matched_file}")
         logger.info(f"[DRY RUN] Metadata: {metadata}")
         sys.exit(0)
 
@@ -440,12 +754,27 @@ if __name__ == "__main__":
         client = VideoIndexerClient(consts)
         client.authenticate()
 
-        # Upload
+        # Conflict mode
+        conflict_mode = (section.get("conflict_resolution") or DEFAULT_CONFLICT_RESOLUTION).lower()
+        if conflict_mode not in CONFLICT_RESOLUTION_MODES:
+            logger.error(f"Invalid conflict_resolution mode: {conflict_mode}")
+            sys.exit(1)
+
+        # Prepare metadata
+        original_file_name = extract_file_name(matched_file)
+        name_part, ext_part = os.path.splitext(original_file_name)
+        sanitized_name_part = name_part.strip()
+        file_name = sanitized_name_part + ext_part
+        
+        if file_name != original_file_name:
+            logging.info(f"Filename sanitized from '{original_file_name}' to '{file_name}'")
         partition = metadata.pop("partition", repo_guid)
         description = backlink_url
 
-        video_id = client.file_upload_async(
-            media_path=args.source_path,
+        # Upload or resolve conflict
+        video_id, is_new = client.resolve_conflict_and_upload(
+            media_path=matched_file,
+            conflict_mode=conflict_mode,
             video_name=file_name,
             description=description,
             privacy="Private",
@@ -453,15 +782,18 @@ if __name__ == "__main__":
             metadata=metadata
         )
 
-        # Poll
-        status = client.wait_for_index_async(video_id)
-        if status == "Processed":
-            print(f"VideoID={video_id}")
-            sys.exit(0)
-        else:
-            sys.exit(1)
+        # Only poll if it's a new upload or reindex was not enough
+        # Note: Reindex triggers async processing — we still need to wait
+        if conflict_mode != "skip" or is_new == True:  # skip doesn't need polling
+            status = client.wait_for_index_async(video_id, timeout_sec=14400)
+            if status != "Processed":
+                logger.error(f"Indexing ended with status: {status}")
+                sys.exit(1)
+
+        print(f"VideoID={video_id}")
+        sys.exit(0)
 
     except Exception as e:
-        logger.error(f"❌ Upload failed: {str(e)}")
+        logger.critical(f"Operation failed: {e}")
         print(f"Error: {str(e)}")
-        sys.exit(1)
+        sys.exit(1)   

@@ -7,8 +7,11 @@ import logging
 import plistlib
 import urllib.parse
 from configparser import ConfigParser
+import random
+import time
+from requests.adapters import HTTPAdapter
+from requests.exceptions import RequestException, SSLError, ConnectionError, Timeout
 import xml.etree.ElementTree as ET
-from pathlib import Path
 
 # Constants
 VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet"]
@@ -16,7 +19,8 @@ CHUNK_SIZE = 5 * 1024 * 1024
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
-
+CONFLICT_RESOLUTION_MODES = ["skip", "overwrite"]
+DEFAULT_CONFLICT_RESOLUTION = "skip"
 
 # Detect platform
 IS_LINUX = os.path.isdir("/opt/sdna/bin")
@@ -77,6 +81,44 @@ def get_cloud_config_path():
     logging.info(f"Using cloud config path: {path}")
     return path
 
+def get_retry_session(retries=3, backoff_factor_range=(1.0, 2.0)):
+    session = requests.Session()
+    # handling retry delays manually via backoff in the range
+    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+def make_request_with_retries(method, url, **kwargs):
+    session = get_retry_session()
+    last_exception = None
+
+    for attempt in range(3):  # Max 3 attempts
+        try:
+            response = session.request(method, url, timeout=(10, 30), **kwargs)
+            if response.status_code < 500:
+                return response
+            else:
+                logging.warning(f"Received {response.status_code} from {url}. Retrying...")
+        except (SSLError, ConnectionError, Timeout) as e:
+            last_exception = e
+            if attempt < 2:  # Only sleep if not last attempt
+                base_delay = [1, 3, 10][attempt]
+                jitter = random.uniform(0, 1)
+                delay = base_delay + jitter * ([1, 1, 5][attempt])  # e.g., 1-2, 3-4, 10-15
+                logging.warning(f"Attempt {attempt + 1} failed due to {type(e).__name__}: {e}. "
+                                f"Retrying in {delay:.2f}s...")
+                time.sleep(delay)
+            else:
+                logging.error(f"All retry attempts failed for {url}. Last error: {e}")
+        except RequestException as e:
+            logging.error(f"Request failed: {e}")
+            raise
+
+    if last_exception:
+        raise last_exception
+    return None  # Should not reach here
+
 def prepare_metadata_to_upload(repo_guid ,relative_path, file_name, file_size, backlink_url, properties_file = None):    
     metadata = {
         "relativePath": relative_path if relative_path.startswith("/") else "/" + relative_path,
@@ -127,232 +169,396 @@ def prepare_metadata_to_upload(repo_guid ,relative_path, file_name, file_size, b
 def file_exists_in_index(api_key, index_id, filename, file_size):
     url = f"https://api.twelvelabs.io/v1.3/indexes/{index_id}/videos"
     headers = {"x-api-key": api_key}
-    params = {
-        "filename": filename,
-        "size": file_size
-    }
-    video_id = None
-    page = 1
-    total_pages = 1
-
+    params = {"filename": filename, "size": file_size}
     logging.info(f"Searching for existing video: '{filename}' (Size: {file_size} bytes)")
+    logger.debug(f"URL :------------------------------------------->  {url}")
 
-    while page <= total_pages:
-        params["page"] = page
-        response = requests.get(url, headers=headers, params=params)
-        if response.status_code != 200:
-            logging.error(f"Failed to list videos: {response.text}")
-            return None
+    for attempt in range(3):
+        try:
+            page = 1
+            total_pages = 1
+            video_id = None
 
-        data = response.json()
-        results = data.get("data", [])
-        for video in results:
-            meta = video.get("system_metadata", {})
-            if meta.get("filename") == filename and meta.get("size") == file_size:
-                video_id = video["_id"]
-                logging.info(f"Matching video found: ID={video_id}, filename='{filename}', size={file_size}")
-                return video_id  # Return on first match
+            while page <= total_pages:
+                params["page"] = page
+                response = make_request_with_retries("GET", url, headers=headers, params=params)
+                if not response or response.status_code != 200:
+                    raise Exception(f"List videos failed: {response.status_code if response else 'No response'}")
 
-        page_info = data.get("page_info", {})
-        total_pages = page_info.get("total_page", 1)
-        page += 1
+                data = response.json()
+                results = data.get("data", [])
+                for video in results:
+                    meta = video.get("system_metadata", {})
+                    if meta.get("filename") == filename and meta.get("size") == file_size:
+                        video_id = video["_id"]
+                        logging.info(f"Matching video found: ID={video_id}")
+                        return video_id
 
-    return None  # No match found
+                page_info = data.get("page_info", {})
+                total_pages = page_info.get("total_page", 1)
+                page += 1
+
+            return None  # No match
+
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to check video existence after 3 attempts: {e}")
+                return None
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return None
 
 def delete_video(api_key, index_id, video_id):
     url = f"https://api.twelvelabs.io/v1.3/indexes/{index_id}/videos/{video_id}"
     headers = {"x-api-key": api_key}
-    response = requests.delete(url, headers=headers)
-    if response.status_code in (200, 204):
-        logging.info(f"✅ Deleted existing video ID: {video_id}")
-        return True
-    else:
-        logging.error(f"❌ Failed to delete video {video_id}: {response.text}")
-        return False
+    logger.debug(f"URL :------------------------------------------->  {url}")
+
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("DELETE", url, headers=headers)
+            if response and response.status_code in (200, 204):
+                logging.info(f"Deleted existing video ID: {video_id}")
+                return True
+            elif response:
+                logging.warning(f"Delete failed: {response.status_code} {response.text}")
+            if attempt == 2:
+                return False
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to delete video {video_id} after 3 attempts: {e}")
+                return False
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return False
 
 def upload_asset(api_key, index_id, file_path):
-    try:
-        filename = os.path.basename(file_path)
-        file_size = os.path.getsize(file_path)
+    original_file_name = os.path.basename(file_path)
+    name_part, ext_part = os.path.splitext(original_file_name)
+    sanitized_name_part = name_part.strip()
+    file_name = sanitized_name_part + ext_part
+    
+    if file_name != original_file_name:
+        logging.info(f"Filename sanitized from '{original_file_name}' to '{file_name}'")
+    file_size = os.path.getsize(file_path)
 
-        # Check and remove duplicate
-        existing_video_id = file_exists_in_index(api_key, index_id, filename, file_size)
-        if existing_video_id:
-            logging.info(f"Duplicate video found for '{filename}'. Deleting...")
+    # Check for duplicates (with retry)
+    conflict_resolution = cloud_config_data.get('conflict_resolution', DEFAULT_CONFLICT_RESOLUTION)
+    existing_video_id = file_exists_in_index(api_key, index_id, file_name, file_size)
+    if existing_video_id:
+        if conflict_resolution == "skip":
+            logging.info(f"File '{file_name}' exists. Skipping upload.")
+            print(f"File '{file_name}' already exists. Skipping upload.")
+            sys.exit(0)
+        elif conflict_resolution == "overwrite":
             if not delete_video(api_key, index_id, existing_video_id):
                 logging.warning("Proceeding with upload despite failed deletion.")
+    else:
+        logging.info(f"No duplicate found for '{file_name}'.")
+
+    url = "https://api.twelvelabs.io/v1.3/tasks"
+    headers = {"x-api-key": api_key}
+    payload = {"index_id": index_id}
+
+    for attempt in range(3):
+        try:
+            # Open file on each retry
+            with open(file_path, 'rb') as f:
+                files = {"video_file": f}
+                logging.info(f"Uploading '{file_name}' to Twelve Labs index {index_id}... (Attempt {attempt + 1})")
+                response = requests.post(
+                    url,
+                    data=payload,
+                    files=files,
+                    headers=headers,
+                    timeout=(10, 300)  # 5 min read timeout
+                )
+
+            # If 4xx, don't retry — it's a client error (e.g. bad index_id, auth)
+            if 400 <= response.status_code < 500:
+                error_msg = f"Client error: {response.status_code} {response.text}"
+                logging.error(error_msg)
+                raise RuntimeError(error_msg)
+
+            # If 2xx, success
+            if response.status_code in (200, 201):
+                logging.debug(f"Upload successful: {response.text}")
+                return response.json()
+
+            # If 5xx or unexpected, retry
+            logging.warning(f"Server error {response.status_code}: {response.text}. Retrying...")
+
+        except (ConnectionError, Timeout, requests.exceptions.ChunkedEncodingError) as e:
+            logging.warning(f"Network error on attempt {attempt + 1}: {e}")
+        except Exception as e:
+            if "4xx" in str(e).lower():
+                logging.error(f"Client error during upload: {e}")
+                raise  # Don't retry 4xx
+            logging.warning(f"Transient error on attempt {attempt + 1}: {e}")
+
+        # Apply jittered backoff
+        if attempt < 2:
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
         else:
-            logging.info(f"No duplicate found for '{filename}'. Proceeding with upload.")
+            logging.critical(f"Upload failed after 3 attempts: {file_name}")
+            raise RuntimeError("Upload failed after retries.")
 
-        url = "https://api.twelvelabs.io/v1.3/tasks"
-        payload = {"index_id": index_id}
-        headers = {"x-api-key": api_key}
+    # Should not reach here
+    raise RuntimeError("Upload failed.")
 
-        with open(file_path, 'rb') as f:
-            files = {"video_file": f}
-            logging.info(f"Uploading '{filename}' to Twelve Labs index {index_id}...")
-            response = requests.post(url, data=payload, files=files, headers=headers)
+def poll_task_status(api_key, task_id, max_wait=10800, interval=10):
+    url = f"https://api.twelvelabs.io/v1.3/tasks/{task_id}"
+    headers = {"x-api-key": api_key}
+    logger.debug(f"URL :------------------------------------------->  {url}")
+    logging.info(f"Polling task {task_id} status. Max wait: {max_wait}s")
 
-        if response.status_code >= 400:
-            logging.error(f"Upload failed with status {response.status_code}: {response.text}")
-            raise RuntimeError(f"Upload failed: {response.text}")
+    start_time = time.time()
+    attempt_counter = 0
 
-        logging.debug(f"Upload response: {response.text}")
-        return response.json()
+    while (time.time() - start_time) < max_wait:
+        try:
+            response = make_request_with_retries("GET", url, headers=headers)
+            if not response:
+                raise ConnectionError("No response from server")
 
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Network error during upload: {e}")
-        raise RuntimeError(f"Network error: {e}")
-    except Exception as e:
-        logging.error(f"Unexpected error in upload_asset: {e}")
-        raise
+            if response.status_code == 404:
+                logging.error(f"Task {task_id} not found (404)")
+                return False
+            elif response.status_code != 200:
+                logging.warning(f"Status {response.status_code}: {response.text}")
+                if attempt_counter < 2:
+                    attempt_counter += 1
+                    delay = [1, 3, 10][attempt_counter-1] + random.uniform(0, [1, 1, 5][attempt_counter-1])
+                    time.sleep(delay)
+                    continue
+                else:
+                    logging.critical(f"Failed to fetch task status after retries: {response.text}")
+                    return False
+
+            data = response.json()
+            status = data.get("status")
+            hls_status = data.get("hls", {}).get("status")
+
+            logging.info(f"Task {task_id} | Status: {status} | HLS: {hls_status}")
+
+            if status == "ready":
+                logging.info(f"Task {task_id} completed successfully.")
+                return data  # Success — return full task object
+
+            elif status == "failed":
+                reason = data.get("error", "No error message provided")
+                logging.error(f"Task {task_id} failed: {reason}")
+                return False
+
+            # Reset retry counter on successful poll
+            attempt_counter = 0
+
+        except Exception as e:
+            logging.debug(f"Exception during polling: {e}")
+            if attempt_counter < 2:
+                attempt_counter += 1
+                delay = [1, 3, 10][attempt_counter-1] + random.uniform(0, [1, 1, 5][attempt_counter-1])
+                time.sleep(delay)
+                continue
+            logging.warning(f"Polling transient error after retries: {e}")
+
+        # Wait before next poll
+        time.sleep(interval)
+
+    # Timeout
+    logging.critical(f" Polling timed out after {max_wait}s. Task {task_id} did not reach 'ready'.")
+    return False
 
 def add_metadata(api_key, index_id, video_id, metadata):
-    try:
-        url = f"https://api.twelvelabs.io/v1.3/indexes/{index_id}/videos/{video_id}"
-        payload = {"user_metadata": metadata}
-        headers = {
-            "x-api-key": api_key,
-            "Content-Type": "application/json"
-        }
-        response = requests.put(url, json=payload, headers=headers)
+    url = f"https://api.twelvelabs.io/v1.3/indexes/{index_id}/videos/{video_id}"
+    headers = {
+        "x-api-key": api_key,
+        "Content-Type": "application/json"
+    }
+    payload = {"user_metadata": metadata}
+    logger.debug(f"URL :------------------------------------------->  {url}")
+    logging.debug(f"Metadata payload -------------------------> {payload}")
 
-        logging.debug(f"Metadata update status: {response.status_code}")
-
-        if response.status_code == 204:
-            logging.info("Metadata updated successfully (204 No Content).")
-            return None  # No body to return
-        elif response.status_code == 200:
-            logging.info("Metadata updated successfully with response.")
-            return response.json()
-        else:
-            raise RuntimeError(
-                f"Metadata update failed with status {response.status_code}: {response.text}"
-            )
-    except Exception as e:
-        raise RuntimeError(f"Failed to add metadata: {e}")
-
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("PUT", url, json=payload, headers=headers)
+            if not response:
+                continue
+            if response.status_code == 204:
+                logging.info("Metadata updated successfully (204 No Content).")
+                return None
+            elif response.status_code == 200:
+                logging.info("Metadata updated successfully.")
+                return response.json()
+            else:
+                if attempt == 2:
+                    raise RuntimeError(f"Metadata update failed: {response.status_code} {response.text}")
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to add metadata after 3 attempts: {e}")
+                raise
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    raise RuntimeError("Metadata update failed after retries.")
 
 if __name__ == '__main__':
+    time.sleep(random.uniform(0.0, 1.5))
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("-m", "--mode", required=True, help="mode of Operation proxy or original upload")
-    parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
-    parser.add_argument("-j", "--job-guid", help="Job Guid of SDNA job")
-    parser.add_argument("--parent-id", help="Optional parent folder ID to resolve relative upload paths from") 
-    parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
-    parser.add_argument("-sp", "--source-path", help="Source path of file to look for original upload")
-    parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
-    parser.add_argument("-up", "--upload-path", required=True, help="Path where file will be uploaded google Drive")
-    parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
-    parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
+    parser.add_argument("-m", "--mode", required=True, help="Mode: proxy, original, get_base_target")
+    parser.add_argument("-c", "--config-name", required=True, help="Name of cloud configuration")
+    parser.add_argument("-j", "--job-guid", help="Job GUID of SDNA job")
+    parser.add_argument("--parent-id", help="Parent folder ID")
+    parser.add_argument("-cp", "--catalog-path", help="Catalog path")
+    parser.add_argument("-sp", "--source-path", help="Source file path")
+    parser.add_argument("-mp", "--metadata-file", help="Path to metadata file")
+    parser.add_argument("-up", "--upload-path", required=True, help="Twelve Labs index ID or upload path")
+    parser.add_argument("-sl", "--size-limit", help="File size limit in MB")
+    parser.add_argument("--dry-run", action="store_true", help="Dry run mode")
     parser.add_argument("--log-level", default="debug", help="Logging level")
-    parser.add_argument("-r", "--repo-guid",  help="repo GUID of provided file")  
-    parser.add_argument("--resolved-upload-id", action="store_true", help="Pass if upload path is already resolved ID")
-    parser.add_argument("--controller-address",help="Link IP/Hostname Port")
+    parser.add_argument("-r", "--repo-guid", help="Repo GUID")
+    parser.add_argument("--resolved-upload-id", action="store_true", help="Treat upload-path as index ID")
+    parser.add_argument("--controller-address", help="Controller IP:Port")
+
     args = parser.parse_args()
 
     setup_logging(args.log_level)
 
     mode = args.mode
     if mode not in VALID_MODES:
-        logging.error(f"Only allowed modes: {VALID_MODES}")
+        logging.error(f"Invalid mode. Use one of: {VALID_MODES}")
         sys.exit(1)
 
     cloud_config_path = get_cloud_config_path()
     if not os.path.exists(cloud_config_path):
-        logging.error(f"Missing cloud config: {cloud_config_path}")
+        logging.error(f"Cloud config not found: {cloud_config_path}")
         sys.exit(1)
 
     cloud_config = ConfigParser()
     cloud_config.read(cloud_config_path)
-    cloud_config_name = args.config_name
-    if cloud_config_name not in cloud_config:
-        logging.error(f"Missing cloud config section: {cloud_config_name}")
+    if args.config_name not in cloud_config:
+        logging.error(f"Config '{args.config_name}' not found.")
         sys.exit(1)
 
-    cloud_config_data = cloud_config[cloud_config_name]
+    cloud_config_data = cloud_config[args.config_name]
+    api_key = cloud_config_data.get("api_key")
+    if not api_key:
+        logging.error("API key not found in config.")
+        sys.exit(1)
 
-    index_id = args.upload_path if args.resolved_upload_id else cloud_config_data.get('index_id', '')
-    print(f"Index Id ----------------------->{index_id}")
+    index_id = args.upload_path if args.resolved_upload_id else cloud_config_data.get('index_id')
+    if not index_id:
+        logging.error("Index ID not provided and not found in config.")
+        sys.exit(1)
 
-    logging.info(f"Starting Twelve labs upload process in {mode} mode")
-    logging.debug(f"Using cloud config: {cloud_config_path}")
-    logging.debug(f"Source path: {args.source_path}")
-    
-    logging.info(f"Initializing Twelve labs client")
-    
+    logging.info(f"Starting Twelve Labs upload process in {mode} mode")
+    logging.debug(f"Index ID: {index_id}")
+
     matched_file = args.source_path
-    catalog_path = args.catalog_path
-    file_name_for_url = extract_file_name(matched_file) if mode == "original" else extract_file_name(catalog_path)
-
-    if not os.path.exists(matched_file):
+    if not matched_file or not os.path.exists(matched_file):
         logging.error(f"File not found: {matched_file}")
         sys.exit(4)
 
-    matched_file_size = os.stat(matched_file).st_size
-    file_size_limit = args.size_limit
-    if mode == "original" and file_size_limit:
+    # Size limit
+    if mode == "original" and args.size_limit:
         try:
-            size_limit_bytes = float(file_size_limit) * 1024 * 1024
-            if matched_file_size > size_limit_bytes:
-                logging.error(f"File too large: {matched_file_size / (1024 * 1024):.2f} MB > limit of {file_size_limit} MB")
+            limit_bytes = float(args.size_limit) * 1024 * 1024
+            file_size = os.path.getsize(matched_file)
+            if file_size > limit_bytes:
+                logging.error(f"File too large: {file_size / 1024 / 1024:.2f} MB > {args.size_limit} MB")
                 sys.exit(4)
-        except Exception as e:
-            logging.warning(f"Could not validate size limit: {e}")
+        except ValueError:
+            logging.warning(f"Invalid size limit: {args.size_limit}")
 
-    catalog_path = remove_file_name_from_path(args.catalog_path)
-
-    normalized_path = catalog_path.replace("\\", "/")
-    if "/1/" in normalized_path:
-        cache_path, relative_path = normalized_path.split("/1/")
-        repo_guid = cache_path.split("/")[-1]        
-        relative_path = normalized_path.split("/1/", 1)[-1]
-    else:
-        relative_path = normalized_path
-    catalog_url = urllib.parse.quote(relative_path)
+    # Backlink URL
+    catalog_path = args.catalog_path or matched_file
+    rel_path = remove_file_name_from_path(catalog_path).replace("\\", "/")
+    rel_path = rel_path.split("/1/", 1)[-1] if "/1/" in rel_path else rel_path
+    catalog_url = urllib.parse.quote(rel_path)
+    file_name_for_url = extract_file_name(matched_file)
     filename_enc = urllib.parse.quote(file_name_for_url)
-    job_guid = args.job_guid
+    job_guid = args.job_guid or ""
 
-    if args.controller_address is not None and len(args.controller_address.split(":")) == 2:
-        client_ip, client_port = args.controller_address.split(":")
+    if args.controller_address and ":" in args.controller_address:
+        client_ip, _ = args.controller_address.split(":", 1)
     else:
-        client_ip, client_port = get_link_address_and_port()
+        ip, _ = get_link_address_and_port()
+        client_ip = ip
 
-    link_host = f"https://{client_ip}/dashboard/projects/{job_guid}"
-    link_url = f"/browse&search?path={catalog_url}&filename={filename_enc}"
-    backlink_url = f"{link_host}{link_url}"
-    logging.debug(f"Generated dashboard URL: {backlink_url}")
-
+    backlink_url = f"https://{client_ip}/dashboard/projects/{job_guid}/browse&search?path={catalog_url}&filename={filename_enc}"
+    logging.debug(f"Generated backlink URL: {backlink_url}")
 
     if args.dry_run:
         logging.info("[DRY RUN] Upload skipped.")
-        logging.info(f"[DRY RUN] File to upload: {matched_file}")
-
+        logging.info(f"[DRY RUN] File: {matched_file}")
+        logging.info(f"[DRY RUN] Index ID: {index_id}")
+        if args.metadata_file:
+            logging.info(f"[DRY RUN] Metadata will be applied from: {args.metadata_file}")
         sys.exit(0)
-        
-    meta_file = args.metadata_file
-    logging.info("Preparing metadata to be uploaded ...")
-    metadata_obj = prepare_metadata_to_upload(args.repo_guid, catalog_url, file_name_for_url, matched_file_size, backlink_url, meta_file)
-    if metadata_obj is not None:
-        parsed = metadata_obj
-    else:
-        parsed = None
-        logging.error("Failed to find metadata .")
 
-    logging.info(f"Starting upload process to Twelve labs")
-    api_key = cloud_config_data.get("api_key")
+    # Prepare metadata
     try:
-        asset = upload_asset(api_key, index_id, args.source_path)
-        logging.info(f"Asset uploaded to twelve labs. Asset ID: --> {asset['video_id']}")
-        if "video_id" in asset:
-            try:
-                add_metadata(api_key, index_id, asset["video_id"], parsed)
-                logging.info("File uploaded and metadata added successfully.")
-            except Exception as e:
-                logging.warning(f"Video uploaded, but metadata insertion failed: {e}")
-                print("Video Uploaded, metadata insertion failed.")
-            sys.exit(0)
-        sys.exit(0)
+        metadata_obj = prepare_metadata_to_upload(
+            repo_guid=args.repo_guid,
+            relative_path=catalog_url,
+            file_name=file_name_for_url,
+            file_size=os.path.getsize(matched_file),
+            backlink_url=backlink_url,
+            properties_file=args.metadata_file
+        )
+        logging.info("Metadata prepared successfully.")
     except Exception as e:
-        print(str(e))
+        logging.error(f"Failed to prepare metadata: {e}")
+        metadata_obj = {}
+
+    # Step 1: Upload
+    try:
+        result = upload_asset(api_key, index_id, matched_file)
+        task_id = result.get("task_id")
+        if not task_id:
+            logging.error("Upload succeeded but no 'task_id' in response.")
+            sys.exit(1)
+        logging.info(f"Upload successful. Task ID: {task_id}")
+
+        # Step 2: Apply metadata BEFORE polling (as requested)
+        video_id = result.get("video_id")  # may not exist yet
+        if not video_id:
+            logging.warning("video_id not in upload response. Will extract after ready.")
+        else:
+            try:
+                add_metadata(api_key, index_id, video_id, metadata_obj)
+                logging.info(f"Metadata applied to video {video_id}")
+            except Exception as e:
+                logging.warning(f"Metadata application failed: {e}")
+
+        # Step 3: Poll for indexing completion
+        poll_result = poll_task_status(api_key, task_id, max_wait=args.max_poll_time)
+        if not poll_result:
+            logging.error("Task polling failed or timed out.")
+            sys.exit(1)
+
+        final_video_id = poll_result.get("video_id")
+        if not final_video_id:
+            logging.error("Task completed but 'video_id' missing.")
+            sys.exit(1)
+
+        logging.info(f"Indexing complete. Final Video ID: {final_video_id}")
+
+        # Re-apply metadata if not done earlier (e.g., video_id wasn't available)
+        if not video_id:
+            try:
+                add_metadata(api_key, index_id, final_video_id, metadata_obj)
+                logging.info(f"Metadata applied after indexing: {final_video_id}")
+            except Exception as e:
+                logging.warning(f"Metadata application failed post-indexing: {e}")
+
+        logging.info("Twelve Labs upload and indexing completed successfully.")
+        sys.exit(0)
+
+    except Exception as e:
+        logging.critical(f"Upload or indexing failed: {e}")
         sys.exit(1)
