@@ -19,8 +19,9 @@ DEBUG_PRINT = True
 DEBUG_TO_FILE = True
 
 PROXY_GENERATION_HOST = "http://127.0.0.1:8000"
-PROVIDERS_SUPPORTING_GET_BASE_TARGET = {"frameio_v2", "frameio_v4", "tessact", "overcasthq", "trint"}
+PROVIDERS_SUPPORTING_GET_BASE_TARGET = ["frameio" , "frameio_v2", "frameio_v4", "tessact", "overcasthq", "trint", "twelvelabs", "box", "googledrive", "iconik"]
 PATH_BASED_PROVIDERS = ["cloud", "AWS"]
+ACCOUNT_BASED_PROVIDERS = ["azure_video_indexer"]
 
 # Mapping provider names to their respective upload scripts
 PROVIDER_SCRIPTS = {
@@ -36,6 +37,7 @@ PROVIDER_SCRIPTS = {
     "cloud": "dropbox_uploader.py",
     "googledrive": "google_drive_uploader.py",
     "iconik": "iconik_uploader.py",
+    "azure_video_indexer": "azure_video_indexer_uploader.py"
 }
 
 
@@ -366,7 +368,6 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
         "--source-path", source_path,
         "--catalog-path", catalog_path,
         "--config-name", config["cloud_config_name"],
-        "--upload-path", upload_path_id or full_upload_path,
         "--job-guid", config["job_guid"],
         "--log-level", "debug"
     ]
@@ -384,12 +385,19 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
         cmd += ["--controller-address", config["controller_address"]]
     if config.get("provider") in PATH_BASED_PROVIDERS:
         cmd += ["--bucket-name", config["bucket"]]
-    if config.get("provider") == "twelvelabs":
+    if config.get("provider") in ["twelvelabs", "azure_video_indexer"]:
         cmd += ["--repo-guid", config["repo_guid"]] 
     if dry_run:
         cmd.append("--dry-run")
     if upload_path_id:
         cmd.append("--resolved-upload-id")
+
+    # Remove --upload-path for azure_video_indexer
+    if config.get("provider") not in ACCOUNT_BASED_PROVIDERS:
+        cmd += ["--upload-path", upload_path_id or full_upload_path]
+    else:
+        # Remove any accidental --upload-path argument
+        cmd = [arg for arg in cmd if arg != "--upload-path"]
 
     debug_print(config["logging_path"], f"[COMMAND] {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -614,7 +622,7 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
         # Special handling for twelvelabs: always use root resolved ID
         if config.get("provider") == "twelvelabs":
             upload_path_id = resolved_ids.get(logical_base)
-        elif config["provider"] in PATH_BASED_PROVIDERS:
+        elif config["provider"] not in PROVIDERS_SUPPORTING_GET_BASE_TARGET:
             upload_path_id = None
         else:
             upload_path_id = resolved_ids.get(normalized_folder_key, list(resolved_ids.values())[0])
@@ -734,7 +742,7 @@ def process_csv_and_upload(config, dry_run=False):
     send_progress(progressDetails, config["repo_guid"])
 
     # Resolve folder IDs if needed
-    if config["provider"] not in PATH_BASED_PROVIDERS:
+    if config["provider"] in PROVIDERS_SUPPORTING_GET_BASE_TARGET:
         progressDetails["status"] = "Building Folder Map"
         send_progress(progressDetails, config["repo_guid"])
         resolved_ids = build_folder_id_map(records, config, config["logging_path"], progressDetails)
