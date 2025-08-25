@@ -293,4 +293,3 @@ if __name__ == '__main__':
     else:
         logging.info("All parts uploaded successfully to Frame.io")
         sys.exit(0)
-
