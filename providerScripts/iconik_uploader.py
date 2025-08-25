@@ -5,10 +5,14 @@ import math
 import hashlib
 import argparse
 import logging
+import time
+import random
 import urllib.parse
 import requests
+from requests.adapters import HTTPAdapter
 from json import dumps
 from configparser import ConfigParser
+from requests.exceptions import RequestException, SSLError, ConnectionError, Timeout
 import xml.etree.ElementTree as ET
 import plistlib
 from pathlib import Path
@@ -21,6 +25,8 @@ CHUNK_SIZE = 5 * 1024 * 1024
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
+CONFLICT_RESOLUTION_MODES = ["skip", "overwrite"]
+DEFAULT_CONFLICT_RESOLUTION = "overwrite"
 
 # Detect platform
 IS_LINUX = os.path.isdir("/opt/sdna/bin")
@@ -81,6 +87,44 @@ def get_link_address_and_port():
     logging.info(f"Server connection details - Address: {ip}, Port: {port}")
     return ip, port
 
+def get_retry_session(retries=3, backoff_factor_range=(1.0, 2.0)):
+    session = requests.Session()
+    # handling retry delays manually via backoff in the range
+    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+def make_request_with_retries(method, url, **kwargs):
+    session = get_retry_session()
+    last_exception = None
+
+    for attempt in range(4):  # Max 3 attempts
+        try:
+            response = session.request(method, url, timeout=(10, 30), **kwargs)
+            if response.status_code < 500:
+                return response
+            else:
+                logging.warning(f"Received {response.status_code} from {url}. Retrying...")
+        except (SSLError, ConnectionError, Timeout) as e:
+            last_exception = e
+            if attempt < 2:  # Only sleep if not last attempt
+                base_delay = [1, 3, 10, 30][attempt]
+                jitter = random.uniform(0, 1)
+                delay = base_delay + jitter * ([1, 1, 5, 10][attempt])  # e.g., 1-2, 3-4, 10-15, 30-40
+                logging.warning(f"Attempt {attempt + 1} failed due to {type(e).__name__}: {e}. "
+                                f"Retrying in {delay:.2f}s...")
+                time.sleep(delay)
+            else:
+                logging.error(f"All retry attempts failed for {url}. Last error: {e}")
+        except RequestException as e:
+            logging.error(f"Request failed: {e}")
+            raise
+
+    if last_exception:
+        raise last_exception
+    return None  # Should not reach here
+
 def prepare_metadata_to_upload( backlink_url, properties_file = None):    
     metadata = {
         "fabric URL": backlink_url
@@ -127,12 +171,24 @@ def prepare_metadata_to_upload( backlink_url, properties_file = None):
 def remove_file(config, asset_id):
     url = f'{DOMAIN}/API/assets/v1/assets/{asset_id}'
     headers = {"app-id":config["app-id"], "auth-token" : config["auth-token"]}
-    response = requests.delete(url,headers=headers)
-    if response.status_code != 204:
-        logging.error(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        exit(1)
-        return False
-    return True
+    logging.debug(f"URL: {url}")
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("DELETE", url, headers=headers)
+            if response and response.status_code == 204:
+                logging.info("Asset removed successfully.")
+                return True
+            else:
+                logger.info(f"Response error. Status - {response.status_code}, Error - {response.text}")
+                return False
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to remove asset after 3 attempts: {e}")
+                return None
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return None  
 
 def calculate_sha1(file_path):
     sha1 = hashlib.sha1()
@@ -150,20 +206,28 @@ def get_first_collection(config):
         "App-ID": config["app-id"],
         "Auth-Token": config["auth-token"]
     }
-    try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        collections = response.json().get('objects', [])
-        if collections:
-            collection_id = collections[0].get('id')
-            logging.info(f"Using first collection ID: {collection_id}")
-            return collection_id
-        else:
-            logging.error("No collections found in the response.")
-            sys.exit(1)
-    except requests.RequestException as e:
-        logging.error(f"Failed to fetch collections: {e}")
-        sys.exit(1)
+    logger.debug(f"URL :------------------------------------------->  {url}")
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("GET", url, headers=headers)
+            if response and response.status_code in (200, 201):
+                collections = response.json().get('objects', [])
+                if collections:    
+                    logging.info(f"Using first collection ID: {collections[0].get('id')}")
+                    return collections[0].get('id')
+                else:
+                    return None
+            else:
+                logging.error("No collections found in the response.")
+                return None
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to Root asset ID after 3 attempts: {e}")
+                return None
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return None 
 
 def create_collection(config, collection_name, parent_id=None):
     url = f'{DOMAIN}/API/assets/v1/collections/'
@@ -176,16 +240,22 @@ def create_collection(config, collection_name, parent_id=None):
         "app-id": config["app-id"],
         "auth-token": config["auth-token"]
     }
-    response = requests.post(
-        url,
-        headers=headers,
-        json=payload,
-        params=params
-    )
-    if response.status_code != 201:
-        print(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        sys.exit(1)
-    return response.json()['id']
+    logger.debug(f"URL :------------------------------------------->  {url}")
+    for attempt in range(3):
+        try:    
+            response = make_request_with_retries("POST", url, headers=headers, json=payload, params=params)
+            if response and response.status_code in (200, 201):
+                return response.json()['id']
+            else:
+                logging.error(f"Response error. Status - {response.status_code}, Error - {response.text}")
+                return None
+        except Exception as e:
+            logging.warning(f"Exception during folder creation (attempt {attempt + 1}): {e}")
+            if attempt == 2:
+                logging.error("Failed to create folder after 3 attempts.")
+                return None
+            time.sleep(random.uniform(*([1, 2], [3, 4], [10, 15])[attempt]))
+    return None
 
 def find_or_create_collection_path(config, collection_path, base_collection_id=None):
     current_id = base_collection_id
@@ -215,13 +285,22 @@ def get_call_of_collections_content(config, collection_id):
         "page": 1,
         "index_immediately": "true"
     }
-    try:
-        response = requests.get(url, headers=headers, params=params)
-        response.raise_for_status()
-        return response.json().get("objects", [])
-    except requests.RequestException as e:
-        logging.error(f"Failed to fetch collection contents for ID {collection_id}: {e}")
-        return []
+    logger.debug(f"URL :------------------------------------------->  {url}")
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("GET", url, headers=headers, params=params)
+            if response and response.status_code in (200, 201):
+                logging.info("contents of folder acquired successfully.")                
+                return response.json().get("objects", [])
+            else:
+                logger.info(f"Response error. Status - {response.status_code}, Error - {response.text}")
+                return None
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to get contents of folder after 3 attempts: {e}")
+                return None
+            time.sleep(random.uniform(*([1, 2], [3, 4], [10, 15])[attempt]))
+    return None
 
 def get_storage_id(config, storage_name,storage_method):
     url = f'{DOMAIN}/API/files/v1/storages/'
@@ -229,16 +308,27 @@ def get_storage_id(config, storage_name,storage_method):
         "app-id": config["app-id"],
         "auth-token": config["auth-token"]
     }
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        print(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        exit(1)
-    response = response.json()
-    storage_id = []
-    for storage in response["objects"]:
-        if storage["name"] == storage_name and storage["method"] == storage_method:
-            storage_id.append(storage["id"])
-    return storage_id[0]
+    logger.debug(f"URL :------------------------------------------->  {url}")
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("GET", url, headers=headers)
+            if response and response.status_code in (200, 201):
+                logging.info("Storgae ID acquired successfully.")                
+                response_data = response.json()
+                storage_id = []
+                for storage in response_data["objects"]:
+                    if storage["name"] == storage_name and storage["method"] == storage_method:
+                        storage_id.append(storage["id"])
+                return storage_id[0]
+            else:
+                logger.info(f"Response error. Status - {response.status_code}, Error - {response.text}")
+                return None
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to get Storgae ID after 3 attempts: {e}")
+                return None
+            time.sleep(random.uniform(*([1, 2], [3, 4], [10, 15])[attempt]))
+    return None
 
 def create_asset_id(config, file_path, collection_id=None):
     url = f'{DOMAIN}/API/assets/v1/assets/'
@@ -247,15 +337,21 @@ def create_asset_id(config, file_path, collection_id=None):
     payload = {"title": file_name, "type": "ASSET"}
     params = {"apply_default_acls": "true"}
     # check and remove file if is already present
+    conflict_resolution = config.get('conflict_resolution', DEFAULT_CONFLICT_RESOLUTION)
     assets = get_call_of_collections_content(config, collection_id)
     for asset in assets:
         if 'files' in asset:
             for file in asset['files']:
                 if file['original_name'] == file_name and int(file['size']) == int(file_size):
-                    if remove_file(config, asset['id']) == True:
-                         logging.info(f"Removed existing asset with path: {matched_file}")
-                    else:
-                        logging.error(f"Failed to remove existing asset: {file_name} with path: {matched_file}")
+                    if conflict_resolution == "skip":
+                        logging.info(f"File '{file_name}' exists. Skipping upload.")
+                        print(f"File '{file_name}' already exists. Skipping upload.")
+                        sys.exit(0)
+                    elif conflict_resolution == "overwrite":
+                        if remove_file(config, asset['id']) == True:
+                            logging.info(f"Removed existing asset with path: {matched_file}")
+                        else:
+                            logging.error(f"Failed to remove existing asset: {file_name} with path: {matched_file}")                
 
     if collection_id:
         payload["collection_id"] = collection_id
@@ -265,17 +361,22 @@ def create_asset_id(config, file_path, collection_id=None):
         "app-id": config["app-id"],
         "auth-token": config["auth-token"]
     }
-    try:
-        response = requests.post(url, headers=headers, json=payload, params=params)
-        response.raise_for_status()
-        if response.status_code != 201:
-            print(f"Response error. Status - {response.status_code}, Error - {response.text}")
-            sys.exit(1)
-        response = response.json()
-        return response['id'], response['created_by_user']
-    except requests.RequestException as e:
-        logging.error(f"Failed to create asset: {e} - {getattr(e.response, 'text', '')}")
-        return None, getattr(e.response, 'status_code', None)
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("POST", url, params=params, headers=headers, json=payload)
+            if response and response.status_code in (200, 201):
+                logging.info("Upload initiated successfully.")
+                response_data = response.json()
+                return response_data['id'], response_data['created_by_user']
+            else:
+                logging.warning(f"create asset failed (attempt {attempt + 1}): {response.text if response else 'No response'}")
+        except Exception as e:
+            logging.warning(f"create asset error (attempt {attempt + 1}): {e}")
+            if attempt == 2:
+                logging.error("Failed to create asset after 3 attempts.")
+                return None, 500
+            time.sleep(random.uniform(*([1, 2], [3, 4], [10, 15])[attempt]))
+    return None, 500
     
 def add_asset_in_collection(config, asset_id, collection_id):
     url = f'{DOMAIN}/API/assets/v1/collections/{collection_id}/contents'
@@ -284,11 +385,22 @@ def add_asset_in_collection(config, asset_id, collection_id):
     headers = {"app-id":config["app-id"],
             "auth-token" : config["auth-token"]
             }
-    response = requests.post(url, headers=headers, json=payload,params=params)
-    if response.status_code != 201:
-        print(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        sys.exit(1)
-    return True
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("POST", url, params=params, headers=headers, json=payload)
+            if response and response.status_code in (200, 201):
+                logging.info("Asset added in collection successfully.")
+                return True
+            else:
+                logging.warning(f"adding asset to collection failed (attempt {attempt + 1}): {response.text if response else 'No response'}")
+                return False
+        except Exception as e:
+            logging.warning(f"asset addition to collection error (attempt {attempt + 1}): {e}")
+            if attempt == 2:
+                logging.error("Failed to add asset in collection after 3 attempts.")
+                return False
+            time.sleep(random.uniform(*([1, 2], [3, 4], [10, 15])[attempt]))
+    return False
 
 def collection_fullpath(config,collection_id):
     url = f'{DOMAIN}/API/assets/v1/collections/{collection_id}/full/path'
@@ -296,12 +408,22 @@ def collection_fullpath(config,collection_id):
         "auth-token" : config["auth-token"]
         }
     params = {"get_upload_path": "true"}
-    response = requests.get(url, headers=headers,params=params)
-    if response.status_code != 200:
-        print(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        sys.exit(1)
-    response = response.json()
-    return '' if "errors" in response else response
+    logger.debug(f"URL :------------------------------------------->  {url}")
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("GET", url, headers=headers, params=params)
+            if response and response.status_code in (200, 201):
+                logging.info("Colection full path acquired successfully.")                
+                return response.json()
+            else:
+                logger.info(f"Response error. Status - {response.status_code}, Error - {response.text}")
+                return ""
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to get Collection full path after 3 attempts: {e}")
+                return ""
+            time.sleep(random.uniform(*([1, 2], [3, 4], [10, 15])[attempt]))
+    return ""
 
 def create_format_id(config,asset_id, user_id):
     url = f'{DOMAIN}/API/files/v1/assets/{asset_id}/formats/'
@@ -309,12 +431,22 @@ def create_format_id(config,asset_id, user_id):
     headers = {"app-id":config["app-id"],
                "auth-token" : config["auth-token"]
                }
-    response = requests.post(url, headers=headers, json=payload)
-    if response.status_code != 201:
-        print(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        sys.exit(1)
-    response = response.json()
-    return response['id']
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("POST", url, headers=headers, json=payload)
+            if response and response.status_code in (200, 201):
+                logging.info("format_id aquired successfully.")
+                return response.json()['id']
+            else:
+                logging.warning(f"fetching of format_id failed (attempt {attempt + 1}): {response.text if response else 'No response'}")
+                return None
+        except Exception as e:
+            logging.warning(f"format_id fetch error (attempt {attempt + 1}): {e}")
+            if attempt == 2:
+                logging.error("Failed to get format_id after 3 attempts.")
+                return None
+            time.sleep(random.uniform(*([1, 2], [3, 4], [10, 15])[attempt]))
+    return None
 
 def create_fileset_id(config, asset_id, format_id, file_name, storage_id,upload_path):
     url = f'{DOMAIN}/API/files/v1/assets/{asset_id}/file_sets/'
@@ -322,12 +454,22 @@ def create_fileset_id(config, asset_id, format_id, file_name, storage_id,upload_
     headers = {"app-id":config["app-id"],
                "auth-token" : config["auth-token"]
                }
-    response = requests.post(url, headers=headers, json=payload)
-    if response.status_code != 201:
-        print(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        sys.exit(1)
-    response = response.json()
-    return response['id']
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("POST", url, headers=headers, json=payload)
+            if response and response.status_code in (200, 201):
+                logging.info("fileset_id aquired successfully.")
+                return response.json()['id']
+            else:
+                logging.warning(f"fetching of fileset_id failed (attempt {attempt + 1}): {response.text if response else 'No response'}")
+                return None
+        except Exception as e:
+            logging.warning(f"fileset_id fetch error (attempt {attempt + 1}): {e}")
+            if attempt == 2:
+                logging.error("Failed to get fileset_id after 3 attempts.")
+                return None
+            time.sleep(random.uniform(*([1, 2], [3, 4], [10, 15])[attempt]))
+    return None
 
 def get_upload_url(config, asset_id, file_name, file_size, fileset_id, storage_id, format_id,upload_path):
     url = f'{DOMAIN}/API/files/v1/assets/{asset_id}/files/'
@@ -341,12 +483,23 @@ def get_upload_url(config, asset_id, file_name, file_size, fileset_id, storage_i
         'format_id': format_id
     }
     headers = { "app-id":config["app-id"], "auth-token" : config["auth-token"] }
-    response = requests.post(url, headers=headers, json=file_info)
-    if response.status_code != 201:
-        print(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        sys.exit(1)
-    response = response.json()
-    return response['upload_url'], response['id']
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("POST", url, headers=headers, json=file_info)
+            if response and response.status_code in (200, 201):
+                logging.info("create_format_id aquired successfully.")
+                response_data = response.json()
+                return response_data['upload_url'], response_data['id']
+            else:
+                logging.warning(f"fetching of create_format_id failed (attempt {attempt + 1}): {response.text if response else 'No response'}")
+                return None, None
+        except Exception as e:
+            logging.warning(f"create_format_id fetch error (attempt {attempt + 1}): {e}")
+            if attempt == 2:
+                logging.error("Failed to get create_format_id after 3 attempts.")
+                return None, None
+            time.sleep(random.uniform(*([1, 2], [3, 4], [10, 15])[attempt]))
+    return None, None
 
 def get_upload_url_s3(config, asset_id, file_name, file_size, fileset_id, storage_id, format_id,upload_path):
     url = f'{DOMAIN}/API/files/v1/assets/{asset_id}/files/'
@@ -360,12 +513,23 @@ def get_upload_url_s3(config, asset_id, file_name, file_size, fileset_id, storag
         'format_id': format_id
     }
     headers = { "app-id":config["app-id"], "auth-token" : config["auth-token"] }
-    response = requests.post(url, headers=headers, json=file_info)
-    if response.status_code != 201:
-        print(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        sys.exit(1)
-    response = response.json()
-    return response['multipart_upload_url'], response['id']
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("POST", url, headers=headers, json=file_info)
+            if response and response.status_code in (200, 201):
+                logging.info("upload_url for s3 aquired successfully.")
+                response_data = response.json()
+                return response_data['multipart_upload_url'], response_data['id']
+            else:
+                logging.warning(f"fetching of upload_url for S3 failed (attempt {attempt + 1}): {response.text if response else 'No response'}")
+                return None, None
+        except Exception as e:
+            logging.warning(f"upload_url from S3 fetch error (attempt {attempt + 1}): {e}")
+            if attempt == 2:
+                logging.error("Failed to get upload_url from S3 after 3 attempts.")
+                return None, None
+            time.sleep(random.uniform(*([1, 2], [3, 4], [10, 15])[attempt]))
+    return None, None
 
 def get_upload_url_b2(config, asset_id, file_name, file_size, fileset_id, storage_id, format_id,upload_path):
     url = f'{DOMAIN}/API/files/v1/assets/{asset_id}/files/'
@@ -379,33 +543,65 @@ def get_upload_url_b2(config, asset_id, file_name, file_size, fileset_id, storag
         'format_id': format_id
     }
     headers = { "app-id":config["app-id"], "auth-token" : config["auth-token"] }
-    response = requests.post(url, headers=headers, json=file_info)
-    if response.status_code != 201:
-        print(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        sys.exit(1)
-    response = response.json()
-    return response['upload_url'], response['id'],response["upload_credentials"]["authorizationToken"],response["upload_filename"]
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("POST", url, headers=headers, json=file_info)
+            if response and response.status_code in (200, 201):
+                logging.info("upload_url for s3 aquired successfully.")
+                response_data = response.json()
+                return response_data['upload_url'], response_data['id'],response_data["upload_credentials"]["authorizationToken"],response_data["upload_filename"]
+            else:
+                logging.warning(f"fetching of upload_url for B2 failed (attempt {attempt + 1}): {response.text if response else 'No response'}")
+                return None, None, None, None
+        except Exception as e:
+            logging.warning(f"upload_url from B2 fetch error (attempt {attempt + 1}): {e}")
+            if attempt == 2:
+                logging.error("Failed to get upload_url from B2 after 3 attempts.")
+                return None, None, None, None
+            time.sleep(random.uniform(*([1, 2], [3, 4], [10, 15])[attempt]))
+    return None, None, None, None
 
 def get_upload_id_s3(upload_url):
-    response = requests.post(upload_url)
-    if response.status_code != 200:
-        print(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        sys.exit(1)
-    root = ET.fromstring(response.text)
-    namespace = root.tag.split('}')[0] + '}'
-    upload_id = root.find(f'{namespace}UploadId').text
-    return upload_id
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("POST", upload_url)
+            if response and response.status_code in (200, 201):
+                logging.info("upload_id for s3 aquired successfully.")
+                root = ET.fromstring(response.text)
+                namespace = root.tag.split('}')[0] + '}'
+                upload_id = root.find(f'{namespace}UploadId').text
+                return upload_id
+            else:
+                logging.warning(f"fetching of upload_id for S3 failed (attempt {attempt + 1}): {response.text if response else 'No response'}")
+                return None
+        except Exception as e:
+            logging.warning(f"upload_id from S3 fetch error (attempt {attempt + 1}): {e}")
+            if attempt == 2:
+                logging.error("Failed to get upload_id from S3 after 3 attempts.")
+                return None
+            time.sleep(random.uniform(*([1, 2], [3, 4], [10, 15])[attempt]))
+    return None
 
 def get_part_url_s3(config, asset_id, file_id, upload_id):
     part_url = f'{DOMAIN}/API/files/v1/assets/{asset_id}/files/{file_id}/multipart_url/part/'
     params = {"parts_num": "1", "upload_id": upload_id, "per_page": "100", "page": "1"}
     headers = { "app-id":config["app-id"], "auth-token" : config["auth-token"] }
-    response = requests.get(part_url, headers=headers, params=params)
-    if response.status_code != 200:
-        print(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        sys.exit(1)
-    response = response.json()
-    return response["objects"][0]["url"]
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("POST", part_url, headers=headers, params=params)
+            if response and response.status_code in (200, 201):
+                logging.info("part_url for s3 aquired successfully.")
+                return response.json()["objects"][0]["url"]
+            else:
+                logging.warning(f"fetching of part_url for S3 failed (attempt {attempt + 1}): {response.text if response else 'No response'}")
+                return None
+        except Exception as e:
+            logging.warning(f"part_url from S3 fetch error (attempt {attempt + 1}): {e}")
+            if attempt == 2:
+                logging.error("Failed to get part_url from S3 after 3 attempts.")
+                return None
+            time.sleep(random.uniform(*([1, 2], [3, 4], [10, 15])[attempt]))
+    return None
 
 def upload_file_gcs(upload_url, file_path, file_size):
     google_headers = {
@@ -418,56 +614,160 @@ def upload_file_gcs(upload_url, file_path, file_size):
         'referer': f'{DOMAIN}/upload',
         'x-goog-resumable': 'start',
     }
-    resp_JSON = requests.post(upload_url, headers=google_headers)
-    if resp_JSON.status_code != 201:
-        print(f"Response error. Status - {upload_url.status_code}, Error - {upload_url.text}")
-        sys.exit(1)
-    upload_id = resp_JSON.headers['X-GUploader-Uploadid']
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("POST", upload_url, headers=google_headers)
+            if response and response.status_code in (200, 201):
+                logging.info("upload_id for s3 aquired successfully.")
+                upload_id = response.headers['X-GUploader-Uploadid']
+            else:
+                logging.warning(f"fetching of upload_id for S3 failed (attempt {attempt + 1}): {response.text if response else 'No response'}")
+        except Exception as e:
+            logging.warning(f"upload_id from S3 fetch error (attempt {attempt + 1}): {e}")
+            if attempt == 2:
+                logging.error("Failed to get upload_id from S3 after 3 attempts.")
+            time.sleep(random.uniform(*([1, 2], [3, 4], [10, 15])[attempt]))
 
     google_headers = {
         'content-length': str(file_size),
         'x-goog-resumable': 'upload'
     }
+    for attempt in range(3):
+        try:
+            # Open file on each retry
+            with open(file_path, 'rb') as f:
+                full_upload_url = f"{upload_url}&upload_id={upload_id}"
+                upload_response = requests.put(full_upload_url, headers=google_headers, data=f)
 
-    with open(file_path, 'rb') as f:
-        full_upload_url = f"{upload_url}&upload_id={upload_id}"
-        x = requests.put(full_upload_url, headers=google_headers, data=f)
-        if x.status_code != 200:
-            print(f"Response error. Status - {x.status_code}, Error - {x.text}")
-            sys.exit(1)
-        return x
+                # If 4xx, don't retry — it's a client error (e.g. bad upload_id, data, or headers)
+                if 400 <= upload_response.status_code < 500:
+                    error_msg = f"Client error: {upload_response.status_code} {upload_response.text}"
+                    logging.error(error_msg)
+                    raise RuntimeError(error_msg)
+
+                # If 2xx, success
+                if upload_response.status_code in (200, 201):
+                    logging.debug(f"Upload successful: {upload_response.text}")
+                    return upload_response
+
+                # If 5xx or unexpected, retry
+                logging.warning(f"Server error {upload_response.status_code}: {upload_response.text}. Retrying...")
+
+        except (ConnectionError, Timeout, requests.exceptions.ChunkedEncodingError) as e:
+            logging.warning(f"Network error on attempt {attempt + 1}: {e}")
+        except Exception as e:
+            if "4xx" in str(e).lower():
+                logging.error(f"Client error during upload: {e}")
+                raise  # Don't retry 4xx
+            logging.warning(f"Transient error on attempt {attempt + 1}: {e}")
+
+        # Apply jittered backoff
+        if attempt < 2:
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+        else:
+            logging.critical(f"Upload failed after 3 attempts: {file_name}")
+            raise RuntimeError("Upload failed after retries.")
+
+    # Should not reach here
+    raise RuntimeError("Upload failed for GCS.")         
 
 def upload_file_s3(config, part_url, file_path, upload_id, asset_id, file_id):
-    with open(file_path, 'rb') as file:
-        response = requests.put(part_url, data=file)
-        if response.status_code != 200:
-            print(f"Response error. Status - {response.status_code}, Error - {response.text}")
-            sys.exit(1)
-        etag = response.headers['etag']
+    etag = None
+    for attempt in range(3):
+        try:
+            with open(file_path, 'rb') as file:
+                response = requests.put(part_url, data=file)
+            if 400 <= response.status_code < 500:
+                error_msg = f"Client error: {response.status_code} {response.text}"
+                logging.error(error_msg)
+                raise RuntimeError(error_msg)
+
+            if response.status_code in (200, 201):
+                etag = response.headers.get('etag')
+                if not etag:
+                    logging.warning("No ETag returned from S3 part upload.")
+                else:
+                    logging.debug(f"Upload successful, ETag: {etag}")
+                break
+
+            logging.warning(f"Unexpected status code: {response.status_code}, response: {response.text}")
+            if attempt < 2:
+                continue
+            else:
+                raise RuntimeError(f"Upload failed with status {response.status_code}")
+
+        except RuntimeError as e:
+            if "Client error" in str(e):
+                logging.error(f"Client error during upload: {e}")
+                raise  # Don't retry 4xx
+            logging.warning(f"Transient error on attempt {attempt + 1}: {e}")
+            if attempt < 2:
+                base_delay = [1, 3, 10][attempt]
+                delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+                time.sleep(delay)
+            else:
+                logging.critical(f"Upload failed after 3 attempts: {file_path}")
+                raise
+        except Exception as e:
+            logging.warning(f"Unexpected error on attempt {attempt + 1}: {e}")
+            if attempt < 2:
+                base_delay = [1, 3, 10][attempt]
+                delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+                time.sleep(delay)
+            else:
+                logging.critical(f"Upload failed after 3 attempts: {file_path}")
+                raise
+
+    if not etag:
+        raise RuntimeError("Failed to retrieve ETag after successful upload.")
+
+    logging.debug("Completing multipart upload...")
     multipart_url = f'{DOMAIN}/API/files/v1/assets/{asset_id}/files/{file_id}/multipart_url/'
-    complete_url_response = requests.get(
-        multipart_url,
-        headers = { "app-id":config["app-id"], "auth-token" : config["auth-token"] },
-        params={"upload_id": upload_id, "type": "complete_url"}
-    )
-    if complete_url_response.status_code != 200:
-        print(f"Response error. Status - {response.status_code}, Error - {response.text}")
+    try:
+        complete_url_response = make_request_with_retries(
+            method='GET',
+            url=multipart_url,
+            headers={
+                "app-id": config["app-id"],
+                "auth-token": config["auth-token"]
+            },
+            params={"upload_id": upload_id, "type": "complete_url"}
+        )
+        if complete_url_response.status_code != 200:
+            error_msg = f"Failed to get complete_url: {complete_url_response.status_code}, {complete_url_response.text}"
+            logging.error(error_msg)
+            sys.exit(1)
+        complete_url_data = complete_url_response.json()
+        complete_url = complete_url_data.get('complete_url')
+        if not complete_url:
+            raise ValueError("No 'complete_url' in response")
+        # Create XML payload
+        xml_payload = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <CompleteMultipartUpload>
+        <Part>
+            <ETag>{etag}</ETag>
+            <PartNumber>1</PartNumber>
+        </Part>
+        </CompleteMultipartUpload>'''
+        headers = {'Content-Type': 'application/xml'}
+        final_response = make_request_with_retries(
+            method='POST',
+            url=complete_url,
+            data=xml_payload,
+            headers=headers
+        )
+        if final_response.status_code != 200:
+            error_msg = f"Failed to complete upload: {final_response.status_code}, {final_response.text}"
+            logging.error(error_msg)
+            sys.exit(1)
+        logging.info("Multipart upload completed successfully.")
+        return final_response
+
+    except Exception as e:
+        logging.critical(f"Failed to complete multipart upload: {e}")
         sys.exit(1)
-    complete_url_response =complete_url_response.json()
-    complete_url = complete_url_response['complete_url']
-    xml_payload = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-    <CompleteMultipartUpload>
-    <Part>
-        <ETag>{etag}</ETag>
-        <PartNumber>1</PartNumber>
-    </Part>
-    </CompleteMultipartUpload>'''.format(etag=etag)
-    headers = {'Content-Type': 'application/xml'}
-    response = requests.post(complete_url, data=xml_payload, headers=headers)
-    if response.status_code != 200:
-        print(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        sys.exit(1)
-    return response
 
 def upload_file_b2(upload_url,authorizationToken,file_path,upload_filename,sha1_of_file):
     headers = {
@@ -476,75 +776,153 @@ def upload_file_b2(upload_url,authorizationToken,file_path,upload_filename,sha1_
                "X-Bz-Content-Sha1" : sha1_of_file,
                "Content-Type" : "b2/x-auto"
                }
-    
-    with open(file_path, 'rb') as f:
-        x = requests.post(upload_url,headers=headers,data=f)
-        if x.status_code != 200:
-            print(f"Response error. Status - {x.status_code}, Error - {x.text}")
-            sys.exit(1)
-        return x
+    for attempt in range(3):
+        try:
+            # Open file on each retry
+            with open(file_path, 'rb') as f:
+                response = requests.post(upload_url,headers=headers,data=f)
+
+                # If 4xx, don't retry — it's a client error (e.g. bad index_id, auth)
+                if 400 <= response.status_code < 500:
+                    error_msg = f"Client error: {response.status_code} {response.text}"
+                    logging.error(error_msg)
+                    raise RuntimeError(error_msg)
+
+                # If 2xx, success
+                if response.status_code in (200, 201):
+                    logging.debug(f"Upload successful for B2: {response.text}")
+                    return response
+
+                # If 5xx or unexpected, retry
+                logging.warning(f"Server error {response.status_code}: {response.text}. Retrying...")
+
+        except (ConnectionError, Timeout, requests.exceptions.ChunkedEncodingError) as e:
+            logging.warning(f"Network error on attempt {attempt + 1}: {e}")
+        except Exception as e:
+            if "4xx" in str(e).lower():
+                logging.error(f"Client error during upload: {e}")
+                raise  # Don't retry 4xx
+            logging.warning(f"Transient error on attempt {attempt + 1}: {e}")
+
+        # Apply jittered backoff
+        if attempt < 2:
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+        else:
+            logging.critical(f"Upload failed after 3 attempts")
+            raise RuntimeError("Upload failed after retries.")
+
+    # Should not reach here
+    raise RuntimeError("Upload failed for B2.")
 
 def upload_file_azure(upload_url, file_path):
     headers = { "x-ms-blob-type" : "BlockBlob"}
-    with open(file_path, 'rb') as file:
-        x = requests.put(upload_url, data=file,headers=headers)
-        if x.status_code != 200:
-            print(f"Response error. Status - {x.status_code}, Error - {x.text}")
-            sys.exit(1)
-        return x
+    for attempt in range(3):
+        try:
+            # Open file on each retry
+            with open(file_path, 'rb') as f:
+                response = requests.put(upload_url, headers=headers, data=f)
+
+                # If 4xx, don't retry — it's a client error (e.g. bad data, auth)
+                if 400 <= response.status_code < 500:
+                    error_msg = f"Client error: {response.status_code} {response.text}"
+                    logging.error(error_msg)
+                    raise RuntimeError(error_msg)
+
+                # If 2xx, success
+                if response.status_code in (200, 201):
+                    logging.debug(f"Upload successful for Azure: {response.text}")
+                    return response
+
+                # If 5xx or unexpected, retry
+                logging.warning(f"Server error {response.status_code}: {response.text}. Retrying...")
+
+        except (ConnectionError, Timeout, requests.exceptions.ChunkedEncodingError) as e:
+            logging.warning(f"Network error on attempt {attempt + 1}: {e}")
+        except Exception as e:
+            if "4xx" in str(e).lower():
+                logging.error(f"Client error during upload: {e}")
+                raise  # Don't retry 4xx
+            logging.warning(f"Transient error on attempt {attempt + 1}: {e}")
+
+        # Apply jittered backoff
+        if attempt < 2:
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+        else:
+            logging.critical(f"Upload failed after 3 attempts")
+            raise RuntimeError("Upload failed after retries.")
+
+    # Should not reach here
+    raise RuntimeError("Upload failed for Azure.")
 
 def file_status_update(config, asset_id, file_id):
     url = f'{DOMAIN}/API/files/v1/assets/{asset_id}/files/{file_id}/'
     headers = {"app-id":config["app-id"],
             "auth-token" : config["auth-token"]
             }
-    response = requests.patch(url, headers=headers, json={"status": "CLOSED", "progress_processed": 100})
-    if response.status_code != 200:
-        print(f"Response error. Status - {response.status_code}, Error - {response.text}")
-        exit(1)
-    return response
+    for attempt in range(3):
+        try:
+            response = make_request_with_retries("PATCH", url, headers=headers, json={"status": "CLOSED", "progress_processed": 100})
+            if response and response.status_code == 200:
+                logging.info("File status updated successfully.")
+                return response
+            else:
+                logging.error(f"Failed to update File Status: {response.status_code} {response.text}")
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to update file status after 3 attempts: {e}")
+                return None
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return None
 
 
 
 if __name__ == '__main__':
+    # Random delay to avoid thundering herd
+    time.sleep(random.uniform(0.0, 1.5))
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("-m", "--mode", required=True, help="mode of Operation proxy or original upload")
-    parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
-    parser.add_argument("-j", "--job-guid", help="Job Guid of SDNA job")
+    parser.add_argument("-m", "--mode", required=True, help="Mode: proxy, original, get_base_target, etc.")
+    parser.add_argument("-c", "--config-name", required=True, help="Cloud config name")
+    parser.add_argument("-j", "--job-guid", help="Job GUID")
     parser.add_argument("--collection-id", help="Collection ID to resolve relative upload paths from") 
-    parser.add_argument("--parent-id", help="Optional parent collection ID to resolve relative upload paths from") 
-    parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
-    parser.add_argument("-sp", "--source-path", help="Source path of file to look for original upload")
-    parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
-    parser.add_argument("-up", "--upload-path", required=True, help="Path where file will be uploaded google Drive")
-    parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
-    parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
-    parser.add_argument("--log-level", default="debug", help="Logging level")
-    parser.add_argument("--resolved-upload-id", action="store_true", help="Pass if upload path is already resolved collection ID")
-    parser.add_argument("--controller-address",help="Link IP/Hostname Port")
+    parser.add_argument("--parent-id", help="Parent folder ID")
+    parser.add_argument("-cp", "--catalog-path", help="Catalog path")
+    parser.add_argument("-sp", "--source-path", help="Source file path")
+    parser.add_argument("-mp", "--metadata-file", help="Metadata file path")
+    parser.add_argument("-up", "--upload-path", required=True, help="Upload path or ID")
+    parser.add_argument("-sl", "--size-limit", help="Size limit in MB")
+    parser.add_argument("--dry-run", action="store_true", help="Dry run")
+    parser.add_argument("--log-level", default="debug", help="Log level")
+    parser.add_argument("--resolved-upload-id", action="store_true", help="Upload path is already resolved ID")
+    parser.add_argument("--controller-address", help="Controller IP:Port")
+
     args = parser.parse_args()
-    
 
     setup_logging(args.log_level)
 
     mode = args.mode
     if mode not in VALID_MODES:
-        logging.error(f"Only allowed modes: {VALID_MODES}")
+        logging.error(f"Invalid mode. Use one of: {VALID_MODES}")
         sys.exit(1)
 
     cloud_config_path = get_cloud_config_path()
     if not os.path.exists(cloud_config_path):
-        logging.error(f"Missing cloud config: {cloud_config_path}")
+        logging.error(f"Cloud config not found: {cloud_config_path}")
         sys.exit(1)
 
     cloud_config = ConfigParser()
     cloud_config.read(cloud_config_path)
-    cloud_config_name = args.config_name
-    if cloud_config_name not in cloud_config:
-        logging.error(f"Missing cloud config section: {cloud_config_name}")
+    if args.config_name not in cloud_config:
+        logging.error(f"Config '{args.config_name}' not found.")
         sys.exit(1)
 
-    cloud_config_data = cloud_config[cloud_config_name]
+    cloud_config_data = cloud_config[args.config_name]
     
     # set collection ID if provided if not check from cloudconfig data block and if not present there need to use api of get collection and take the id of first collection we get
     if args.collection_id:
@@ -553,82 +931,80 @@ if __name__ == '__main__':
         collection_id = cloud_config_data["collection_id"]
     else:
         collection_id = get_first_collection(cloud_config_data)
-        
-    if mode == "get_base_target":
-        upload_path = args.upload_path
-        if not upload_path:
-            logging.error("Upload path must be provided for get_base_target mode")
+        if not collection_id:
+            logging.error("Could not retrieve collection_id from Iconik.")
             sys.exit(1)
 
-        logging.info(f"Fetching upload target ID for path: {upload_path}")
-        
-        if args.resolved_upload_id:
-            print(args.upload_path)
-            sys.exit(0)
-
-        logging.info(f"Fetching upload target ID for path: {upload_path}")
-        base_id = args.parent_id or collection_id
-        up_id = find_or_create_collection_path(cloud_config_data, upload_path, base_id) if '/' in upload_path else upload_path
-        print(up_id)
-        sys.exit(0)
-    
-    matched_file = args.source_path
-    catalog_path = args.catalog_path
-    upload_path = remove_file_name_from_path(args.upload_path)
-
-    if collection_id is None or matched_file is None:
-        print(f'Collection id and source file both are required for upload')
-        sys.exit(1)
+    if collection_id is None:
+        print(f'Collection id is required for upload')
+        sys.exit(1)            
 
     logging.info(f"Starting S3 upload process in {mode} mode")
     logging.debug(f"Using cloud config: {cloud_config_path}")
     logging.debug(f"Source path: {args.source_path}")
     logging.debug(f"Upload path: {args.upload_path}")
 
-    file_name_for_url = extract_file_name(matched_file) if mode == "original" else extract_file_name(catalog_path)
+    if mode == "get_base_target":
+        if args.resolved_upload_id:
+            print(args.upload_path)
+            sys.exit(0)
 
-    if not os.path.exists(matched_file):
-        logging.error(f"File not found: {matched_file}")
+        try:
+            base_id = args.parent_id or None
+            folder_id = find_or_create_collection_path(cloud_config_data, args.upload_path, base_id)
+            if not folder_id:
+                logging.error("Failed to resolve folder ID for get_base_target.")
+                sys.exit(1)
+            print(folder_id)
+            sys.exit(0)
+        except Exception as e:
+            logging.critical(f"Failed to resolve upload target: {e}")
+            sys.exit(1)
+    
+    # Validate source file
+    matched_file = args.source_path
+    if not matched_file or not os.path.exists(matched_file):
+        logging.error(f"Source file not found: {matched_file}")
         sys.exit(4)
 
-    matched_file_size = os.stat(matched_file).st_size
-    file_size_limit = args.size_limit
-    if mode == "original" and file_size_limit:
+    matched_file_size = os.path.getsize(matched_file)
+    # Size limit check
+    if mode == "original" and args.size_limit:
         try:
-            size_limit_bytes = float(file_size_limit) * 1024 * 1024
-            if matched_file_size > size_limit_bytes:
-                logging.error(f"File too large: {matched_file_size / (1024 * 1024):.2f} MB > limit of {file_size_limit} MB")
+            limit_bytes = float(args.size_limit) * 1024 * 1024
+            if matched_file_size > limit_bytes:
+                logging.error(f"File too large: {matched_file_size / 1024 / 1024:.2f} MB > {args.size_limit} MB")
                 sys.exit(4)
-        except Exception as e:
-            logging.warning(f"Could not validate size limit: {e}")
+        except (ValueError, TypeError):
+            logging.warning(f"Invalid size limit format: {args.size_limit}")
 
-    catalog_path = remove_file_name_from_path(args.catalog_path)
-    normalized_path = catalog_path.replace("\\", "/")
-    if "/1/" in normalized_path:
-        relative_path = normalized_path.split("/1/", 1)[-1]
-    else:
-        relative_path = normalized_path
-    catalog_url = urllib.parse.quote(relative_path)
+    # Prepare backlink URL
+    catalog_path = args.catalog_path or matched_file
+    file_name_for_url = extract_file_name(matched_file) if mode == "original" else extract_file_name(catalog_path)
+    rel_path = remove_file_name_from_path(catalog_path).replace("\\", "/")
+    rel_path = rel_path.split("/1/", 1)[-1] if "/1/" in rel_path else rel_path
+    catalog_url = urllib.parse.quote(rel_path)
     filename_enc = urllib.parse.quote(file_name_for_url)
-    job_guid = args.job_guid
+    job_guid = args.job_guid or ""
 
-    if args.controller_address is not None and len(args.controller_address.split(":")) == 2:
-        client_ip, client_port = args.controller_address.split(":")
+    # Resolve controller address
+    if args.controller_address and ":" in args.controller_address:
+        client_ip, _ = args.controller_address.split(":", 1)
     else:
-        client_ip, client_port = get_link_address_and_port()
+        ip, _ = get_link_address_and_port()
+        client_ip = ip
 
     backlink_url = f"https://{client_ip}/dashboard/projects/{job_guid}/browse&search?path={catalog_url}&filename={filename_enc}"
-    logging.debug(f"Generated dashboard URL: {backlink_url}")
+    logging.debug(f"Generated backlink URL: {backlink_url}")
 
     if args.dry_run:
         logging.info("[DRY RUN] Upload skipped.")
-        logging.info(f"[DRY RUN] File to upload: {matched_file}")
-        logging.info(f"[DRY RUN] Upload path: {args.upload_path} => google Drive")
-        meta_file = args.metadata_file
-        if meta_file:
-            logging.info(f"[DRY RUN] Metadata would be applied from: {meta_file}")
+        logging.info(f"[DRY RUN] File: {matched_file}")
+        logging.info(f"[DRY RUN] Upload path: {args.upload_path} => Iconik")
+        if args.metadata_file:
+            logging.info(f"[DRY RUN] Metadata will be applied from: {args.metadata_file}")
         else:
-            logging.warning("[DRY RUN] Metadata upload enabled but no metadata file specified.")
+            logging.warning("[DRY RUN] No metadata file specified.")
         sys.exit(0)
 
     logging.info(f"Starting upload process to Google Drive in {mode} mode")
@@ -636,12 +1012,17 @@ if __name__ == '__main__':
     storage_name = cloud_config_data["name"] if not cloud_config_data["name"] is None and len(cloud_config_data["name"]) != 0 else "iconik-files-gcs"
     storage_method = cloud_config_data["method"] if not cloud_config_data["method"] is None and len(cloud_config_data["method"]) != 0 else "GCS"
     
-    if args.upload_path and args.resolved_upload_id:
-        collection_to_use = args.upload_path
-    elif args.upload_path and not args.resolved_upload_id:
-        collection_to_use = find_or_create_collection_path(cloud_config_data, args.upload_path, collection_id)
-    else:
-        collection_to_use = collection_id
+    # Resolve Collection ID
+    try:
+        if args.upload_path and args.resolved_upload_id:
+            collection_to_use = args.upload_path
+        elif args.upload_path and not args.resolved_upload_id:
+            collection_to_use = find_or_create_collection_path(cloud_config_data, args.upload_path, collection_id)
+        else:
+            collection_to_use = collection_id
+    except Exception as e:
+        logging.critical(f"Collection resolution failed: {e}")
+        sys.exit(1)
     
     if storage_method and storage_name:
         collection = collection_to_use
@@ -706,15 +1087,15 @@ if __name__ == '__main__':
     elif storage_method == "AZURE":
         upload_url, file_id = get_upload_url(cloud_config_data,asset_id, file_name, matched_file_size, fileset_id, storage_id, format_id,upload_path)
         upload_code = upload_file_azure(upload_url, matched_file)
-        if upload_code.status_code == 200:
+        if upload_code is not None and upload_code.status_code == 200:
             response = file_status_update(cloud_config_data,asset_id, file_id)
-            if response.status_code != 200:
-                print(f"Response error. Status - {response.status_code}, Error - {response.text}")
+            if response is None or response.status_code != 200:
+                print(f"Response error. Status - {response.status_code if response else 'No response'}, Error - {response.text if response else 'No response'}")
                 sys.exit(1)
             print("File Upload Succesfully")
             sys.exit(0)
         else:
-            print(f"Response error. Status - {upload_code.status_code}, Error - {upload_code.text}")
+            print(f"Response error. Status - {upload_code.status_code if upload_code else 'No response'}, Error - {upload_code.text if upload_code else 'No response'}")
             sys.exit(1)
             
     else:

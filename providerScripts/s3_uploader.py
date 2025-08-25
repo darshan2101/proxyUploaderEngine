@@ -77,17 +77,31 @@ def get_link_address_and_port():
 
 
 def upload_file_to_s3(config_data, bucket_name, source_path, upload_path, metadata=None):
-    try:
-        client_kwargs = {
-            'service_name': 's3',
-            'aws_access_key_id': config_data['access_key_id'],
-            'aws_secret_access_key': config_data['secret_access_key']
-        }
-        if 'region' in config_data:
-            client_kwargs['region_name'] = config_data['region']
-        if 'endpoint_url' in config_data:
-            client_kwargs['endpoint_url'] = config_data['endpoint_url']
+    from botocore.config import Config
+    from botocore.exceptions import ClientError, ConnectionError, EndpointConnectionError, ReadTimeoutError
 
+    # Define retry logic via boto3 config
+    retry_config = Config(
+        retries={
+            'max_attempts': 5,
+            'mode': 'adaptive'  # or 'standard'
+        },
+        connect_timeout=15,
+        read_timeout=30,
+    )
+
+    client_kwargs = {
+        'service_name': 's3',
+        'aws_access_key_id': config_data['access_key_id'],
+        'aws_secret_access_key': config_data['secret_access_key'],
+        'config': retry_config
+    }
+    if 'region' in config_data:
+        client_kwargs['region_name'] = config_data['region']
+    if 'endpoint_url' in config_data:
+        client_kwargs['endpoint_url'] = config_data['endpoint_url']
+
+    try:
         s3 = boto3.client(**client_kwargs)
 
         upload_path = upload_path.lstrip('/')
@@ -96,22 +110,32 @@ def upload_file_to_s3(config_data, bucket_name, source_path, upload_path, metada
         if metadata:
             sanitized_metadata = {k.lower().replace(' ', '-'): str(v) for k, v in metadata.items()}
 
+        # Perform upload with extra retry resilience
         s3.upload_file(
             Filename=source_path,
             Bucket=bucket_name,
             Key=upload_path,
             ExtraArgs={'Metadata': sanitized_metadata} if sanitized_metadata else {}
         )
+
+        logging.info(f"Successfully uploaded {source_path} to s3://{bucket_name}/{upload_path}")
         return {
             "status": 200,
-            "detail": "uploaded asset successfully"
+            "detail": "Uploaded asset successfully"
         }
+
+    except (ClientError, EndpointConnectionError, ReadTimeoutError, ConnectionError) as e:
+        error_code = e.response['Error']['Code'] if isinstance(e, ClientError) else "Network/Timeout"
+        if isinstance(e, ClientError) and e.response['Error']['Code'].startswith('4'):
+            # Client error — don't retry
+            logging.error(f"Client error during S3 upload: {e}")
+            return {"status": 400, "detail": str(e)}
+        logging.error(f"Transient S3 error: {e}")
+        return {"status": 500, "detail": f"Transient S3 failure: {str(e)}"}
+
     except Exception as e:
-        logging.debug(f"Error: {e}")
-        return {
-            "status": 500,
-            "detail": str(e)
-        }
+        logging.error(f"Unexpected error during S3 upload: {e}")
+        return {"status": 500, "detail": str(e)}
 
 def prepare_metadata_to_upload( backlink_url, properties_file = None):    
     metadata = {
