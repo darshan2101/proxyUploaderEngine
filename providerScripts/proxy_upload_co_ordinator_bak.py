@@ -41,7 +41,7 @@ PROVIDER_SCRIPTS = {
 }
 
 # New upload modes
-UPLOAD_MODES = ["video_proxy", "video_proxy_sample_scene_change", "video_sample_faces", "video_sample_interval", "audio_proxy", "sprite_sheet"]
+UPLOAD_TYPES = ["video_proxy", "video_proxy_sample_scene_change", "video_sample_faces", "video_sample_interval", "audio_proxy", "sprite_sheet"]
 
 def debug_print(log_path, text_string):
     current_datetime = datetime.now()
@@ -118,7 +118,7 @@ def build_proxy_map(records, config, progressDetails):
     proxy_map = {}
     proxy_dir = config["proxy_directory"]
     log_path = config["logging_path"]
-    upload_mode = config.get("upload_mode", "video_proxy")
+    upload_type = config.get("upload_type", "video_proxy")
     total_records = len(records)
 
     def resolve_proxy(record):
@@ -126,9 +126,9 @@ def build_proxy_map(records, config, progressDetails):
         base_source_path = os.path.join(*original_source_path.split("/./")) if "/./" in original_source_path else original_source_path
         base_name = os.path.splitext(os.path.basename(base_source_path))[0]
         
-        if upload_mode == "sprite_sheet":
+        if upload_type == "sprite_sheet":
             # New behavior - folder with multiple files (search recursively)
-            return base_source_path, find_folder_with_files(proxy_dir, base_name, upload_mode, log_path)
+            return base_source_path, find_folder_with_files(proxy_dir, base_name, upload_type, log_path)
         else:
             # Original behavior - single file proxy
             pattern = f"{base_name}*.*"
@@ -163,10 +163,10 @@ def build_proxy_map(records, config, progressDetails):
     return proxy_map
 
 # Helper function to find folder with files recursively
-def find_folder_with_files(proxy_dir, folder_name, upload_mode, log_path):
+def find_folder_with_files(proxy_dir, folder_name, upload_type, log_path):
     base_dir = Path(proxy_dir)
     
-    debug_print(log_path, f"[FIND FOLDER] Searching for folder '{folder_name}' in {proxy_dir} with mode {upload_mode}")
+    debug_print(log_path, f"[FIND FOLDER] Searching for folder '{folder_name}' in {proxy_dir} with mode {upload_type}")
     
     # Use rglob to search recursively for directories with the specified name
     matching_folders = list(base_dir.rglob(folder_name))
@@ -182,7 +182,7 @@ def find_folder_with_files(proxy_dir, folder_name, upload_mode, log_path):
     all_matching_files = []
     for file_path in proxy_folder.iterdir():
         if file_path.is_file():
-            if upload_mode == "sprite_sheet" and is_spreadsheet_file(str(file_path)):
+            if upload_type == "sprite_sheet" and is_spreadsheet_file(str(file_path)):
                 all_matching_files.append(str(file_path))
                 debug_print(log_path, f"[FIND FOLDER] Found spreadsheet file: {file_path}")
     
@@ -529,7 +529,7 @@ def read_csv_records(csv_path, logging_path, extensions = [], file_size_limit = 
 
 def calculate_total_size(records, config, proxy_map=None):
     total_size = 0
-    upload_mode = config.get("upload_mode", "video_proxy")
+    upload_type = config.get("upload_type", "video_proxy")
     
     for r in records:
         if "/./" in r[0]:
@@ -539,7 +539,7 @@ def calculate_total_size(records, config, proxy_map=None):
             full_path = r[0]
 
         if config["mode"] == "proxy":
-            if upload_mode == "sprite_sheet":
+            if upload_type == "sprite_sheet":
                 # New behavior - multiple files
                 proxy_files = proxy_map.get(full_path) if proxy_map else None
                 if proxy_files and isinstance(proxy_files, list):
@@ -607,7 +607,7 @@ def build_folder_id_map(records, config, log_path, progressDetails):
             for seg_idx, segment in enumerate(path_segments):
                 if seg_idx < len(path_segments):
                     is_last = seg_idx == len(path_segments) - 1
-                    if is_last and config.get("mode") == "proxy" and config.get("upload_mode") == "sprite_sheet":
+                    if is_last and config.get("mode") == "proxy" and config.get("upload_type") == "sprite_sheet":
                         segment = os.path.splitext(segment)[0]
                     elif is_last:
                         break
@@ -664,7 +664,7 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
         debug_print(config['logging_path'], f"[STEP] Processing record: {record}")
         original_source_path, catalog_path, metadata_path = record
         
-        upload_mode = config.get("upload_mode", "video_proxy")
+        upload_type = config.get("upload_type", "video_proxy")
 
         # Extract relative folder path for resolved_ids lookup
         if "/./" in original_source_path:
@@ -717,14 +717,14 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
                 return
 
         # Handle different upload modes
-        if upload_mode == "sprite_sheet" and config["mode"] == "proxy":
+        if upload_type == "sprite_sheet" and config["mode"] == "proxy":
             # Multiple files upload mode (images/spreadsheets)
             base_source_path = os.path.join(*original_source_path.split("/./")) if "/./" in original_source_path else original_source_path
             proxy_files = proxy_map.get(base_source_path) if proxy_map else None
             logging.debug(f"proxy files for {base_source_path}: {proxy_files}")
 
             if not proxy_files or not isinstance(proxy_files, list):
-                error_msg = f"[UPLOAD MODE {upload_mode}] No files found for {base_source_path}"
+                error_msg = f"[UPLOAD MODE {upload_type}] No files found for {base_source_path}"
                 debug_print(config["logging_path"], error_msg)
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 write_csv_row(issues_log, ["Error", base_source_path, timestamp, error_msg])
@@ -741,7 +741,7 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
             specific_upload_path_id = resolved_ids.get(sub_folder_key, upload_path_id)
 
             for file_path in proxy_files:
-                debug_print(config['logging_path'], f"[UPLOAD MODE {upload_mode}] Uploading {file_path} to sub-folder {sub_folder_key}")
+                debug_print(config['logging_path'], f"[UPLOAD MODE {upload_type}] Uploading {file_path} to sub-folder {sub_folder_key}")
 
                 # Create a temporary record for this specific file
                 temp_record = (file_path, catalog_path, metadata_path)
@@ -916,7 +916,7 @@ if __name__ == '__main__':
     parser.add_argument("-c","--json-path", help="Path to JSON config file")
     parser.add_argument("--dry-run", action="store_true", help="Run in dry mode without uploading")
     parser.add_argument("--log-prefix", help="Prefix path for transfer/client/issues CSV logs")
-    parser.add_argument("--upload-mode", choices=UPLOAD_MODES, default="normal", help="Upload mode: normal, spreadsheets, or images")
+    parser.add_argument("--upload-type", choices=UPLOAD_TYPES, default="normal", help="Upload mode: normal, spreadsheets, or images")
     args = parser.parse_args()
 
     config_path = args.json_path
@@ -951,14 +951,14 @@ if __name__ == '__main__':
         required_keys.append("proxy_output_base_path")
         os.makedirs(request_data.get("proxy_output_base_path"), exist_ok=True)  # Ensure target dir exists
 
-    # Add upload_mode from argument or config
-    if args.upload_mode and args.upload_mode != "video_proxy":
-        request_data["upload_mode"] = args.upload_mode
-    elif "upload_mode" in request_data and request_data["upload_mode"] not in UPLOAD_MODES:
-        print(f"Invalid upload_mode: {request_data['upload_mode']}. Must be one of: {UPLOAD_MODES}")
+    # Add upload_type from argument or config
+    if args.upload_type and args.upload_type != "video_proxy":
+        request_data["upload_type"] = args.upload_type
+    elif "upload_type" in request_data and request_data["upload_type"] not in UPLOAD_TYPES:
+        print(f"Invalid upload_type: {request_data['upload_type']}. Must be one of: {UPLOAD_TYPES}")
         sys.exit(1)
-    elif "upload_mode" not in request_data:
-        request_data["upload_mode"] = "video_proxy"
+    elif "upload_type" not in request_data:
+        request_data["upload_type"] = "video_proxy"
 
     for key in required_keys:
         if key not in request_data:
