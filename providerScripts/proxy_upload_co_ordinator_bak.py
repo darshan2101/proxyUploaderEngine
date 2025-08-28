@@ -40,6 +40,8 @@ PROVIDER_SCRIPTS = {
     "azure_video_indexer": "azure_video_indexer_uploader.py"
 }
 
+# New upload modes
+UPLOAD_MODES = ["video_proxy", "video_proxy_sample_scene_change", "video_sample_faces", "video_sample_interval", "audio_proxy", "sprite_sheet"]
 
 def debug_print(log_path, text_string):
     current_datetime = datetime.now()
@@ -116,14 +118,21 @@ def build_proxy_map(records, config, progressDetails):
     proxy_map = {}
     proxy_dir = config["proxy_directory"]
     log_path = config["logging_path"]
+    upload_mode = config.get("upload_mode", "video_proxy")
     total_records = len(records)
 
     def resolve_proxy(record):
         original_source_path = record[0]
         base_source_path = os.path.join(*original_source_path.split("/./")) if "/./" in original_source_path else original_source_path
         base_name = os.path.splitext(os.path.basename(base_source_path))[0]
-        pattern = f"{base_name}*.*"
-        return base_source_path, resolve_proxy_file(proxy_dir, base_source_path, pattern, log_path)
+        
+        if upload_mode == "sprite_sheet":
+            # New behavior - folder with multiple files (search recursively)
+            return base_source_path, find_folder_with_files(proxy_dir, base_name, upload_mode, log_path)
+        else:
+            # Original behavior - single file proxy
+            pattern = f"{base_name}*.*"
+            return base_source_path, resolve_proxy_file(proxy_dir, base_source_path, pattern, log_path)
 
     # Initialize progress
     progressDetails["processedFiles"] = 0
@@ -137,8 +146,8 @@ def build_proxy_map(records, config, progressDetails):
     with ThreadPoolExecutor(max_workers=config.get("thread_count", 2)) as executor:
         future_to_record = {executor.submit(resolve_proxy, r): r for r in records}
         for future in as_completed(future_to_record):
-            base_source_path, proxy_path = future.result()
-            proxy_map[base_source_path] = proxy_path
+            base_source_path, proxy_result = future.result()
+            proxy_map[base_source_path] = proxy_result
 
             # Update counter in main thread only
             progressDetails["processedFiles"] += 1
@@ -152,6 +161,38 @@ def build_proxy_map(records, config, progressDetails):
 
     debug_print(log_path, f"[PROXY MAP] Pre-resolved {len(proxy_map)} proxies.")
     return proxy_map
+
+# Helper function to find folder with files recursively
+def find_folder_with_files(proxy_dir, folder_name, upload_mode, log_path):
+    base_dir = Path(proxy_dir)
+    
+    debug_print(log_path, f"[FIND FOLDER] Searching for folder '{folder_name}' in {proxy_dir} with mode {upload_mode}")
+    
+    # Use rglob to search recursively for directories with the specified name
+    matching_folders = list(base_dir.rglob(folder_name))
+    matching_folders = [f for f in matching_folders if f.is_dir()]
+    
+    debug_print(log_path, f"[FIND FOLDER] Found {len(matching_folders)} matching folders: {matching_folders}")
+    
+    if not matching_folders:
+        debug_print(log_path, f"[FIND FOLDER] No folder found with name '{folder_name}'")
+        return None
+    proxy_folder = matching_folders[0]
+    # For proxy_folder, collect files based on upload mode
+    all_matching_files = []
+    for file_path in proxy_folder.iterdir():
+        if file_path.is_file():
+            if upload_mode == "sprite_sheet" and is_spreadsheet_file(str(file_path)):
+                all_matching_files.append(str(file_path))
+                debug_print(log_path, f"[FIND FOLDER] Found spreadsheet file: {file_path}")
+    
+    debug_print(log_path, f"[FIND FOLDER] Total matching files found: {len(all_matching_files)}")
+    return all_matching_files if all_matching_files else None
+
+# Helper functions to identify file types
+def is_spreadsheet_file(file_path):
+    image_extensions = {'.jpg', '.jpeg', '.png'}
+    return os.path.splitext(file_path)[1].lower() in image_extensions
 
 # Locates proxy file by filename pattern inside a directory tree
 def resolve_proxy_file(proxy_dir, original_source_path, pattern, log_path):
@@ -326,7 +367,7 @@ def resolve_source_path_for_upload_asset(record, config, override_source_path=No
         return override_source_path or base_source_path, None
 
 # Launches the provider script with file arguments
-def upload_asset(record, config, dry_run=False, upload_path_id=None, override_source_path=None, proxy_map=None):
+def upload_asset(record, config, dry_run=False, upload_path_id=None, override_source_path=None, proxy_map=None, specific_file_path=None):
     original_source_path, catalog_path, metadata_path = record
 
     # Resolve base source path and upload path
@@ -343,8 +384,13 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
     else:
         full_upload_path = relative_upload_path
 
-    # Determine the correct source path using the helper
-    source_path, error = resolve_source_path_for_upload_asset(record, config, override_source_path, proxy_map)
+    error = None
+    # Determine the correct source path using the helper and for multiple files mode, use the specific file path
+    if specific_file_path:
+        debug_print(config["logging_path"], f"[SPECIFIC FILE] Using specific file path for upload: {specific_file_path}")
+        source_path = specific_file_path
+    else:
+        source_path, error = resolve_source_path_for_upload_asset(record, config, override_source_path, proxy_map)
 
     if error:
         debug_print(config["logging_path"], error)
@@ -483,6 +529,8 @@ def read_csv_records(csv_path, logging_path, extensions = [], file_size_limit = 
 
 def calculate_total_size(records, config, proxy_map=None):
     total_size = 0
+    upload_mode = config.get("upload_mode", "video_proxy")
+    
     for r in records:
         if "/./" in r[0]:
             src = r[0].split("/./")[-1]
@@ -491,11 +539,20 @@ def calculate_total_size(records, config, proxy_map=None):
             full_path = r[0]
 
         if config["mode"] == "proxy":
-            proxy = proxy_map.get(full_path) if proxy_map else None
-            if proxy and os.path.exists(proxy):
-                total_size += os.path.getsize(proxy)
+            if upload_mode == "sprite_sheet":
+                # New behavior - multiple files
+                proxy_files = proxy_map.get(full_path) if proxy_map else None
+                if proxy_files and isinstance(proxy_files, list):
+                    logging.debug(f"[SIZE CALC] Counting files for {full_path}: {proxy_files}")
+                    for file_path in proxy_files and os.path.exists(file_path):
+                        total_size += os.path.getsize(file_path)
             else:
-                total_size += os.path.getsize(full_path)
+                # Original behavior - single file
+                proxy = proxy_map.get(full_path) if proxy_map else None
+                if proxy and os.path.exists(proxy):
+                    total_size += os.path.getsize(proxy)
+                else:
+                    total_size += 0  # Missing proxy, count as 0
         elif os.path.exists(full_path):
             total_size += os.path.getsize(full_path)
 
@@ -548,7 +605,12 @@ def build_folder_id_map(records, config, log_path, progressDetails):
             path_segments = [seg for seg in sub_path.split(os.sep) if seg]
             current_path = base_upload_path if config.get("upload_path") else "/"
             for seg_idx, segment in enumerate(path_segments):
-                if seg_idx < len(path_segments) - 1:  # Exclude last segment (file)
+                if seg_idx < len(path_segments):
+                    is_last = seg_idx == len(path_segments) - 1
+                    if is_last and config.get("mode") == "proxy" and config.get("upload_mode") == "sprite_sheet":
+                        segment = os.path.splitext(segment)[0]
+                    elif is_last:
+                        break
                     next_path = posixpath.join(current_path, segment)
                     all_needed_paths.add(next_path)
                     current_path = next_path
@@ -563,9 +625,9 @@ def build_folder_id_map(records, config, log_path, progressDetails):
     # === Stage 2: Create folders and resolve IDs ===
     progressDetails["status"] = "Creating unique Folders"
     progressDetails["processedFiles"] = 0
-    progressDetails["totalFiles"] = total_folders  # ✅ Set total
+    progressDetails["totalFiles"] = total_folders
     progressDetails["duration"] = int(time.time())
-    send_progress(progressDetails, config["repo_guid"])  # Initial update
+    send_progress(progressDetails, config["repo_guid"])
 
     last_send = time.time()
     SEND_INTERVAL = 30  # seconds
@@ -601,6 +663,8 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
     try:
         debug_print(config['logging_path'], f"[STEP] Processing record: {record}")
         original_source_path, catalog_path, metadata_path = record
+        
+        upload_mode = config.get("upload_mode", "video_proxy")
 
         # Extract relative folder path for resolved_ids lookup
         if "/./" in original_source_path:
@@ -652,41 +716,105 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
                 send_progress(progressDetails, config["repo_guid"])
                 return
 
-        # Call upload_asset with proxy_map
-        result, resolved_path = upload_asset(
-            record, config, config.get("dry_run", False),
-            upload_path_id, override_source_path, proxy_map
-        )
+        # Handle different upload modes
+        if upload_mode == "sprite_sheet" and config["mode"] == "proxy":
+            # Multiple files upload mode (images/spreadsheets)
+            base_source_path = os.path.join(*original_source_path.split("/./")) if "/./" in original_source_path else original_source_path
+            proxy_files = proxy_map.get(base_source_path) if proxy_map else None
+            logging.debug(f"proxy files for {base_source_path}: {proxy_files}")
 
-        # Handle proxy resolution failure
-        if isinstance(result, dict) and not result.get("success", True):
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            error_message = result.get("error", "Unknown error during proxy resolution or upload")
-            debug_print(config["logging_path"], f"[PROXY FAILURE] {resolved_path}\n{error_message}")
-            write_csv_row(issues_log, ["Error", resolved_path, timestamp, error_message])
-            return {"status": "failure", "file": resolved_path, "error": error_message}
+            if not proxy_files or not isinstance(proxy_files, list):
+                error_msg = f"[UPLOAD MODE {upload_mode}] No files found for {base_source_path}"
+                debug_print(config["logging_path"], error_msg)
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                write_csv_row(issues_log, ["Error", base_source_path, timestamp, error_msg])
+                return {"status": "failure", "file": base_source_path, "error": error_msg}
 
-        # Handle upload success
-        if result and result.returncode == 0:
-            file_size = os.path.getsize(resolved_path) if os.path.exists(resolved_path) else 0
+            # Upload each file in the folder
+            total_uploaded_size = 0
+            success_count = 0
+            failure_count = 0
+
+            # Get the sub-folder ID for the source file name
+            source_file_name_no_ext = os.path.splitext(os.path.basename(base_source_path))[0]
+            sub_folder_key = os.path.join(normalized_folder_key, source_file_name_no_ext) if normalized_folder_key != "/" else f"/{source_file_name_no_ext}"
+            specific_upload_path_id = resolved_ids.get(sub_folder_key, upload_path_id)
+
+            for file_path in proxy_files:
+                debug_print(config['logging_path'], f"[UPLOAD MODE {upload_mode}] Uploading {file_path} to sub-folder {sub_folder_key}")
+
+                # Create a temporary record for this specific file
+                temp_record = (file_path, catalog_path, metadata_path)
+
+                result, resolved_path = upload_asset(
+                    temp_record, config, config.get("dry_run", False),
+                    specific_upload_path_id, override_source_path, proxy_map, file_path
+                )
+
+                # Handle upload success
+                if result and result.returncode == 0:
+                    file_size = os.path.getsize(resolved_path) if os.path.exists(resolved_path) else 0
+                    total_uploaded_size += file_size
+                    success_count += 1
+                    debug_print(config["logging_path"], f"[UPLOAD SUCCESS] {resolved_path} | {file_size} bytes")
+
+                    if transferred_log:
+                        write_csv_row(transferred_log, ["Success", resolved_path, file_size, ""])
+                    if client_log:
+                        write_csv_row(client_log, ["Success", resolved_path, file_size, "Client"])
+                else:
+                    # Handle upload failure
+                    stderr_cleaned = result.stderr.replace("\n", " ").replace("\r", " ").strip() if result and result.stderr else "Unknown Error"
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    debug_print(config["logging_path"], f"[UPLOAD FAILURE] {resolved_path}\n{stderr_cleaned}")
+                    write_csv_row(issues_log, ["Error", resolved_path, timestamp, stderr_cleaned])
+                    failure_count += 1
+
+            # Update progress for the entire record (one increment for the whole folder)
             progressDetails["processedFiles"] += 1
-            progressDetails["processedBytes"] += file_size
-            debug_print(config["logging_path"], f"[UPLOAD SUCCESS] {resolved_path} | {file_size} bytes")
+            progressDetails["processedBytes"] += total_uploaded_size
 
-            if transferred_log:
-                write_csv_row(transferred_log, ["Success", resolved_path, file_size, ""])
-            if client_log:
-                write_csv_row(client_log, ["Success", resolved_path, file_size, "Client"])
+            if failure_count == 0:
+                return {"status": "success", "file": base_source_path, "size": total_uploaded_size, "sub_files": success_count}
+            else:
+                return {"status": "partial", "file": base_source_path, "uploaded": success_count, "failed": failure_count}
 
-            return {"status": "success", "file": resolved_path, "size": file_size}
-
-        # Handle upload failure
         else:
-            stderr_cleaned = result.stderr.replace("\n", " ").replace("\r", " ").strip() if result and result.stderr else "Unknown Error"
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            debug_print(config["logging_path"], f"[UPLOAD FAILURE] {resolved_path}\n{stderr_cleaned}")
-            write_csv_row(issues_log, ["Error", resolved_path, timestamp, stderr_cleaned])
-            return {"status": "failure", "file": resolved_path, "error": stderr_cleaned}
+            # Original single file upload behavior
+            result, resolved_path = upload_asset(
+                record, config, config.get("dry_run", False),
+                upload_path_id, override_source_path, proxy_map
+            )
+
+            # Handle proxy resolution failure
+            if isinstance(result, dict) and not result.get("success", True):
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                error_message = result.get("error", "Unknown error during proxy resolution or upload")
+                debug_print(config["logging_path"], f"[PROXY FAILURE] {resolved_path}\n{error_message}")
+                write_csv_row(issues_log, ["Error", resolved_path, timestamp, error_message])
+                return {"status": "failure", "file": resolved_path, "error": error_message}
+
+            # Handle upload success
+            if result and result.returncode == 0:
+                file_size = os.path.getsize(resolved_path) if os.path.exists(resolved_path) else 0
+                progressDetails["processedFiles"] += 1
+                progressDetails["processedBytes"] += file_size
+                debug_print(config["logging_path"], f"[UPLOAD SUCCESS] {resolved_path} | {file_size} bytes")
+
+                if transferred_log:
+                    write_csv_row(transferred_log, ["Success", resolved_path, file_size, ""])
+                if client_log:
+                    write_csv_row(client_log, ["Success", resolved_path, file_size, "Client"])
+
+                return {"status": "success", "file": resolved_path, "size": file_size}
+
+            # Handle upload failure
+            else:
+                stderr_cleaned = result.stderr.replace("\n", " ").replace("\r", " ").strip() if result and result.stderr else "Unknown Error"
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                debug_print(config["logging_path"], f"[UPLOAD FAILURE] {resolved_path}\n{stderr_cleaned}")
+                write_csv_row(issues_log, ["Error", resolved_path, timestamp, stderr_cleaned])
+                return {"status": "failure", "file": resolved_path, "error": stderr_cleaned}
 
     except Exception as e:
         debug_print(config['logging_path'], f"[ERROR] upload_worker() failed: {e}")
@@ -768,17 +896,19 @@ def process_csv_and_upload(config, dry_run=False):
 
     # Summarize results
     success_count = sum(1 for r in upload_results if r and r.get("status") == "success")
+    partial_count = sum(1 for r in upload_results if r and r.get("status") == "partial")
     failure_results = [r for r in upload_results if r and r.get("status") == "failure"]
 
-    debug_print(config["logging_path"], f"Upload summary: {success_count} succeeded, {len(failure_results)} failed")
+    debug_print(config["logging_path"], f"Upload summary: {success_count} succeeded, {partial_count} partial, {len(failure_results)} failed")
     print(f"Successful Uploads: {success_count}")
+    print(f"Partial Uploads: {partial_count}")
     print(f"Failed Uploads: {len(failure_results)}")
 
     # Finalize progress
     progressDetails["status"] = "Complete"
     send_progress(progressDetails, config["repo_guid"])
     
-    sys.exit(0 if success_count == len(records) else 2)
+    sys.exit(0 if success_count + partial_count == len(records) else 2)
 
     
 if __name__ == '__main__':
@@ -786,6 +916,7 @@ if __name__ == '__main__':
     parser.add_argument("-c","--json-path", help="Path to JSON config file")
     parser.add_argument("--dry-run", action="store_true", help="Run in dry mode without uploading")
     parser.add_argument("--log-prefix", help="Prefix path for transfer/client/issues CSV logs")
+    parser.add_argument("--upload-mode", choices=UPLOAD_MODES, default="normal", help="Upload mode: normal, spreadsheets, or images")
     args = parser.parse_args()
 
     config_path = args.json_path
@@ -820,6 +951,14 @@ if __name__ == '__main__':
         required_keys.append("proxy_output_base_path")
         os.makedirs(request_data.get("proxy_output_base_path"), exist_ok=True)  # Ensure target dir exists
 
+    # Add upload_mode from argument or config
+    if args.upload_mode and args.upload_mode != "video_proxy":
+        request_data["upload_mode"] = args.upload_mode
+    elif "upload_mode" in request_data and request_data["upload_mode"] not in UPLOAD_MODES:
+        print(f"Invalid upload_mode: {request_data['upload_mode']}. Must be one of: {UPLOAD_MODES}")
+        sys.exit(1)
+    elif "upload_mode" not in request_data:
+        request_data["upload_mode"] = "video_proxy"
 
     for key in required_keys:
         if key not in request_data:
