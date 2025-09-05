@@ -63,9 +63,11 @@ if __name__ == '__main__':
     parser.add_argument('-r', '--run-id', help='run id')
     parser.add_argument('-g', '--repo-guid', help='repo guid')
     parser.add_argument('-v', '--provider', help='provider')
+    parser.add_argument('-b', '--bucket', help='bucket')
     parser.add_argument('-l', '--log-path', help='log path')
     parser.add_argument('-s', '--progress-path', help='progress path')
     parser.add_argument('-z', '--orig-size-limit', help='progress path')
+    parser.add_argument('--proxy-type', help='progress path')
     parser.add_argument(
         "--thread-count",
         type=int,
@@ -108,6 +110,8 @@ if __name__ == '__main__':
     property_bag['run_id'] = args.run_id
     property_bag['repo_guid'] = args.repo_guid
     property_bag['job_guid'] = args.job_guid
+    property_bag['bucket'] = args.bucket
+    property_bag['proxy_type'] = args.proxy_type
     target_path = args.target_json_path
 
     json_string = json.dumps(property_bag, indent=4)
