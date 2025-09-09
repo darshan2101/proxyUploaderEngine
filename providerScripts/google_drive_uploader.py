@@ -2,7 +2,11 @@ import argparse
 import sys
 import os
 import json
+import requests
+import random
 import time
+from requests.adapters import HTTPAdapter
+from requests.exceptions import RequestException, SSLError, ConnectionError, Timeout
 import logging
 import urllib.parse
 from configparser import ConfigParser
@@ -18,6 +22,8 @@ from google.auth.transport.requests import Request
 SCOPES = ['https://www.googleapis.com/auth/drive']
 VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet"]
 CHUNK_SIZE = 20 * 1024 * 1024
+CONFLICT_RESOLUTION_MODES = ["skip", "overwrite"]
+DEFAULT_CONFLICT_RESOLUTION = "skip"
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
@@ -81,6 +87,65 @@ def get_link_address_and_port():
 
     logging.info(f"Server connection details - Address: {ip}, Port: {port}")
     return ip, port
+
+def get_node_api_key():
+    api_key = ""
+    try:
+        if IS_LINUX:
+            parser = ConfigParser()
+            parser.read(DNA_CLIENT_SERVICES)
+            api_key = parser.get('General', 'NodeAPIKey', fallback='')
+        else:
+            with open(DNA_CLIENT_SERVICES, 'rb') as fp:
+                api_key = plistlib.load(fp).get("NodeAPIKey", "")
+    except Exception as e:
+        logging.error(f"Error reading Node API key: {e}")
+        sys.exit(5)
+
+    if not api_key:
+        logging.error("Node API key not found in configuration.")
+        sys.exit(5)
+
+    logging.info("Successfully retrieved Node API key.")
+    return api_key
+
+def get_retry_session(retries=3, backoff_factor_range=(1.0, 2.0)):
+    session = requests.Session()
+    # handling retry delays manually via backoff in the range
+    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+def make_request_with_retries(method, url, **kwargs):
+    session = get_retry_session()
+    last_exception = None
+
+    for attempt in range(3):  # Max 3 attempts
+        try:
+            response = session.request(method, url, timeout=(10, 30), **kwargs)
+            if response.status_code < 500:
+                return response
+            else:
+                logging.warning(f"Received {response.status_code} from {url}. Retrying...")
+        except (SSLError, ConnectionError, Timeout) as e:
+            last_exception = e
+            if attempt < 2:  # Only sleep if not last attempt
+                base_delay = [1, 3, 10][attempt]
+                jitter = random.uniform(0, 1)
+                delay = base_delay + jitter * ([1, 1, 5][attempt])  # e.g., 1-2, 3-4, 10-15
+                logging.warning(f"Attempt {attempt + 1} failed due to {type(e).__name__}: {e}. "
+                                f"Retrying in {delay:.2f}s...")
+                time.sleep(delay)
+            else:
+                logging.error(f"All retry attempts failed for {url}. Last error: {e}")
+        except RequestException as e:
+            logging.error(f"Request failed: {e}")
+            raise
+
+    if last_exception:
+        raise last_exception
+    return None  # Should not reach here
 
 def prepare_metadata_to_upload(link_host, link_url, properties_file=None):
     metadata = {
@@ -230,19 +295,30 @@ def upload_file(token, file_path, folder_id, file_metadata=None, max_retries=3):
     if not os.path.exists(file_path):
         logging.error(f"File not found: {file_path}")
         return None
+    original_file_name = os.path.basename(file_path)
+    name_part, ext_part = os.path.splitext(original_file_name)
+    sanitized_name_part = name_part.strip()
+    file_name = sanitized_name_part + ext_part
 
+    if file_name != original_file_name:
+        logging.info(f"Filename sanitized from '{original_file_name}' to '{file_name}'")
     file_size = os.path.getsize(file_path)
-    file_name = os.path.basename(file_path)
 
-    # Step 1: Search for and delete existing file if present
+    # Step 1: Search for and handle file if present
+    conflict_resolution = cloud_config_data.get('conflict_resolution', DEFAULT_CONFLICT_RESOLUTION)
     existing_file = find_exact_existing_file(service, folder_id, file_name, file_size)
     if existing_file:
-        try:
-            service.files().delete(fileId=existing_file['id']).execute()
-            logging.info(f"Deleted existing file: {existing_file['name']} (ID: {existing_file['id']})")
-        except Exception as e:
-            logging.error(f"Failed to delete existing file {existing_file['id']}: {e}")
-            return None
+        if conflict_resolution == "skip":
+            logging.info(f"File '{file_name}' exists. Skipping upload.")
+            print(f"File '{file_name}' already exists. Skipping upload.")
+            sys.exit(0)
+        elif conflict_resolution == "overwrite":
+            try:
+                service.files().delete(fileId=existing_file['id']).execute()
+                logging.info(f"Deleted existing file: {existing_file['name']} (ID: {existing_file['id']})")
+            except Exception as e:
+                logging.error(f"Failed to delete existing file {existing_file['id']}: {e}")
+                return None
 
     # Step 2: Setup file metadata and begin upload
     file_metadata = file_metadata or {}
@@ -300,6 +376,55 @@ def upload_file(token, file_path, folder_id, file_metadata=None, max_retries=3):
         logging.error(f"Upload failed for file '{file_path}'")
         print(f"Upload failed for file '{file_path}'")
         return None
+    
+def update_catalog(repo_guid, file_path, folder_id, asset_id, max_attempts=5):
+    url = "http://127.0.0.1:5080/catalogs/provideData"
+    # Read NodeAPIKey from client services config
+    node_api_key = get_node_api_key()
+    headers = {
+        "apikey": node_api_key,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "repoGuid": repo_guid,
+        "fileName": os.path.basename(file_path),
+        "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
+        "providerName": "google_drive",
+        "providerData": {
+            "assetId": asset_id,
+            "folder_id": folder_id,
+        }
+    }
+    for attempt in range(max_attempts):
+        try:
+            response = make_request_with_retries("POST", url, headers=headers, json=payload)
+            if response and response.status_code in (200, 201):
+                logging.info(f"Catalog updated successfully: {response.text}")
+                return True
+            if response and response.status_code == 404:
+                try:
+                    resp_json = response.json()
+                    if resp_json.get("message", "").lower() == "catalog item not found":
+                        wait_time = 60 + (attempt * 30)
+                        logging.warning(
+                            f"[Attempt {attempt+1}/{max_attempts}] Catalog item not found. "
+                            f"Waiting {wait_time} seconds before retrying..."
+                        )
+                        time.sleep(wait_time)
+                        continue  # retry outer loop
+                except Exception:
+                    logging.warning(f"Failed to parse JSON on 404 response: {response.text}")
+                logging.warning(f"Catalog update failed (status 404): {response.text}")
+                break
+            logging.warning(
+                f"Catalog update failed (status {response.status_code if response else 'No response'}): "
+                f"{response.text if response else ''}"
+            )
+            break
+        except Exception as e:
+            logging.warning(f"Unexpected error in update_catalog attempt {attempt+1}: {e}")
+            break
+    pass
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -312,6 +437,7 @@ if __name__ == '__main__':
     parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
     parser.add_argument("-up", "--upload-path", required=True, help="Path where file will be uploaded google Drive")
     parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
+    parser.add_argument("-r", "--repo-guid", help="Repo GUID")
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")    
     parser.add_argument("--resolved-upload-id", action="store_true", help="Pass if upload path is already resolved ID")
@@ -444,6 +570,7 @@ if __name__ == '__main__':
     response = upload_file(cloud_config_data["token"], args.source_path, folder_id, parsed)
     if response:
         print("File uploaded successfully")
+        update_catalog(args.repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], folder_id, response.get('id'))
         sys.exit(0)
     else:
         print(f"Upload failed, error details: {response}")

@@ -14,7 +14,7 @@ import plistlib
 from configparser import ConfigParser
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 # =============================
 # Constants
@@ -185,6 +185,27 @@ def make_request_with_retries(method, url, **kwargs):
         raise last_exception
     return None  # Should not reach here
 
+def get_node_api_key():
+    api_key = ""
+    try:
+        if IS_LINUX:
+            parser = ConfigParser()
+            parser.read(DNA_CLIENT_SERVICES)
+            api_key = parser.get('General', 'NodeAPIKey', fallback='')
+        else:
+            with open(DNA_CLIENT_SERVICES, 'rb') as fp:
+                api_key = plistlib.load(fp).get("NodeAPIKey", "")
+    except Exception as e:
+        logging.error(f"Error reading Node API key: {e}")
+        sys.exit(5)
+
+    if not api_key:
+        logging.error("Node API key not found in configuration.")
+        sys.exit(5)
+
+    logging.info("Successfully retrieved Node API key.")
+    return api_key
+
 # =============================
 # Dataclass: Consts
 # =============================
@@ -349,7 +370,7 @@ class VideoIndexerClient:
             response = None
             for attempt in range(3):
                 try:
-                    response = make_request_with_retries("GET", url, params=params, timeout=(10, 30))
+                    response = make_request_with_retries("GET", url, params=params)
                     if response and response.status_code == 200:
                         break
                     else:
@@ -562,6 +583,8 @@ class VideoIndexerClient:
 
                 result = response.json()
                 state = result.get("state", "Unknown")
+                video_data = result.get("videos", [{}])[0]
+                progress = video_data.get("processingProgress", "0%")
 
                 if state == "Processed":
                     logger.info(f"✅ Video indexed successfully: {video_id}")
@@ -571,7 +594,7 @@ class VideoIndexerClient:
                     logger.error(f"❌ Indexing failed: {error}")
                     return "Failed"
 
-                logger.info(f"🟡 Indexing... State: {state}")
+                logger.info(f"🟡 Indexing... State: {state}, progress: {progress}")
                 time.sleep(10)
 
             except Exception as e:
@@ -591,7 +614,7 @@ class VideoIndexerClient:
         conflict_mode: str,
         video_name: Optional[str] = None,
         **upload_kwargs
-    ) -> tuple[str, bool]:
+    ) -> Tuple[str, bool]:
 
         if conflict_mode not in CONFLICT_RESOLUTION_MODES:
             raise ValueError(f"Invalid conflict_mode: {conflict_mode}. Use: {CONFLICT_RESOLUTION_MODES}")
@@ -638,6 +661,57 @@ class VideoIndexerClient:
 
         # Should not reach
         raise RuntimeError(f"Unhandled conflict mode: {conflict_mode}")
+    
+    def update_catalog(self, repo_guid, file_path, video_id, max_attempts=5):
+        url = "http://127.0.0.1:5080/catalogs/providerData"
+        self.get_account()
+        node_api_key = get_node_api_key()
+        headers = {
+            "apikey": node_api_key,
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "repoGuid": repo_guid,
+            "fileName": os.path.basename(file_path),
+            "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
+            "providerName": "azure_video_indexer",
+            "providerData": {
+                "assetId": video_id,
+                "accountId": self.account['properties']['accountId'],
+                "location": self.account['location'],
+                "providerUiLink": f"https://www.videoindexer.ai/accounts/{self.account['properties']['accountId']}/videos/{video_id}?location=westus"
+            }
+        }
+        for attempt in range(max_attempts):
+            try:
+                response = make_request_with_retries("POST", url, headers=headers, json=payload)
+                if response and response.status_code in (200, 201):
+                    logging.info(f"Catalog updated successfully: {response.text}")
+                    return True
+                if response and response.status_code == 404:
+                    try:
+                        resp_json = response.json()
+                        if resp_json.get("message", "").lower() == "catalog item not found":
+                            wait_time = 60 + (attempt * 30)
+                            logging.warning(
+                                f"[Attempt {attempt+1}/{max_attempts}] Catalog item not found. "
+                                f"Waiting {wait_time} seconds before retrying..."
+                            )
+                            time.sleep(wait_time)
+                            continue  # retry outer loop
+                    except Exception:
+                        logging.warning(f"Failed to parse JSON on 404 response: {response.text}")
+                    logging.warning(f"Catalog update failed (status 404): {response.text}")
+                    break
+                logging.warning(
+                    f"Catalog update failed (status {response.status_code if response else 'No response'}): "
+                    f"{response.text if response else ''}"
+                )
+                break
+            except Exception as e:
+                logging.warning(f"Unexpected error in update_catalog attempt {attempt+1}: {e}")
+                break
+        pass
 
 # =============================
 # Main Execution
@@ -713,7 +787,7 @@ if __name__ == "__main__":
             logger.warning(f"Invalid size limit: {args.size_limit}")
 
     # Paths and backlink
-    file_name = extract_file_name(matched_file)
+    file_name_for_url = extract_file_name(args.catalog_path)
     catalog_dir = remove_file_name_from_path(args.catalog_path or matched_file)
     normalized_path = catalog_dir.replace("\\", "/")
     relative_path = normalized_path.split("/1/", 1)[-1] if "/1/" in normalized_path else normalized_path
@@ -726,14 +800,14 @@ if __name__ == "__main__":
     backlink_url = (
         f"https://{client_ip}/dashboard/projects/{job_guid}"
         f"/browse&search?path={urllib.parse.quote(relative_path)}"
-        f"&filename={urllib.parse.quote(file_name)}"
+        f"&filename={urllib.parse.quote(file_name_for_url)}"
     )
 
     # Metadata
     metadata = {
         "relativePath": "/" + relative_path if not relative_path.startswith("/") else relative_path,
         "repoGuid": repo_guid,
-        "fileName": file_name,
+        "fileName": file_name_for_url,
         "fabric_size": os.path.getsize(matched_file),
         "fabric-URL": backlink_url
     }
@@ -790,10 +864,11 @@ if __name__ == "__main__":
                 logger.error(f"Indexing ended with status: {status}")
                 sys.exit(1)
 
+        client.update_catalog(repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], video_id)
         print(f"VideoID={video_id}")
         sys.exit(0)
 
     except Exception as e:
         logger.critical(f"Operation failed: {e}")
         print(f"Error: {str(e)}")
-        sys.exit(1)   
+        sys.exit(1)

@@ -87,6 +87,27 @@ def get_link_address_and_port():
     logging.info(f"Server connection details - Address: {ip}, Port: {port}")
     return ip, port
 
+def get_node_api_key():
+    api_key = ""
+    try:
+        if IS_LINUX:
+            parser = ConfigParser()
+            parser.read(DNA_CLIENT_SERVICES)
+            api_key = parser.get('General', 'NodeAPIKey', fallback='')
+        else:
+            with open(DNA_CLIENT_SERVICES, 'rb') as fp:
+                api_key = plistlib.load(fp).get("NodeAPIKey", "")
+    except Exception as e:
+        logging.error(f"Error reading Node API key: {e}")
+        sys.exit(5)
+
+    if not api_key:
+        logging.error("Node API key not found in configuration.")
+        sys.exit(5)
+
+    logging.info("Successfully retrieved Node API key.")
+    return api_key
+
 def get_retry_session(retries=3, backoff_factor_range=(1.0, 2.0)):
     session = requests.Session()
     # handling retry delays manually via backoff in the range
@@ -99,7 +120,7 @@ def make_request_with_retries(method, url, **kwargs):
     session = get_retry_session()
     last_exception = None
 
-    for attempt in range(4):  # Max 3 attempts
+    for attempt in range(3):  # Max 3 attempts
         try:
             response = session.request(method, url, timeout=(10, 30), **kwargs)
             if response.status_code < 500:
@@ -109,9 +130,9 @@ def make_request_with_retries(method, url, **kwargs):
         except (SSLError, ConnectionError, Timeout) as e:
             last_exception = e
             if attempt < 2:  # Only sleep if not last attempt
-                base_delay = [1, 3, 10, 30][attempt]
+                base_delay = [1, 3, 10][attempt]
                 jitter = random.uniform(0, 1)
-                delay = base_delay + jitter * ([1, 1, 5, 10][attempt])  # e.g., 1-2, 3-4, 10-15, 30-40
+                delay = base_delay + jitter * ([1, 1, 5][attempt])  # e.g., 1-2, 3-4, 10-15
                 logging.warning(f"Attempt {attempt + 1} failed due to {type(e).__name__}: {e}. "
                                 f"Retrying in {delay:.2f}s...")
                 time.sleep(delay)
@@ -880,7 +901,56 @@ def file_status_update(config, asset_id, file_id):
             time.sleep(delay)
     return None
 
-
+    
+def update_catalog(repo_guid, file_path, collection_id, asset_id, max_attempts=5):
+    url = "http://127.0.0.1:5080/catalogs/provideData"
+    # Read NodeAPIKey from client services config
+    node_api_key = get_node_api_key()
+    headers = {
+        "apikey": node_api_key,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "repoGuid": repo_guid,
+        "fileName": os.path.basename(file_path),
+        "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
+        "providerName": "iconic",
+        "providerData": {
+            "assetId": asset_id,
+            "collectionId": collection_id,
+            "providerUiLink": f"https://app.iconik.io/asset/{asset_id}"
+        }
+    }
+    for attempt in range(max_attempts):
+        try:
+            response = make_request_with_retries("POST", url, headers=headers, json=payload)
+            if response and response.status_code in (200, 201):
+                logging.info(f"Catalog updated successfully: {response.text}")
+                return True
+            if response and response.status_code == 404:
+                try:
+                    resp_json = response.json()
+                    if resp_json.get("message", "").lower() == "catalog item not found":
+                        wait_time = 60 + (attempt * 30)
+                        logging.warning(
+                            f"[Attempt {attempt+1}/{max_attempts}] Catalog item not found. "
+                            f"Waiting {wait_time} seconds before retrying..."
+                        )
+                        time.sleep(wait_time)
+                        continue  # retry outer loop
+                except Exception:
+                    logging.warning(f"Failed to parse JSON on 404 response: {response.text}")
+                logging.warning(f"Catalog update failed (status 404): {response.text}")
+                break
+            logging.warning(
+                f"Catalog update failed (status {response.status_code if response else 'No response'}): "
+                f"{response.text if response else ''}"
+            )
+            break
+        except Exception as e:
+            logging.warning(f"Unexpected error in update_catalog attempt {attempt+1}: {e}")
+            break
+    pass
 
 if __name__ == '__main__':
     # Random delay to avoid thundering herd
@@ -897,6 +967,7 @@ if __name__ == '__main__':
     parser.add_argument("-mp", "--metadata-file", help="Metadata file path")
     parser.add_argument("-up", "--upload-path", required=True, help="Upload path or ID")
     parser.add_argument("-sl", "--size-limit", help="Size limit in MB")
+    parser.add_argument("-r", "--repo-guid", help="Repo GUID")
     parser.add_argument("--dry-run", action="store_true", help="Dry run")
     parser.add_argument("--log-level", default="debug", help="Log level")
     parser.add_argument("--resolved-upload-id", action="store_true", help="Upload path is already resolved ID")
@@ -1048,6 +1119,7 @@ if __name__ == '__main__':
                 print(f"Response error. Status - {response.status_code}, Error - {response.text}")
                 sys.exit(1)
             print("File Upload Succesfully")
+            update_catalog(args.repo_guid, matched_file, collection_id, asset_id)
             sys.exit(0)
         else:
             print(f"Response error. Status - {upload_code.status_code}, Error - {upload_code.text}")
@@ -1064,6 +1136,7 @@ if __name__ == '__main__':
                 print(f"Response error. Status - {response.status_code}, Error - {response.text}")
                 sys.exit(1)
             print("File Upload Succesfully")
+            update_catalog(args.repo_guid, matched_file, collection_id, asset_id)
             sys.exit(0)
         else:
             print(f"Response error. Status - {upload_code.status_code}, Error - {upload_code.text}")
@@ -1079,6 +1152,7 @@ if __name__ == '__main__':
                 print(f"Response error. Status - {response.status_code}, Error - {response.text}")
                 sys.exit(1)
             print("File Upload Succesfully")
+            update_catalog(args.repo_guid, matched_file, collection_id, asset_id)
             sys.exit(0)
         else:
             print(f"Response error. Status - {upload_code.status_code}, Error - {upload_code.text}")
@@ -1093,6 +1167,7 @@ if __name__ == '__main__':
                 print(f"Response error. Status - {response.status_code if response else 'No response'}, Error - {response.text if response else 'No response'}")
                 sys.exit(1)
             print("File Upload Succesfully")
+            update_catalog(args.repo_guid, matched_file, collection_id, asset_id)
             sys.exit(0)
         else:
             print(f"Response error. Status - {upload_code.status_code if upload_code else 'No response'}, Error - {upload_code.text if upload_code else 'No response'}")

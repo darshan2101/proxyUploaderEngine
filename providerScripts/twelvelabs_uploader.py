@@ -81,6 +81,27 @@ def get_cloud_config_path():
     logging.info(f"Using cloud config path: {path}")
     return path
 
+def get_node_api_key():
+    api_key = ""
+    try:
+        if IS_LINUX:
+            parser = ConfigParser()
+            parser.read(DNA_CLIENT_SERVICES)
+            api_key = parser.get('General', 'NodeAPIKey', fallback='')
+        else:
+            with open(DNA_CLIENT_SERVICES, 'rb') as fp:
+                api_key = plistlib.load(fp).get("NodeAPIKey", "")
+    except Exception as e:
+        logging.error(f"Error reading Node API key: {e}")
+        sys.exit(5)
+
+    if not api_key:
+        logging.error("Node API key not found in configuration.")
+        sys.exit(5)
+
+    logging.info("Successfully retrieved Node API key.")
+    return api_key
+
 def get_retry_session(retries=3, backoff_factor_range=(1.0, 2.0)):
     session = requests.Session()
     # handling retry delays manually via backoff in the range
@@ -271,8 +292,7 @@ def upload_asset(api_key, index_id, file_path):
                     url,
                     data=payload,
                     files=files,
-                    headers=headers,
-                    timeout=(10, 300)  # 5 min read timeout
+                    headers=headers
                 )
 
             # If 4xx, don't retry — it's a client error (e.g. bad index_id, auth)
@@ -405,6 +425,56 @@ def add_metadata(api_key, index_id, video_id, metadata):
             time.sleep(delay)
     raise RuntimeError("Metadata update failed after retries.")
 
+def update_catalog(repo_guid, file_path, index_id, video_id, max_attempts=3):
+    url = "http://127.0.0.1:5080/catalogs/provideData"
+    # Read NodeAPIKey from client services config
+    node_api_key = get_node_api_key()
+    headers = {
+        "apikey": node_api_key,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "repoGuid": repo_guid,
+        "fileName": os.path.basename(file_path),
+        "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
+        "providerName": "twelvelabs",
+        "providerData": {
+            "assetId": video_id,
+            "indexId": index_id,
+            "providerUiLink": f"https://playground.twelvelabs.io/indexes/{index_id}/videos?page=1&task_id={video_id}"
+        }
+    }
+    for attempt in range(max_attempts):
+        try:
+            response = make_request_with_retries("POST", url, headers=headers, json=payload)
+            if response and response.status_code in (200, 201):
+                logging.info(f"Catalog updated successfully: {response.text}")
+                return True
+            if response and response.status_code == 404:
+                try:
+                    resp_json = response.json()
+                    if resp_json.get("message", "").lower() == "catalog item not found":
+                        wait_time = 60 + (attempt * 30)
+                        logging.warning(
+                            f"[Attempt {attempt+1}/{max_attempts}] Catalog item not found. "
+                            f"Waiting {wait_time} seconds before retrying..."
+                        )
+                        time.sleep(wait_time)
+                        continue  # retry outer loop
+                except Exception:
+                    logging.warning(f"Failed to parse JSON on 404 response: {response.text}")
+                logging.warning(f"Catalog update failed (status 404): {response.text}")
+                break
+            logging.warning(
+                f"Catalog update failed (status {response.status_code if response else 'No response'}): "
+                f"{response.text if response else ''}"
+            )
+            break
+        except Exception as e:
+            logging.warning(f"Unexpected error in update_catalog attempt {attempt+1}: {e}")
+            break
+    pass
+
 if __name__ == '__main__':
     time.sleep(random.uniform(0.0, 1.5))
 
@@ -479,7 +549,7 @@ if __name__ == '__main__':
     rel_path = remove_file_name_from_path(catalog_path).replace("\\", "/")
     rel_path = rel_path.split("/1/", 1)[-1] if "/1/" in rel_path else rel_path
     catalog_url = urllib.parse.quote(rel_path)
-    file_name_for_url = extract_file_name(matched_file)
+    file_name_for_url = extract_file_name(matched_file) if mode == "original" else extract_file_name(catalog_path)
     filename_enc = urllib.parse.quote(file_name_for_url)
     job_guid = args.job_guid or ""
 
@@ -510,6 +580,14 @@ if __name__ == '__main__':
             backlink_url=backlink_url,
             properties_file=args.metadata_file
         )
+        # Rename forbidden metadata fields by prefixing with 'fabric-'
+        forbidden_fields = {
+            "duration", "filename", "fps", "height", "model_names", "size", "video_title", "width"
+        }
+        if isinstance(metadata_obj, dict):
+            for key in list(metadata_obj.keys()):
+                if key in forbidden_fields:
+                    metadata_obj[f"fabric-{key}"] = metadata_obj.pop(key)
         logging.info("Metadata prepared successfully.")
     except Exception as e:
         logging.error(f"Failed to prepare metadata: {e}")
@@ -518,7 +596,7 @@ if __name__ == '__main__':
     # Step 1: Upload
     try:
         result = upload_asset(api_key, index_id, matched_file)
-        task_id = result.get("task_id")
+        task_id = result.get("_id")
         if not task_id:
             logging.error("Upload succeeded but no 'task_id' in response.")
             sys.exit(1)
@@ -536,7 +614,7 @@ if __name__ == '__main__':
                 logging.warning(f"Metadata application failed: {e}")
 
         # Step 3: Poll for indexing completion
-        poll_result = poll_task_status(api_key, task_id, max_wait=args.max_poll_time)
+        poll_result = poll_task_status(api_key, task_id)
         if not poll_result:
             logging.error("Task polling failed or timed out.")
             sys.exit(1)
@@ -547,7 +625,7 @@ if __name__ == '__main__':
             sys.exit(1)
 
         logging.info(f"Indexing complete. Final Video ID: {final_video_id}")
-
+        update_catalog(args.repo_guid, catalog_path.replace("\\", "/").split("/1/", 1)[-1], index_id, final_video_id)
         # Re-apply metadata if not done earlier (e.g., video_id wasn't available)
         if not video_id:
             try:

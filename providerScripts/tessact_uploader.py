@@ -18,9 +18,10 @@ from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 
 # Constants
+UI_DOMAIN= "https://anything.tessact.com"
 VALID_MODES = ["proxy", "original", "get_base_target", "generate_video_proxy", "generate_video_frame_proxy",
                "generate_intelligence_proxy", "generate_video_to_spritesheet"]
-CHUNK_SIZE = 5 * 1024 * 1024
+CHUNK_SIZE = 20 * 1024 * 1024
 CONFLICT_RESOLUTION_MODES = ["skip", "overwrite"]
 DEFAULT_CONFLICT_RESOLUTION = "skip"
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
@@ -86,6 +87,27 @@ def get_link_address_and_port():
 
     logging.info(f"Server connection details - Address: {ip}, Port: {port}")
     return ip, port
+
+def get_node_api_key():
+    api_key = ""
+    try:
+        if IS_LINUX:
+            parser = ConfigParser()
+            parser.read(DNA_CLIENT_SERVICES)
+            api_key = parser.get('General', 'NodeAPIKey', fallback='')
+        else:
+            with open(DNA_CLIENT_SERVICES, 'rb') as fp:
+                api_key = plistlib.load(fp).get("NodeAPIKey", "")
+    except Exception as e:
+        logging.error(f"Error reading Node API key: {e}")
+        sys.exit(5)
+
+    if not api_key:
+        logging.error("Node API key not found in configuration.")
+        sys.exit(5)
+
+    logging.info("Successfully retrieved Node API key.")
+    return api_key
 
 def get_retry_session(retries=3, backoff_factor_range=(1.0, 2.0)):
     session = requests.Session()
@@ -359,7 +381,7 @@ def upload_parts(file_path, presigned_urls):
             for attempt in range(3):
                 try:
                     logging.info("Uploading part %d/%d (attempt %d)", part_num, len(presigned_urls), attempt + 1)
-                    response = requests.put(url, data=part_data, timeout=60)
+                    response = requests.put(url, data=part_data)
                     response.raise_for_status()
                     etag = response.headers.get("ETag")
                     etags.append({
@@ -398,6 +420,57 @@ def finalize_upload(base_url, token, payload):
             time.sleep(random.uniform(*([1, 2], [3, 4], [10, 15])[attempt]))
 
     return {}, 500
+
+def update_catalog(repo_guid, file_path, workspace_id, folder_id, asset_id, max_attempts=5):
+    url = "http://127.0.0.1:5080/catalogs/provideData"
+    # Read NodeAPIKey from client services config
+    node_api_key = get_node_api_key()
+    headers = {
+        "apikey": node_api_key,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "repoGuid": repo_guid,
+        "fileName": os.path.basename(file_path),
+        "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
+        "providerName": "tessact",
+        "providerData": {
+            "assetId": asset_id,
+            "folderId": folder_id,
+            "workspaceId": workspace_id,
+            "providerUiLink": f"{UI_DOMAIN}/library/asset/{asset_id}?workspace={workspace_id}"
+        }
+    }
+    for attempt in range(max_attempts):
+        try:
+            response = make_request_with_retries("POST", url, headers=headers, json=payload)
+            if response and response.status_code in (200, 201):
+                logging.info(f"Catalog updated successfully: {response.text}")
+                return True
+            if response and response.status_code == 404:
+                try:
+                    resp_json = response.json()
+                    if resp_json.get("message", "").lower() == "catalog item not found":
+                        wait_time = 60 + (attempt * 30)
+                        logging.warning(
+                            f"[Attempt {attempt+1}/{max_attempts}] Catalog item not found. "
+                            f"Waiting {wait_time} seconds before retrying..."
+                        )
+                        time.sleep(wait_time)
+                        continue  # retry outer loop
+                except Exception:
+                    logging.warning(f"Failed to parse JSON on 404 response: {response.text}")
+                logging.warning(f"Catalog update failed (status 404): {response.text}")
+                break
+            logging.warning(
+                f"Catalog update failed (status {response.status_code if response else 'No response'}): "
+                f"{response.text if response else ''}"
+            )
+            break
+        except Exception as e:
+            logging.warning(f"Unexpected error in update_catalog attempt {attempt+1}: {e}")
+            break
+    pass
 
 def parse_metadata_file(properties_file):
     props = {}
@@ -475,6 +548,7 @@ if __name__ == '__main__':
     parser.add_argument("-mp", "--metadata-file", help="Metadata file path")
     parser.add_argument("-up", "--upload-path", required=True, help="Upload path or ID")
     parser.add_argument("-sl", "--size-limit", help="Size limit in MB")
+    parser.add_argument("-r", "--repo-guid", help="Repository GUID for catalog update")
     parser.add_argument("--dry-run", action="store_true", help="Dry run")
     parser.add_argument("--log-level", default="debug", help="Log level")
     parser.add_argument("--resolved-upload-id", action="store_true", help="Upload path is already resolved ID")
@@ -594,7 +668,7 @@ if __name__ == '__main__':
         if finalize_code not in (200, 201):
             logging.error("Finalize upload failed.")
             sys.exit(1)
-
+        update_catalog(args.repo_guid, catalog_path.replace("\\", "/").split("/1/", 1)[-1], workspace_id, folder_id, file_id)
         logging.info(f"Upload successful. Asset ID: {file_id}")
 
         meta_file = args.metadata_file

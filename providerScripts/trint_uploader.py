@@ -80,6 +80,27 @@ def get_link_address_and_port():
     logging.info(f"Server connection details - Address: {ip}, Port: {port}")
     return ip, port
 
+def get_node_api_key():
+    api_key = ""
+    try:
+        if IS_LINUX:
+            parser = ConfigParser()
+            parser.read(DNA_CLIENT_SERVICES)
+            api_key = parser.get('General', 'NodeAPIKey', fallback='')
+        else:
+            with open(DNA_CLIENT_SERVICES, 'rb') as fp:
+                api_key = plistlib.load(fp).get("NodeAPIKey", "")
+    except Exception as e:
+        logging.error(f"Error reading Node API key: {e}")
+        sys.exit(5)
+
+    if not api_key:
+        logging.error("Node API key not found in configuration.")
+        sys.exit(5)
+
+    logging.info("Successfully retrieved Node API key.")
+    return api_key
+
 def get_retry_session(retries=3, backoff_factor_range=(1.0, 2.0)):
     session = requests.Session()
     # handling retry delays manually via backoff in the range
@@ -294,6 +315,57 @@ def create_asset(config_data, file_path, folder_id=None, workspace_id=None, lang
                 f.close()
     return None, 500
 
+def update_catalog(repo_guid, file_path, workspace_id, folder_id, asset_id, max_attempts=5):
+    url = "http://127.0.0.1:5080/catalogs/provideData"
+    # Read NodeAPIKey from client services config
+    node_api_key = get_node_api_key()
+    headers = {
+        "apikey": node_api_key,
+        "Content-Type": "application/json"
+    } 
+    payload = {
+        "repoGuid": repo_guid,
+        "fileName": os.path.basename(file_path),
+        "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
+        "providerName": "trint",
+        "providerData": {
+            "assetId": asset_id,
+            "folderId": folder_id,
+            "workspaceId": workspace_id,
+            "providerUiLink": f"https://app.trint.com/editor/{asset_id}"
+        }
+    }
+    for attempt in range(max_attempts):
+        try:
+            response = make_request_with_retries("POST", url, headers=headers, json=payload)
+            if response and response.status_code in (200, 201):
+                logging.info(f"Catalog updated successfully: {response.text}")
+                return True
+            if response and response.status_code == 404:
+                try:
+                    resp_json = response.json()
+                    if resp_json.get("message", "").lower() == "catalog item not found":
+                        wait_time = 60 + (attempt * 30)
+                        logging.warning(
+                            f"[Attempt {attempt+1}/{max_attempts}] Catalog item not found. "
+                            f"Waiting {wait_time} seconds before retrying..."
+                        )
+                        time.sleep(wait_time)
+                        continue  # retry outer loop
+                except Exception:
+                    logging.warning(f"Failed to parse JSON on 404 response: {response.text}")
+                logging.warning(f"Catalog update failed (status 404): {response.text}")
+                break
+            logging.warning(
+                f"Catalog update failed (status {response.status_code if response else 'No response'}): "
+                f"{response.text if response else ''}"
+            )
+            break
+        except Exception as e:
+            logging.warning(f"Unexpected error in update_catalog attempt {attempt+1}: {e}")
+            break
+    pass
+
 if __name__ == '__main__':
     # Random delay to avoid thundering herd
     time.sleep(random.uniform(0.0, 1.5))
@@ -406,6 +478,7 @@ if __name__ == '__main__':
             resp_json = response.json()
             trint_id = resp_json.get("trintId")
             if trint_id:
+                update_catalog(args.repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], workspace_id, folder_id, trint_id)
                 logging.info(f"asset upload completed ==============================> {trint_id}")
                 sys.exit(0) 
             else:

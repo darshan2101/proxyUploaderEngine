@@ -141,7 +141,7 @@ def get_first_project(config_data):
                 result = response.json().get("result", {})
                 items = result.get("items", [])
                 if items:
-                    logging.info(f"First project ID: { items[0].get("uuid")}")
+                    logging.info(f"First project ID: {items[0].get('uuid')}")
                     return items[0].get("uuid")
                 else:
                     return None
@@ -621,6 +621,26 @@ def complete_multipart_upload(asset_res, upload_id, etags, config_data):
     logging.debug(response.status_code)
     logging.debug(response.text)
 
+def get_node_api_key():
+    api_key = ""
+    try:
+        if IS_LINUX:
+            parser = ConfigParser()
+            parser.read(DNA_CLIENT_SERVICES)
+            api_key = parser.get('General', 'NodeAPIKey', fallback='')
+        else:
+            with open(DNA_CLIENT_SERVICES, 'rb') as fp:
+                api_key = plistlib.load(fp).get("NodeAPIKey", "")
+    except Exception as e:
+        logging.error(f"Error reading Node API key: {e}")
+        sys.exit(5)
+
+    if not api_key:
+        logging.error("Node API key not found in configuration.")
+        sys.exit(5)
+
+    logging.info("Successfully retrieved Node API key.")
+    return api_key
 
 
 def parse_metadata_file(properties_file):
@@ -662,6 +682,56 @@ def parse_metadata_file(properties_file):
         logging.error(f"Failed to parse {properties_file}: {e}")
 
     return metadata
+
+def update_catalog(repo_guid, file_path, folder_id, asset_id, max_attempts=5):
+    url = "http://127.0.0.1:5080/catalogs/provideData"
+    # Read NodeAPIKey from client services config
+    node_api_key = get_node_api_key()
+    headers = {
+        "apikey": node_api_key,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "repoGuid": repo_guid,
+        "fileName": os.path.basename(file_path),
+        "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
+        "providerName": "overcasthq",
+        "providerData": {
+            "assetId": asset_id,
+            "folderId": folder_id,
+            "providerUiLink": f"https://keycode.overcasthq.com/assets/{asset_id}"
+        }
+    }
+    for attempt in range(max_attempts):
+        try:
+            response = make_request_with_retries("POST", url, headers=headers, json=payload)
+            if response and response.status_code in (200, 201):
+                logging.info(f"Catalog updated successfully: {response.text}")
+                return True
+            if response and response.status_code == 404:
+                try:
+                    resp_json = response.json()
+                    if resp_json.get("message", "").lower() == "catalog item not found":
+                        wait_time = 60 + (attempt * 30)
+                        logging.warning(
+                            f"[Attempt {attempt+1}/{max_attempts}] Catalog item not found. "
+                            f"Waiting {wait_time} seconds before retrying..."
+                        )
+                        time.sleep(wait_time)
+                        continue  # retry outer loop
+                except Exception:
+                    logging.warning(f"Failed to parse JSON on 404 response: {response.text}")
+                logging.warning(f"Catalog update failed (status 404): {response.text}")
+                break
+            logging.warning(
+                f"Catalog update failed (status {response.status_code if response else 'No response'}): "
+                f"{response.text if response else ''}"
+            )
+            break
+        except Exception as e:
+            logging.warning(f"Unexpected error in update_catalog attempt {attempt+1}: {e}")
+            break
+    pass
 
 def upload_metadata_to_asset(hostname, api_key, backlink_url, asset_id, properties_file=None):
     logging.info(f"Updating asset {asset_id} with properties from {properties_file}")
@@ -719,6 +789,7 @@ if __name__ == '__main__':
     parser.add_argument("-mp", "--metadata-file", help="Path to metadata file (JSON/CSV/XML)")
     parser.add_argument("-up", "--upload-path", required=True, help="Target path or ID in Overcast HQ")
     parser.add_argument("-sl", "--size-limit", help="File size limit in MB for original upload")
+    parser.add_argument("-r", "--repo-guid", help="Repository GUID for catalog update")
     parser.add_argument("--dry-run", action="store_true", help="Perform dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level (debug, info, warning, error)")
     parser.add_argument("--resolved-upload-id", action="store_true", help="Treat upload-path as resolved folder ID")
@@ -861,7 +932,7 @@ if __name__ == '__main__':
     except Exception as e:
         logging.critical(f"File upload failed: {e}")
         sys.exit(1)
-
+    update_catalog(args.repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], folder_id, asset_id)
     # Upload metadata
     try:
         meta_response = upload_metadata_to_asset(

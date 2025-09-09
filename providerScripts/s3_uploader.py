@@ -8,7 +8,11 @@ import urllib.parse
 from configparser import ConfigParser
 import xml.etree.ElementTree as ET
 import plistlib
-from pathlib import Path
+import requests
+import random
+import time
+from requests.adapters import HTTPAdapter
+from requests.exceptions import RequestException, SSLError, ConnectionError, Timeout
 
 # Constants
 VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet"]
@@ -137,6 +141,114 @@ def upload_file_to_s3(config_data, bucket_name, source_path, upload_path, metada
         logging.error(f"Unexpected error during S3 upload: {e}")
         return {"status": 500, "detail": str(e)}
 
+def get_retry_session(retries=3, backoff_factor_range=(1.0, 2.0)):
+    session = requests.Session()
+    # handling retry delays manually via backoff in the range
+    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+def make_request_with_retries(method, url, **kwargs):
+    session = get_retry_session()
+    last_exception = None
+
+    for attempt in range(3):  # Max 3 attempts
+        try:
+            response = session.request(method, url, timeout=(10, 30), **kwargs)
+            if response.status_code < 500:
+                return response
+            else:
+                logging.warning(f"Received {response.status_code} from {url}. Retrying...")
+        except (SSLError, ConnectionError, Timeout) as e:
+            last_exception = e
+            if attempt < 2:  # Only sleep if not last attempt
+                base_delay = [1, 3, 10][attempt]
+                jitter = random.uniform(0, 1)
+                delay = base_delay + jitter * ([1, 1, 5][attempt])  # e.g., 1-2, 3-4, 10-15
+                logging.warning(f"Attempt {attempt + 1} failed due to {type(e).__name__}: {e}. "
+                                f"Retrying in {delay:.2f}s...")
+                time.sleep(delay)
+            else:
+                logging.error(f"All retry attempts failed for {url}. Last error: {e}")
+        except RequestException as e:
+            logging.error(f"Request failed: {e}")
+            raise
+
+    if last_exception:
+        raise last_exception
+    return None  # Should not reach here
+
+def get_node_api_key():
+    api_key = ""
+    try:
+        if IS_LINUX:
+            parser = ConfigParser()
+            parser.read(DNA_CLIENT_SERVICES)
+            api_key = parser.get('General', 'NodeAPIKey', fallback='')
+        else:
+            with open(DNA_CLIENT_SERVICES, 'rb') as fp:
+                api_key = plistlib.load(fp).get("NodeAPIKey", "")
+    except Exception as e:
+        logging.error(f"Error reading Node API key: {e}")
+        sys.exit(5)
+
+    if not api_key:
+        logging.error("Node API key not found in configuration.")
+        sys.exit(5)
+
+    logging.info("Successfully retrieved Node API key.")
+    return api_key
+
+def update_catalog(repo_guid, file_path, upload_path, bucket, max_attempts=5):
+    url = "http://127.0.0.1:5080/catalogs/provideData"
+    # Read NodeAPIKey from client services config
+    node_api_key = get_node_api_key()
+    headers = {
+        "apikey": node_api_key,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "repoGuid": repo_guid,
+        "fileName": os.path.basename(file_path),
+        "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
+        "providerName": "s3",
+        "providerData": {
+            "bucket": bucket,
+            "s3_key": upload_path,
+        }
+    }
+    for attempt in range(max_attempts):
+        try:
+            response = make_request_with_retries("POST", url, headers=headers, json=payload)
+            if response and response.status_code in (200, 201):
+                logging.info(f"Catalog updated successfully: {response.text}")
+                return True
+            if response and response.status_code == 404:
+                try:
+                    resp_json = response.json()
+                    if resp_json.get("message", "").lower() == "catalog item not found":
+                        wait_time = 60 + (attempt * 30)
+                        logging.warning(
+                            f"[Attempt {attempt+1}/{max_attempts}] Catalog item not found. "
+                            f"Waiting {wait_time} seconds before retrying..."
+                        )
+                        time.sleep(wait_time)
+                        continue  # retry outer loop
+                except Exception:
+                    logging.warning(f"Failed to parse JSON on 404 response: {response.text}")
+                logging.warning(f"Catalog update failed (status 404): {response.text}")
+                break
+            logging.warning(
+                f"Catalog update failed (status {response.status_code if response else 'No response'}): "
+                f"{response.text if response else ''}"
+            )
+            break
+        except Exception as e:
+            logging.warning(f"Unexpected error in update_catalog attempt {attempt+1}: {e}")
+            break
+    pass
+
 def prepare_metadata_to_upload( backlink_url, properties_file = None):    
     metadata = {
         "fabric URL": backlink_url
@@ -193,6 +305,7 @@ if __name__ == '__main__':
     parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
     parser.add_argument("-up", "--upload-path", required=True, help="Path where file will be uploaded to frameIO")
     parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
+    parser.add_argument("-r", "--repo-guid", help="Repository GUID for catalog update")
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")
     parser.add_argument("--controller-address",help="Link IP/Hostname Port")
@@ -264,7 +377,7 @@ if __name__ == '__main__':
     if args.dry_run:
         logging.info("[DRY RUN] Upload skipped.")
         logging.info(f"[DRY RUN] File to upload: {matched_file}")
-        logging.info(f"[DRY RUN] Upload path: {args.upload_path} => Frame.io")
+        logging.info(f"[DRY RUN] Upload path: {args.upload_path} => S3")
         meta_file = args.metadata_file
         if meta_file:
             logging.info(f"[DRY RUN] Metadata would be applied from: {meta_file}")
@@ -272,7 +385,7 @@ if __name__ == '__main__':
             logging.warning("[DRY RUN] Metadata upload enabled but no metadata file specified.")
         sys.exit(0)
 
-    logging.info(f"Starting upload process to Frame.io")
+    logging.info(f"Starting upload process to S3")
     upload_path = args.upload_path
     
     #  upload file along with meatadata
@@ -291,5 +404,6 @@ if __name__ == '__main__':
         print(f"Failed to upload file parts: {response['detail']}")
         sys.exit(1)
     else:
-        logging.info("All parts uploaded successfully to Frame.io")
+        update_catalog(args.repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], args.upload_path, args.bucket_name)
+        logging.info("All parts uploaded successfully to S3")
         sys.exit(0)

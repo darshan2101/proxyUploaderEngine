@@ -37,7 +37,7 @@ PROVIDER_SCRIPTS = {
     "cloud": "dropbox_uploader.py",
     "googledrive": "google_drive_uploader.py",
     "iconik": "iconik_uploader.py",
-    "azure_video_indexer": "azure_video_indexer_uploader.py"
+    "AZURE": "azure_video_indexer_uploader.py"
 }
 
 # New upload modes
@@ -120,7 +120,7 @@ def build_proxy_map(records, config, progressDetails):
     log_path = config["logging_path"]
     upload_type = config.get("upload_type", "video_proxy")
     total_records = len(records)
-
+    debug_print(log_path, f"[STEP] Building proxy map for {total_records} records using proxy directory: {proxy_dir} with mode {upload_type}")
     def resolve_proxy(record):
         original_source_path = record[0]
         base_source_path = os.path.join(*original_source_path.split("/./")) if "/./" in original_source_path else original_source_path
@@ -415,6 +415,7 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
         "--catalog-path", catalog_path,
         "--config-name", config["cloud_config_name"],
         "--job-guid", config["job_guid"],
+        "--repo-guid", config["repo_guid"],
         "--log-level", "debug"
     ]
 
@@ -431,8 +432,6 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
         cmd += ["--controller-address", config["controller_address"]]
     if config.get("provider") in PATH_BASED_PROVIDERS:
         cmd += ["--bucket-name", config["bucket"]]
-    if config.get("provider") in ["twelvelabs", "azure_video_indexer"]:
-        cmd += ["--repo-guid", config["repo_guid"]] 
     if dry_run:
         cmd.append("--dry-run")
     if upload_path_id:
@@ -530,7 +529,6 @@ def read_csv_records(csv_path, logging_path, extensions = [], file_size_limit = 
 def calculate_total_size(records, config, proxy_map=None):
     total_size = 0
     upload_type = config.get("upload_type", "video_proxy")
-    
     for r in records:
         if "/./" in r[0]:
             src = r[0].split("/./")[-1]
@@ -544,8 +542,9 @@ def calculate_total_size(records, config, proxy_map=None):
                 proxy_files = proxy_map.get(full_path) if proxy_map else None
                 if proxy_files and isinstance(proxy_files, list):
                     logging.debug(f"[SIZE CALC] Counting files for {full_path}: {proxy_files}")
-                    for file_path in proxy_files and os.path.exists(file_path):
-                        total_size += os.path.getsize(file_path)
+                    for file_path in proxy_files:
+                        if os.path.exists(file_path):
+                            total_size += os.path.getsize(file_path)
             else:
                 # Original behavior - single file
                 proxy = proxy_map.get(full_path) if proxy_map else None
@@ -728,6 +727,12 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
                 debug_print(config["logging_path"], error_msg)
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 write_csv_row(issues_log, ["Error", base_source_path, timestamp, error_msg])
+                try:
+                    if os.path.exists(catalog_path):
+                        os.remove(catalog_path)
+                        logging.info(f"Deleted catalog file: {catalog_path}")
+                except Exception as e:
+                    logging.error(f"Failed to delete catalog file {catalog_path}: {e}")                
                 return {"status": "failure", "file": base_source_path, "error": error_msg}
 
             # Upload each file in the folder
@@ -776,6 +781,13 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
 
             if failure_count == 0:
                 return {"status": "success", "file": base_source_path, "size": total_uploaded_size, "sub_files": success_count}
+            elif failure_count == len(proxy_files):
+                try:
+                    if os.path.exists(catalog_path):
+                        os.remove(catalog_path)
+                        logging.info(f"Deleted catalog file: {catalog_path}")
+                except Exception as e:
+                    logging.error(f"Failed to delete catalog file {catalog_path}: {e}")
             else:
                 return {"status": "partial", "file": base_source_path, "uploaded": success_count, "failed": failure_count}
 
@@ -792,6 +804,12 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
                 error_message = result.get("error", "Unknown error during proxy resolution or upload")
                 debug_print(config["logging_path"], f"[PROXY FAILURE] {resolved_path}\n{error_message}")
                 write_csv_row(issues_log, ["Error", resolved_path, timestamp, error_message])
+                try:
+                    if os.path.exists(catalog_path):
+                        os.remove(catalog_path)
+                        logging.info(f"Deleted catalog file: {catalog_path}")
+                except Exception as e:
+                    logging.error(f"Failed to delete catalog file {catalog_path}: {e}")                
                 return {"status": "failure", "file": resolved_path, "error": error_message}
 
             # Handle upload success
@@ -814,6 +832,12 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 debug_print(config["logging_path"], f"[UPLOAD FAILURE] {resolved_path}\n{stderr_cleaned}")
                 write_csv_row(issues_log, ["Error", resolved_path, timestamp, stderr_cleaned])
+                try:
+                    if os.path.exists(catalog_path):
+                        os.remove(catalog_path)
+                        logging.info(f"Deleted catalog file: {catalog_path}")
+                except Exception as e:
+                    logging.error(f"Failed to delete catalog file {catalog_path}: {e}")                
                 return {"status": "failure", "file": resolved_path, "error": stderr_cleaned}
 
     except Exception as e:
@@ -916,7 +940,7 @@ if __name__ == '__main__':
     parser.add_argument("-c","--json-path", help="Path to JSON config file")
     parser.add_argument("--dry-run", action="store_true", help="Run in dry mode without uploading")
     parser.add_argument("--log-prefix", help="Prefix path for transfer/client/issues CSV logs")
-    parser.add_argument("--upload-type", choices=UPLOAD_TYPES, default="normal", help="Upload mode: normal, spreadsheets, or images")
+    parser.add_argument("--upload-type", choices=UPLOAD_TYPES, help="Upload mode spreadsheets,video or images")
     args = parser.parse_args()
 
     config_path = args.json_path
@@ -934,6 +958,13 @@ if __name__ == '__main__':
     optional_keys = ["proxy_output_base_path", "proxy_extra_params", "controller_address"]
 
     mode = request_data.get("mode")
+    
+    if not (request_data.get("thread_count") or "") or request_data["thread_count"] < 1:
+        request_data["thread_count"] = 2
+        
+    ext = request_data.get("extensions")
+    if not ext or not isinstance(ext, list) or not any(e.strip() for e in ext) or ext == ["*"] or ext == [""] or ext == "*" or ext == "":
+        request_data["extensions"] = []
     
     if not (request_data.get("upload_path") or "").strip() or request_data["upload_path"] == "/":
         if "bucket" in request_data and ":" in request_data["bucket"]:
@@ -954,10 +985,9 @@ if __name__ == '__main__':
     # Add upload_type from argument or config
     if args.upload_type and args.upload_type != "video_proxy":
         request_data["upload_type"] = args.upload_type
-    elif "upload_type" in request_data and request_data["upload_type"] not in UPLOAD_TYPES:
-        print(f"Invalid upload_type: {request_data['upload_type']}. Must be one of: {UPLOAD_TYPES}")
-        sys.exit(1)
-    elif "upload_type" not in request_data:
+    elif request_data.get("proxy_type") in UPLOAD_TYPES:
+        request_data["upload_type"] = request_data["proxy_type"]
+    else:
         request_data["upload_type"] = "video_proxy"
 
     for key in required_keys:
