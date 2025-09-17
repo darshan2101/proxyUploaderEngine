@@ -448,10 +448,36 @@ def upload_file_with_conflict_resolution(client, folder_id, file_path, conflict_
             "success": False,
             "error": str(e)
         }
-        
-def update_catalog(repo_guid, file_path, asset_id, folder_id, max_attempts=5):
-    url = "http://127.0.0.1:5080/catalogs/provideData"
-    # Read NodeAPIKey from client services config
+
+
+def get_shared_link_url(client, file_id):
+    try:
+        shared_link = client.file(file_id).get().shared_link
+        logging.debug(f"Existing shared link for file {file_id}: {shared_link}")
+
+        if not shared_link or not shared_link.get('url'):
+            # Create shared link if it doesn't exist
+            logging.info(f"No shared link found for file {file_id}. Creating one...")
+            shared_link = client.file(file_id).get_shared_link(access='open', allow_download=True, allow_edit=True)
+            logging.debug(f"New shared link created for file {file_id}: {shared_link}")
+
+        if shared_link and shared_link.get('url'):
+            embed_url = shared_link['url']
+            logging.info(f"Embed URL obtained: {embed_url}")
+            return embed_url
+        else:
+            logging.error("Failed to retrieve or create shared link.")
+            return None
+
+    except BoxAPIException as e:
+        logging.error(f"Box API error while fetching shared link for {file_id}: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"Unexpected error while fetching shared link: {e}", exc_info=True)
+        return None
+
+def update_catalog(repo_guid, file_path, asset_id, folder_id, embed_url=None, max_attempts=5):
+    url = "http://127.0.0.1:5080/catalogs/providerData"
     node_api_key = get_node_api_key()
     headers = {
         "apikey": node_api_key,
@@ -461,11 +487,12 @@ def update_catalog(repo_guid, file_path, asset_id, folder_id, max_attempts=5):
         "repoGuid": repo_guid,
         "fileName": os.path.basename(file_path),
         "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
-        "providerName": "twelvelabs",
+        "providerName": "box",
         "providerData": {
             "assetId": asset_id,
             "folderId": folder_id,
-            "providerUiLink": f"https://app.box.com/file/{asset_id}"
+            "providerUiLink": f"https://app.box.com/file/{asset_id}",
+            "embedURL": embed_url
         }
     }
 
@@ -485,7 +512,7 @@ def update_catalog(repo_guid, file_path, asset_id, folder_id, max_attempts=5):
                             f"Waiting {wait_time} seconds before retrying..."
                         )
                         time.sleep(wait_time)
-                        continue  # retry outer loop
+                        continue
                 except Exception:
                     logging.warning(f"Failed to parse JSON on 404 response: {response.text}")
                 logging.warning(f"Catalog update failed (status 404): {response.text}")
@@ -648,7 +675,10 @@ if __name__ == '__main__':
     asset = upload_file_with_conflict_resolution(client, folder_id, args.source_path, conflict_resolution_mode)
     if asset.get("success"):
         logging.info(f"File uploaded successfully: {args.source_path}")
-        update_catalog(args.repo_guid, catalog_path.replace("\\", "/").split("/1/", 1)[-1],asset.get("file_id"), folder_id )
+        embed_url = get_shared_link_url(client, asset.get("file_id"))
+        if not embed_url:
+            logging.warning("Could not obtain embed URL. Proceeding without it.")
+        update_catalog(args.repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1],asset.get("file_id"), folder_id, embed_url)
         if parsed is not None:
             file_obj = client.file(asset.get("file_id"))
             try:

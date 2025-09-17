@@ -395,15 +395,15 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
     if error:
         debug_print(config["logging_path"], error)
         logging.error(error)
-        try:
-            if os.stat(base_source_path).st_size > 0 and os.path.exists(catalog_path):
-                try:
-                    os.remove(catalog_path)
-                    logging.info(f"Deleted catalog file: {catalog_path}")
-                except Exception as e:
-                    logging.error(f"Failed to delete catalog file {catalog_path}: {e}")
-        except Exception as e:
-            logging.error(f"Failed to delete catalog file {catalog_path}: {e}")
+        # try:
+        #     if os.stat(base_source_path).st_size > 0 and os.path.exists(catalog_path):
+        #         try:
+        #             os.remove(catalog_path)
+        #             logging.info(f"Deleted catalog file: {catalog_path}")
+        #         except Exception as e:
+        #             logging.error(f"Failed to delete catalog file {catalog_path}: {e}")
+        # except Exception as e:
+        #     logging.error(f"Failed to delete catalog file {catalog_path}: {e}")
 
         return {"success": False, "error": error}, base_source_path
 
@@ -658,6 +658,49 @@ def build_folder_id_map(records, config, log_path, progressDetails):
 
     return resolved_ids
 
+def load_previous_failures(repo_guid, logging_path):
+    failed_dir = f"/sdna_fs/PROXIES/ARCHIVES/{repo_guid}/failed_uploads"
+    failed_file_path = os.path.join(failed_dir, "failed_files.csv")
+
+    previous_failures = []
+    if os.path.exists(failed_file_path):
+        debug_print(logging_path, f"[RETRY] Loading previous failures from: {failed_file_path}")
+        with open(failed_file_path, 'r') as f:
+            reader = csv.reader(f, delimiter='|')
+            for row in reader:
+                if len(row) >= 2:  # Must have at least source and catalog
+                    source_path = row[0]
+                    catalog_path = row[1]
+                    metadata_path = row[2] if len(row) > 2 else None
+                    previous_failures.append((source_path, catalog_path, metadata_path))
+    else:
+        debug_print(logging_path, "[RETRY] No previous failure file found.")
+
+    return previous_failures
+
+def save_current_failures(repo_guid, current_failures, logging_path):
+    failed_dir = f"/sdna_fs/PROXIES/ARCHIVES/{repo_guid}/failed_uploads"
+    failed_file_path = os.path.join(failed_dir, "failed_files.csv")
+    temp_file_path = failed_file_path + ".tmp"  # Temporary file
+
+    # Ensure the directory exists
+    os.makedirs(failed_dir, exist_ok=True)
+
+    debug_print(logging_path, f"[RETRY] Saving {len(current_failures)} current failures to: {failed_file_path}")
+
+    # Write to temporary file first
+    with open(temp_file_path, 'w', newline='') as f:
+        writer = csv.writer(f, delimiter='|')  # Use pipe delimiter
+        for record in current_failures:
+            # Ensure we write exactly 3 fields. If metadata is None, write empty string.
+            source_path, catalog_path, metadata_path = record
+            row = [source_path, catalog_path, metadata_path if metadata_path is not None else ""]
+            writer.writerow(row)
+
+    # Atomically replace the old file with the new one
+    os.replace(temp_file_path, failed_file_path)
+    debug_print(logging_path, f"[RETRY] Successfully updated failure list: {failed_file_path}")
+
 def upload_worker(record, config, resolved_ids, progressDetails, transferred_log, issues_log, client_log, proxy_map=None):
     try:
         debug_print(config['logging_path'], f"[STEP] Processing record: {record}")
@@ -727,13 +770,13 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
                 debug_print(config["logging_path"], error_msg)
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 write_csv_row(issues_log, ["Error", base_source_path, timestamp, error_msg])
-                try:
-                    if os.path.exists(catalog_path):
-                        os.remove(catalog_path)
-                        logging.info(f"Deleted catalog file: {catalog_path}")
-                except Exception as e:
-                    logging.error(f"Failed to delete catalog file {catalog_path}: {e}")                
-                return {"status": "failure", "file": base_source_path, "error": error_msg}
+                # try:
+                #     if os.path.exists(catalog_path):
+                #         os.remove(catalog_path)
+                #         logging.info(f"Deleted catalog file: {catalog_path}")
+                # except Exception as e:
+                #     logging.error(f"Failed to delete catalog file {catalog_path}: {e}")                
+                return {"status": "failure", "file": base_source_path, "error": error_msg, "record": record}
 
             # Upload each file in the folder
             total_uploaded_size = 0
@@ -782,14 +825,16 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
             if failure_count == 0:
                 return {"status": "success", "file": base_source_path, "size": total_uploaded_size, "sub_files": success_count}
             elif failure_count == len(proxy_files):
-                try:
-                    if os.path.exists(catalog_path):
-                        os.remove(catalog_path)
-                        logging.info(f"Deleted catalog file: {catalog_path}")
-                except Exception as e:
-                    logging.error(f"Failed to delete catalog file {catalog_path}: {e}")
+                # try:
+                #     if os.path.exists(catalog_path):
+                #         os.remove(catalog_path)
+                #         logging.info(f"Deleted catalog file: {catalog_path}")
+                # except Exception as e:
+                #     logging.error(f"Failed to delete catalog file {catalog_path}: {e}")
+                return {"status": "failure", "file": base_source_path, "error": "All sub-files in sprite sheet failed to upload.", "record": record}
             else:
-                return {"status": "partial", "file": base_source_path, "uploaded": success_count, "failed": failure_count}
+                # return {"status": "partial", "file": base_source_path, "uploaded": success_count, "failed": failure_count}
+                return {"status": "partial", "file": base_source_path, "uploaded": success_count, "failed": failure_count, "record": record}
 
         else:
             # Original single file upload behavior
@@ -804,13 +849,14 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
                 error_message = result.get("error", "Unknown error during proxy resolution or upload")
                 debug_print(config["logging_path"], f"[PROXY FAILURE] {resolved_path}\n{error_message}")
                 write_csv_row(issues_log, ["Error", resolved_path, timestamp, error_message])
-                try:
-                    if os.path.exists(catalog_path):
-                        os.remove(catalog_path)
-                        logging.info(f"Deleted catalog file: {catalog_path}")
-                except Exception as e:
-                    logging.error(f"Failed to delete catalog file {catalog_path}: {e}")                
-                return {"status": "failure", "file": resolved_path, "error": error_message}
+                # try:
+                #     if os.path.exists(catalog_path):
+                #         os.remove(catalog_path)
+                #         logging.info(f"Deleted catalog file: {catalog_path}")
+                # except Exception as e:
+                #     logging.error(f"Failed to delete catalog file {catalog_path}: {e}")                
+                # return {"status": "failure", "file": resolved_path, "error": error_message}
+                return {"status": "failure", "file": resolved_path, "error": error_message, "record": record}
 
             # Handle upload success
             if result and result.returncode == 0:
@@ -832,23 +878,28 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 debug_print(config["logging_path"], f"[UPLOAD FAILURE] {resolved_path}\n{stderr_cleaned}")
                 write_csv_row(issues_log, ["Error", resolved_path, timestamp, stderr_cleaned])
-                try:
-                    if os.path.exists(catalog_path):
-                        os.remove(catalog_path)
-                        logging.info(f"Deleted catalog file: {catalog_path}")
-                except Exception as e:
-                    logging.error(f"Failed to delete catalog file {catalog_path}: {e}")                
-                return {"status": "failure", "file": resolved_path, "error": stderr_cleaned}
+                # try:
+                #     if os.path.exists(catalog_path):
+                #         os.remove(catalog_path)
+                #         logging.info(f"Deleted catalog file: {catalog_path}")
+                # except Exception as e:
+                #     logging.error(f"Failed to delete catalog file {catalog_path}: {e}")                
+                # return {"status": "failure", "file": resolved_path, "error": stderr_cleaned}
+                return {"status": "failure", "file": resolved_path, "error": stderr_cleaned, "record": record}
 
     except Exception as e:
         debug_print(config['logging_path'], f"[ERROR] upload_worker() failed: {e}")
-        return {"status": "failure", "file": record[0], "error": str(e)}
+        # return {"status": "failure", "file": record[0], "error": str(e)}
+        return {"status": "failure", "file": record[0], "error": str(e), "record": record}
 
     finally:
         send_progress(progressDetails, config["repo_guid"])
 
 def process_csv_and_upload(config, dry_run=False):
     config["dry_run"] = dry_run
+    repo_guid = config["repo_guid"]  # Extract for path building
+    logging_path = config["logging_path"]
+
     progressDetails = {
         "run_id": config["run_id"],
         "job_id": config["job_id"],
@@ -860,8 +911,18 @@ def process_csv_and_upload(config, dry_run=False):
         "processedBytes": 0,
         "status": "Initializing",
     }
+
     setup_log_and_progress_paths(config)
     transferred_log, issues_log, client_log = prepare_log_files(config)
+
+    # Load previous failures ---
+    previous_failures = load_previous_failures(repo_guid, logging_path)
+    debug_print(logging_path, f"[RETRY] Loaded {len(previous_failures)} records from previous failure list.")
+    # Print the actual list of previously failed files (first 5 for brevity)
+    for i, rec in enumerate(previous_failures[:5]):
+        debug_print(logging_path, f"[RETRY] Previous Failure #{i+1}: {rec[0]}")
+    if len(previous_failures) > 5:
+        debug_print(logging_path, f"[RETRY] ... and {len(previous_failures) - 5} more previous failures.")
 
     # Determine extensions to use for filtering
     if config.get("mode") in ("original", "proxy"):
@@ -869,71 +930,142 @@ def process_csv_and_upload(config, dry_run=False):
     else:
         exts = []
     file_size_limit = config.get("original_file_size_limit") if config.get("mode") == "original" and config.get("original_file_size_limit") else None
+
     progressDetails["status"] = "Reading Files"
     send_progress(progressDetails, config["repo_guid"])
-    records = read_csv_records(config["files_list"], config["logging_path"], exts, file_size_limit)
-    if not records:
+
+    # Read the current batch of files from the main CSV
+    current_records = read_csv_records(config["files_list"], config["logging_path"], exts, file_size_limit)
+    debug_print(logging_path, f"[RETRY] Loaded {len(current_records)} records from current CSV: {config['files_list']}")
+    # Print the first few current records
+    for i, rec in enumerate(current_records[:5]):
+        debug_print(logging_path, f"[RETRY] Current Record #{i+1}: {rec[0]}")
+    if len(current_records) > 5:
+        debug_print(logging_path, f"[RETRY] ... and {len(current_records) - 5} more current records.")
+
+    if not current_records and not previous_failures:
         size_limit_str = f"{file_size_limit} MB" if file_size_limit else "No Limit"
         extensions_str = ", ".join(exts) if exts else "All"
         print(f"No records found with size <= {size_limit_str} and extensions: {extensions_str}")
         sys.exit(0)
-    progressDetails["totalFiles"] = len(records)
+
+    # Create combined list ---
+    # Create a set of base_source_paths from current records for quick lookup
+    current_record_base_paths = set()
+    combined_records = []
+
+    # Add all current records to the combined list
+    for record in current_records:
+        original_source_path = record[0]
+        # Normalize the path for comparison (handle /./)
+        if "/./" in original_source_path:
+            base_source_path = os.path.join(*original_source_path.split("/./"))
+        else:
+            base_source_path = original_source_path
+        current_record_base_paths.add(base_source_path)
+        combined_records.append(record)
+
+    # Add previous failures that are not in the current batch
+    for failed_record in previous_failures:
+        failed_source_path = failed_record[0]
+        if "/./" in failed_source_path:
+            failed_base_path = os.path.join(*failed_source_path.split("/./"))
+        else:
+            failed_base_path = failed_source_path
+
+        # Check if this failed path is already in the current batch
+        if failed_base_path not in current_record_base_paths:
+            combined_records.append(failed_record)
+            debug_print(logging_path, f"[RETRY] Adding failed record for retry: {failed_record[0]}")
+        else:
+            # Log when a previous failure is SKIPPED because it's in the new batch
+            debug_print(logging_path, f"[RETRY] SKIPPING retry for '{failed_record[0]}' (found in current batch)")
+
+    debug_print(logging_path, f"[RETRY] Combined record list has {len(combined_records)} items ({len(current_records)} new + {len(combined_records) - len(current_records)} retries).")
+    # Print the first few combined records to verify merging
+    for i, rec in enumerate(combined_records[:5]):
+        source = rec[0]
+        # Indicate if this is a retry or a new file
+        is_retry = rec in previous_failures and rec not in current_records
+        debug_print(logging_path, f"[RETRY] Combined Record #{i+1} ({'RETRY' if is_retry else 'NEW'}): {source}")
+    if len(combined_records) > 5:
+        debug_print(logging_path, f"[RETRY] ... and {len(combined_records) - 5} more combined records.")
+
+    # ---Create combined list ---
+
+    progressDetails["totalFiles"] = len(combined_records)  # Update total to reflect combined list
     send_progress(progressDetails, config["repo_guid"])
-    # Pre-resolve proxy map if in proxy mode
+
+    # Pre-resolve proxy map if in proxy mode (using the combined list)
     proxy_map = {}
     if config["mode"] == "proxy":
         progressDetails["status"] = "Building Proxy Map"
         send_progress(progressDetails, config["repo_guid"])
-        proxy_map = build_proxy_map(records, config, progressDetails)
+        proxy_map = build_proxy_map(combined_records, config, progressDetails)  # <-- Pass combined_records
         debug_print(config["logging_path"], f"Proxy map ----------> {proxy_map}")
 
     progressDetails["status"] = "Calculating Total Size"
-    # Use proxy_map in size calculation
-    total_size = calculate_total_size(records, config, proxy_map if config["mode"] == "proxy" else None)
+    # Use proxy_map in size calculation (using the combined list)
+    total_size = calculate_total_size(combined_records, config, proxy_map if config["mode"] == "proxy" else None)  # <-- Pass combined_records
     progressDetails["totalSize"] = total_size
     send_progress(progressDetails, config["repo_guid"])
 
-    # Resolve folder IDs if needed
+    # Resolve folder IDs if needed (using the combined list)
     if config["provider"] in PROVIDERS_SUPPORTING_GET_BASE_TARGET:
         progressDetails["status"] = "Building Folder Map"
         send_progress(progressDetails, config["repo_guid"])
-        resolved_ids = build_folder_id_map(records, config, config["logging_path"], progressDetails)
+        resolved_ids = build_folder_id_map(combined_records, config, config["logging_path"], progressDetails)  # <-- Pass combined_records
         debug_print(config["logging_path"], f"Resolved ids directory ---------------------------> {resolved_ids}")
     else:
         resolved_ids = {}
+
+    # Initialize list to track failures in this run 
+    current_run_failures = []
 
     # Upload process
     upload_results = []
     progressDetails["status"] = "Uploading Files"
     progressDetails["processedFiles"] = 0
-    progressDetails["totalFiles"] = len(records)
-    
+    progressDetails["totalFiles"] = len(combined_records)  # Ensure this is set
     send_progress(progressDetails, config["repo_guid"])
 
     with ThreadPoolExecutor(max_workers=config["thread_count"]) as executor:
         futures = [
             executor.submit(upload_worker, record, config, resolved_ids, progressDetails, transferred_log, issues_log, client_log, proxy_map)
-            for record in records
+            for record in combined_records
         ]
         for future in futures:
-            upload_results.append(future.result())
+            result = future.result()
+            upload_results.append(result)
+            # Track failures 
+            if result and result.get("status") in ["failure", "partial"]:
+                failed_record = result.get("record")
+                if failed_record:
+                    current_run_failures.append(failed_record)
+                    debug_print(logging_path, f"[RETRY] File failed/partial, adding to current run failures: {failed_record[0]} | Status: {result.get('status')}")
 
     # Summarize results
     success_count = sum(1 for r in upload_results if r and r.get("status") == "success")
     partial_count = sum(1 for r in upload_results if r and r.get("status") == "partial")
     failure_results = [r for r in upload_results if r and r.get("status") == "failure"]
-
-    debug_print(config["logging_path"], f"Upload summary: {success_count} succeeded, {partial_count} partial, {len(failure_results)} failed")
     print(f"Successful Uploads: {success_count}")
     print(f"Partial Uploads: {partial_count}")
     print(f"Failed Uploads: {len(failure_results)}")
 
+    # Save the new failure list 
+    debug_print(logging_path, f"[RETRY] Preparing to save {len(current_run_failures)} failures to disk.")
+    for i, rec in enumerate(current_run_failures[:5]):
+        debug_print(logging_path, f"[RETRY] Saving Failure #{i+1} for next run: {rec[0]}")
+    if len(current_run_failures) > 5:
+        debug_print(logging_path, f"[RETRY] ... and {len(current_run_failures) - 5} more failures to save.")
+    save_current_failures(repo_guid, current_run_failures, logging_path)
+    debug_print(logging_path, f"[RETRY] Successfully saved failure list. Next run will retry {len(current_run_failures)} files.")
+
     # Finalize progress
     progressDetails["status"] = "Complete"
     send_progress(progressDetails, config["repo_guid"])
-    
-    sys.exit(0 if success_count + partial_count == len(records) else 2)
-
+    debug_print(config["logging_path"], f"Upload summary: {success_count} succeeded, {partial_count} partial, {len(failure_results)} failed")
+    sys.exit(0 if success_count + partial_count == len(combined_records) else 2) # <-- Use len(combined_records)
     
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Uploader Script Backup")
