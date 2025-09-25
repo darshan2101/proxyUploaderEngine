@@ -17,7 +17,7 @@ import xml.etree.ElementTree as ET
 # Constants
 VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet"]
 CHUNK_SIZE = 20 * 1024 * 1024 
-LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
+LINUX_CONFIG_PATH = "DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
 CONFLICT_RESOLUTION_MODES = ["skip", "overwrite"]
@@ -25,7 +25,7 @@ DEFAULT_CONFLICT_RESOLUTION = "skip"
 DOMAIN = "http://15.204.217.105:5000/api"
 
 # Detect platform
-IS_LINUX = os.path.isdir("/opt/sdna/bin")
+IS_LINUX = True
 DNA_CLIENT_SERVICES = LINUX_CONFIG_PATH if IS_LINUX else MAC_CONFIG_PATH
 
 # Initialize logger
@@ -113,25 +113,26 @@ def get_retry_session(retries=3, backoff_factor_range=(1.0, 2.0)):
     session.mount("https://", adapter)
     return session
 
-def make_request_with_retries(method, url, **kwargs):
+def make_request_with_retries(method, url, timeout=(10, 30), **kwargs):
     session = get_retry_session()
     last_exception = None
 
-    for attempt in range(3):  # Max 3 attempts
+    for attempt in range(3):
         try:
-            response = session.request(method, url, timeout=(10, 30), **kwargs)
+            # If timeout passed in kwargs, use it, else default
+            req_timeout = kwargs.pop("timeout", timeout)
+            response = session.request(method, url, timeout=req_timeout, **kwargs)
             if response.status_code < 500:
                 return response
             else:
                 logging.warning(f"Received {response.status_code} from {url}. Retrying...")
         except (SSLError, ConnectionError, Timeout) as e:
             last_exception = e
-            if attempt < 2:  # Only sleep if not last attempt
+            if attempt < 2:
                 base_delay = [1, 3, 10][attempt]
                 jitter = random.uniform(0, 1)
-                delay = base_delay + jitter * ([1, 1, 5][attempt])  # e.g., 1-2, 3-4, 10-15
-                logging.warning(f"Attempt {attempt + 1} failed due to {type(e).__name__}: {e}. "
-                                f"Retrying in {delay:.2f}s...")
+                delay = base_delay + jitter * ([1, 1, 5][attempt])
+                logging.warning(f"Attempt {attempt + 1} failed due to {type(e).__name__}: {e}. Retrying in {delay:.2f}s...")
                 time.sleep(delay)
             else:
                 logging.error(f"All retry attempts failed for {url}. Last error: {e}")
@@ -141,7 +142,7 @@ def make_request_with_retries(method, url, **kwargs):
 
     if last_exception:
         raise last_exception
-    return None  # Should not reach here
+    return None
 
 
 def prepare_metadata_to_upload(repo_guid ,relative_path, file_name, file_size, backlink_url, properties_file = None):    
@@ -205,7 +206,7 @@ def get_access_token(config):
             response = make_request_with_retries("POST", url, json=payload, headers=headers)
             if response and response.status_code == 200:
                 logging.info("JWT token acquired successfully.")
-                return response.json()['axleToken']
+                return response.json()['response']['token']
             else:
                 logging.error(f"Failed to get JWT token: {response.status_code} {response.text}")
         except Exception as e:
@@ -219,9 +220,9 @@ def get_access_token(config):
 
 def upload_file(file_path,endpoint, token, metadata):
     headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
+        "Authorization": f"Bearer {token}"
     }
+    logging.info(f"Uploading file: {file_path} to endpoint: {endpoint}, with headers: {headers}")
     original_file_name = os.path.basename(file_path)
     name_part, ext_part = os.path.splitext(original_file_name)
     sanitized_name_part = name_part.strip()
@@ -231,30 +232,31 @@ def upload_file(file_path,endpoint, token, metadata):
         logging.info(f"Filename sanitized from '{original_file_name}' to '{file_name}'")
     url = f"{DOMAIN}/{endpoint}"
     payload = {
-        "file": file_path,
+        "url": file_path,
         "fileName": file_name,
         "tags": metadata
-        
     }
+    logging.debug(f"Upload payload: {payload}")
     for attempt in range(3):
         try:
-            response = make_request_with_retries("POST", url, json=payload, headers=headers)
+            response = make_request_with_retries("POST", url, json=payload, headers=headers, timeout=None)
             if response and response.status_code == 200:
-                logging.info("JWT token acquired successfully.")
+                logging.info("Video uploaded successfully.")
                 response_data = response.json()['response']
+                logging.debug(f"Upload response data: {response_data}")
                 return response_data[0]
             else:
-                logging.error(f"Failed to get JWT token: {response.status_code} {response.text}")
+                logging.error(f"Failed to upload video: {response.status_code} {response.text}")
         except Exception as e:
             if attempt == 2:
-                logging.critical(f"Failed to get access token after 3 attempts: {e}")
+                logging.critical(f"Failed to get asset ID after 3 attempts: {e}")
                 return None
             base_delay = [1, 3, 10][attempt]
             delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
             time.sleep(delay)
     return None
 
-def poll_task_status(token, task_id, max_wait=10800, interval=10):
+def poll_task_status(token, task_id, max_wait=3600, interval=10):
     url = f"{DOMAIN}/video-status/{task_id}"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -467,10 +469,18 @@ if __name__ == "__main__":
         elif "image" in mime_type:
             endpoint = "upload-image-by-url"
 
+        # convert source path to URL format
+        file_path = matched_file
+        proxy_prefix = "/sdna_fs/ADMINISTRATORDROPBOX/primary/proxy-link/"
+        if file_path.startswith(proxy_prefix):
+            file_path = file_path[len(proxy_prefix):]
+
+        file_url = f"http://{client_ip}/proxy-link{file_path if file_path.startswith('/') else '/' + file_path}"
+
         # Upload file and get file_id from response
-        response = upload_file(args.source_path, endpoint, token, metadata_obj)
+        response = upload_file(file_url, endpoint, token, metadata_obj)
         
-        if response and response.status_code in (200, 201):
+        if response:
             task_id = response.get("_id")  # may not exist yet
             if not task_id:
                 logging.warning("task_id not in upload response. Will extract after ready.")
@@ -479,10 +489,10 @@ if __name__ == "__main__":
             sys.exit(1)
             
         # Step 3: Poll for indexing completion
-        poll_result = poll_task_status(task_id, token, max_wait=args.max_poll_time)
+        poll_result = poll_task_status(task_id, token, max_wait=300)
         if not poll_result:
             logging.error("Task polling failed or timed out.")
-            sys.exit(1)
+
         update_catalog(args.repo_guid, catalog_path.replace("\\", "/").split("/1/", 1)[-1], task_id) 
         logging.info("Operation completed successfully.")
         sys.exit(0)
@@ -490,4 +500,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"Operation failed: {e}")
         print(f"Error: {str(e)}")
-        sys.exit(1)   
+        sys.exit(1)
