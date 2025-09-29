@@ -201,7 +201,7 @@ def get_node_api_key():
     return api_key
 
 def update_catalog(repo_guid, file_path, upload_path, bucket, max_attempts=5):
-    url = "http://127.0.0.1:5080/catalogs/provideData"
+    url = "http://127.0.0.1:5080/catalogs/providerData"
     # Read NodeAPIKey from client services config
     node_api_key = get_node_api_key()
     headers = {
@@ -212,7 +212,7 @@ def update_catalog(repo_guid, file_path, upload_path, bucket, max_attempts=5):
         "repoGuid": repo_guid,
         "fileName": os.path.basename(file_path),
         "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
-        "providerName": "s3",
+        "providerName": cloud_config_data.get("provider", "s3"),
         "providerData": {
             "bucket": bucket,
             "s3_key": upload_path,

@@ -1,4 +1,5 @@
 # provider_box.py
+# Updated for Box SDK v10.0.0+
 import argparse
 import sys
 import os
@@ -30,12 +31,10 @@ def get_dna_client_services_path():
     else:         
         return DNA_CLIENT_SERVICES_MAC
 
-    
 def get_cloud_config_path():
     try:
         client_config_path = get_dna_client_services_path()
         debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, f"Using client config path: {client_config_path}")
-        # Use INI parsing for Linux and Windows
         if IS_LINUX or IS_WINDOWS:
             config_parser = ConfigParser()
             config_parser.read(client_config_path)
@@ -98,7 +97,7 @@ class ConfigTokenStore:
 
     def clear(self):
         if not os.path.exists(self.config_path):
-             return # Nothing to clear
+             return
 
         config = ConfigParser()
         config.read(self.config_path)
@@ -129,24 +128,18 @@ class BoxTokenManager:
 
     def authenticate_with_auth_code(self, auth_code):
         try:
-            # Create temporary OAuth2 to get tokens
             temp_oauth = OAuth2(
                 client_id=self.client_id,
                 client_secret=self.client_secret
             )
-
-            # Exchange auth code for tokens
             access_token, refresh_token = temp_oauth.authenticate(auth_code)
 
-            # Store tokens in config
             token_info = {
                 'access_token': access_token,
                 'refresh_token': refresh_token
             }
-
             self.token_store.write(token_info)
 
-            # Create persistent OAuth2 with token refresh callback
             self.oauth = OAuth2(
                 client_id=self.client_id,
                 client_secret=self.client_secret,
@@ -166,11 +159,10 @@ class BoxTokenManager:
             return self.client
 
         try:
-
             token_info = self.token_store.read()
-
             if 'access_token' not in token_info or 'refresh_token' not in token_info:
                 raise ValueError("Tokens not found in configuration")
+
             self.oauth = OAuth2(
                 client_id=self.client_id,
                 client_secret=self.client_secret,
@@ -178,7 +170,6 @@ class BoxTokenManager:
                 refresh_token=token_info['refresh_token'],
                 store_tokens=self._store_tokens_callback
             )
-
             self.client = Client(self.oauth)
             return self.client
 
@@ -198,10 +189,8 @@ class BoxTokenManager:
         debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, "Tokens automatically refreshed and stored in config")
 
     def refresh_tokens(self):
-
         try:
             if not self.oauth:
-                # Load tokens and create oauth object first
                 token_info = self.token_store.read()
                 self.oauth = OAuth2(
                     client_id=self.client_id,
@@ -210,7 +199,6 @@ class BoxTokenManager:
                     refresh_token=token_info['refresh_token'],
                     store_tokens=self._store_tokens_callback
                 )
-
             self.oauth.refresh()
             self.client = Client(self.oauth)
             return True
@@ -248,7 +236,7 @@ class BoxProvider:
             return []
 
         try:
-            folder = self.client.folder(folder_id=folder_id)
+            folder = self.client.folders.get_by_id(folder_id)
             items = folder.get_items()
             return list(items)
         except Exception as e:
@@ -257,10 +245,10 @@ class BoxProvider:
 
     def get_file_details(self, file_id):
         if not self.client:
-             debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, "Not authenticated with Box")
-             return None
+            debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, "Not authenticated with Box")
+            return None
         try:
-            file_item = self.client.file(file_id).get()
+            file_item = self.client.files.get_by_id(file_id).get()
             return file_item
         except Exception as e:
             debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, f"Error getting file details: {e}")
@@ -271,7 +259,7 @@ class BoxProvider:
             debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, "Not authenticated with Box")
             return None
         try:
-            parent_folder = self.client.folder(folder_id=parent_folder_id)
+            parent_folder = self.client.folders.get_by_id(parent_folder_id)
             folder = parent_folder.create_subfolder(folder_name)
             debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, f"Folder '{folder_name}' created successfully with ID: {folder.id}")
             return folder
@@ -281,10 +269,10 @@ class BoxProvider:
 
     def download_file(self, file_id, target_path):
         if not self.client:
-             debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, "Not authenticated with Box")
-             return False
+            debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, "Not authenticated with Box")
+            return False
         try:
-            file_item = self.client.file(file_id)
+            file_item = self.client.files.get_by_id(file_id)
             download_parent_path = os.path.dirname(target_path)
             os.makedirs(download_parent_path, exist_ok=True)
 
@@ -299,10 +287,10 @@ class BoxProvider:
 
     def upload_file(self, file_path, folder_id):
         if not self.client:
-             debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, "Not authenticated with Box")
-             return None
+            debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, "Not authenticated with Box")
+            return None
         try:
-            folder = self.client.folder(folder_id=folder_id)
+            folder = self.client.folders.get_by_id(folder_id)
             uploaded_file = folder.upload(file_path)
             debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, f"File uploaded successfully: {file_path}")
             return uploaded_file
@@ -368,7 +356,7 @@ def GetObjectDict(files_list, params, catalog_path):
                     mtime_dt = datetime.fromisoformat(file_data.modified_at.replace('Z', '+00:00'))
                     mtime_epoch_seconds = int(mtime_dt.timestamp())
                 except ValueError:
-                    pass # Handle potential parsing errors
+                    pass
 
             if file_data.created_at:
                 try:
@@ -484,7 +472,7 @@ def main():
 
     elif mode == 'list':
         if folder_id is None:
-            folder_id = '0'  # Default to root folder
+            folder_id = '0'
 
         if target_path is None or args.indexid is None:
             print('Target path (-t <targetpath>) and Index ID (-in <indexid>) options are required for list')
@@ -508,11 +496,13 @@ def main():
 
         objects_dict = GetObjectDict(files_list, params_map, catalog_path)
 
-        progressDetails["totalFiles"] = objects_dict.get("scanned_count", 0)
-        progressDetails["totalSize"] = objects_dict.get("total_size", 0)
-        progressDetails["processedFiles"] = objects_dict.get("selected_count", 0)
-        progressDetails["processedBytes"] = 0
-        progressDetails["status"] = "COMPLETED"
+        progressDetails.update({
+            "totalFiles": objects_dict.get("scanned_count", 0),
+            "totalSize": objects_dict.get("total_size", 0),
+            "processedFiles": objects_dict.get("selected_count", 0),
+            "processedBytes": 0,
+            "status": "COMPLETED"
+        })
 
         send_progress(progressDetails, progressDetails["processedFiles"])
 
@@ -530,8 +520,7 @@ def main():
             sys.exit(1)
 
     elif mode == 'browse':
-        if folder_id is None:
-            folder_id = '0'  #
+        folder_id = folder_id or '0'
 
         debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, f"Browsing folders in ID: {folder_id}...")
         items = box_provider.get_folder_contents(folder_id)
@@ -539,52 +528,47 @@ def main():
         folders = [{"name": item.name, "id": item.id} for item in items if item.type == 'folder']
 
         xml_output = add_CDATA_tags_with_id_for_folder(folders)
-        print(xml_output) 
+        print(xml_output)
         sys.exit(0)
 
     elif mode == 'buckets':
-         folder_id = '0' 
-         debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, "Listing buckets (top-level folders)...")
-         items = box_provider.get_folder_contents(folder_id)
+        folder_id = '0'
+        debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, "Listing buckets (top-level folders)...")
 
-         folders = [{"name": item.name, "id": item.id} for item in items if item.type == 'folder']
+        items = box_provider.get_folder_contents(folder_id)
+        folders = [{"name": item.name, "id": item.id} for item in items if item.type == 'folder']
+        buckets = [f"{x['id']}:{replace_file_path(x['name'])}" for x in folders]
 
-         buckets = []
-         for x in folders:
-             safe_name = replace_file_path(x["name"]) 
-             buckets.append(f"{x['id']}:{safe_name}")
-
-         print(','.join(buckets)) 
-         sys.exit(0)
+        print(','.join(buckets))
+        sys.exit(0)
 
     elif mode == 'bucketsfolders':
-        folder_id = '0' 
+        folder_id = '0'
         debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, "Listing buckets (top-level folders) in XML format...")
         items = box_provider.get_folder_contents(folder_id)
-        
+
         folders = [{"name": item.name, "id": item.id} for item in items if item.type == 'folder']
 
         xml_output = add_CDATA_tags_with_id_for_folder(folders)
-        print(xml_output) 
+        print(xml_output)
         sys.exit(0)
 
     elif mode == 'download':
-        if target_path is None or args.tempid is None:
-            print('Target path (-t <targetpath>) and File ID (-tid <tempid>) options are required for download')
+        if not (target_path and args.tempid):
+            print('Target path (-t) and File ID (-tid) required for download')
             sys.exit(1)
 
         debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, f"Downloading file ID: {args.tempid} to {target_path}...")
         if box_provider.download_file(args.tempid, target_path):
-            print(f"File download at {target_path}") 
+            print(f"File download at {target_path}")
             sys.exit(0)
         else:
             print("Error while downloading file")
             sys.exit(1)
 
     elif mode == 'upload':
-        
-        if file_path is None or folder_id is None:
-            print('File path (-s <source>) and Folder ID (-id <folder_id>) options are required for upload')
+        if not (file_path and folder_id):
+            print('File path (-s) and Folder ID (-id) required for upload')
             sys.exit(1)
 
         debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, f"Uploading file: {file_path} to folder ID: {folder_id}...")
@@ -598,8 +582,8 @@ def main():
             sys.exit(1)
 
     elif mode == 'createfolder':
-        if folder_path is None or folder_id is None:
-            print('Folder name (-f <foldername>) and Folder ID (-id <folder_id>) options are required for createfolder')
+        if not (folder_path and folder_id):
+            print('Folder name (-f) and Folder ID (-id) required for createfolder')
             sys.exit(1)
 
         debug_print(DEBUG_FILEPATH, DEBUG_PRINT, DEBUG_TO_FILE, f"Creating folder '{folder_path}' in folder ID: {folder_id}...")

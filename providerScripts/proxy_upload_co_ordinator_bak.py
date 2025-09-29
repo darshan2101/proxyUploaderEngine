@@ -20,8 +20,8 @@ DEBUG_TO_FILE = True
 
 PROXY_GENERATION_HOST = "http://127.0.0.1:8000"
 PROVIDERS_SUPPORTING_GET_BASE_TARGET = ["frameio" , "frameio_v2", "frameio_v4", "tessact", "overcasthq", "trint", "twelvelabs", "box", "googledrive", "iconik"]
-PATH_BASED_PROVIDERS = ["cloud", "AWS"]
-ACCOUNT_BASED_PROVIDERS = ["azure_video_indexer"]
+PATH_BASED_PROVIDERS = ["cloud", "AWS", "axel_ai"]
+ACCOUNT_BASED_PROVIDERS = ["azure_video_indexer", "AZURE"]
 
 # Mapping provider names to their respective upload scripts
 PROVIDER_SCRIPTS = {
@@ -37,7 +37,9 @@ PROVIDER_SCRIPTS = {
     "cloud": "dropbox_uploader.py",
     "googledrive": "google_drive_uploader.py",
     "iconik": "iconik_uploader.py",
-    "AZURE": "azure_video_indexer_uploader.py"
+    "AZURE": "azure_video_indexer_uploader.py",
+    "azure_video_indexer": "azure_video_indexer_uploader.py",
+    "axel_ai": "axel_ai_uploader.py",
 }
 
 # New upload modes

@@ -218,7 +218,7 @@ def upload_file_to_dropbox(token, file_path, target_path, metadata=None, propert
         }
 
 def update_catalog(repo_guid, file_path, upload_path, asset_id, max_attempts=5):
-    url = "http://127.0.0.1:5080/catalogs/provideData"
+    url = "http://127.0.0.1:5080/catalogs/providerData"
     # Read NodeAPIKey from client services config
     node_api_key = get_node_api_key()
     headers = {
@@ -229,7 +229,7 @@ def update_catalog(repo_guid, file_path, upload_path, asset_id, max_attempts=5):
         "repoGuid": repo_guid,
         "fileName": os.path.basename(file_path),
         "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
-        "providerName": "dropbox",
+        "providerName": cloud_config_data.get("provider", "dropbox"),
         "providerData": {
             "folderId": upload_path,
             "assetId": asset_id

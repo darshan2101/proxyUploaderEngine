@@ -642,6 +642,7 @@ class VideoIndexerClient:
         logger.info(f"Found matching video: ID={video_id}, Name='{file_name}', Size={file_size}")
 
         if conflict_mode == "skip":
+            self.update_catalog(repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], video_id)
             logger.info("Conflict mode 'skip'. Skipping upload.")
             return video_id, False
 
@@ -674,7 +675,7 @@ class VideoIndexerClient:
             "repoGuid": repo_guid,
             "fileName": os.path.basename(file_path),
             "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
-            "providerName": "azure_video_indexer",
+            "providerName": section.get("provider", "azure_video_indexer"),
             "providerData": {
                 "assetId": video_id,
                 "accountId": self.account['properties']['accountId'],

@@ -10,6 +10,7 @@ from configparser import ConfigParser
 import random
 import magic
 import time
+import uuid
 from requests.adapters import HTTPAdapter
 from requests.exceptions import RequestException, SSLError, ConnectionError, Timeout
 import xml.etree.ElementTree as ET
@@ -22,7 +23,8 @@ MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
 CONFLICT_RESOLUTION_MODES = ["skip", "overwrite"]
 DEFAULT_CONFLICT_RESOLUTION = "skip"
-DOMAIN = "http://15.204.217.105:5000/api"
+DOMAIN = "https://api.momentslab.com"
+UPLOAD_ENDPOINTS = ["/ingest-request", "/analysis-request"]
 
 # Detect platform
 IS_LINUX = True
@@ -144,7 +146,6 @@ def make_request_with_retries(method, url, timeout=(10, 30), **kwargs):
         raise last_exception
     return None
 
-
 def prepare_metadata_to_upload(repo_guid ,relative_path, file_name, file_size, backlink_url, properties_file = None):    
     metadata = {
         "relativePath": relative_path if relative_path.startswith("/") else "/" + relative_path,
@@ -192,37 +193,11 @@ def prepare_metadata_to_upload(repo_guid ,relative_path, file_name, file_size, b
     
     return metadata
 
-def get_access_token(config):
-    url = f"{DOMAIN}/login-user/"
-    payload = {
-        "username": config["username"],
-        "password": config["password"]
-    }
-    headers = {"Content-Type": "application/json"}
-
-    logging.info("Fetching JWT token...")
-    for attempt in range(3):
-        try:
-            response = make_request_with_retries("POST", url, json=payload, headers=headers)
-            if response and response.status_code == 200:
-                logging.info("JWT token acquired successfully.")
-                return response.json()['response']['token']
-            else:
-                logging.error(f"Failed to get JWT token: {response.status_code} {response.text}")
-        except Exception as e:
-            if attempt == 2:
-                logging.critical(f"Failed to get access token after 3 attempts: {e}")
-                return None
-            base_delay = [1, 3, 10][attempt]
-            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
-            time.sleep(delay)
-    return None
-
-def upload_file(file_path,endpoint, token, metadata):
+def upload_file(file_path, type, token, metadata):
     headers = {
         "Authorization": f"Bearer {token}"
     }
-    logging.info(f"Uploading file: {file_path} to endpoint: {endpoint}, with headers: {headers}")
+    logging.info(f"Uploading file: {file_path}  with headers: {headers}")
     original_file_name = os.path.basename(file_path)
     name_part, ext_part = os.path.splitext(original_file_name)
     sanitized_name_part = name_part.strip()
@@ -230,11 +205,20 @@ def upload_file(file_path,endpoint, token, metadata):
     
     if file_name != original_file_name:
         logging.info(f"Filename sanitized from '{original_file_name}' to '{file_name}'")
-    url = f"{DOMAIN}/{endpoint}"
+    url = f"{DOMAIN}/ingest-request"
     payload = {
-        "url": file_path,
-        "fileName": file_name,
-        "tags": metadata
+        "type": type,
+        "external_id": uuid.uuid4(),
+        "filename": file_name,
+        "title": file_name,
+        "source": {
+            "type": "url",
+            "url": file_path
+        },
+        "analysis_parameters": {
+            "tasks": [ "mxt"]
+        },
+        "metadata": metadata
     }
     logging.debug(f"Upload payload: {payload}")
     for attempt in range(3):
@@ -242,9 +226,9 @@ def upload_file(file_path,endpoint, token, metadata):
             response = make_request_with_retries("POST", url, json=payload, headers=headers, timeout=None)
             if response and response.status_code == 200:
                 logging.info("Video uploaded successfully.")
-                response_data = response.json()['response']
+                response_data = response.json()
                 logging.debug(f"Upload response data: {response_data}")
-                return response_data[0]
+                return response_data
             else:
                 logging.error(f"Failed to upload video: {response.status_code} {response.text}")
         except Exception as e:
@@ -257,7 +241,9 @@ def upload_file(file_path,endpoint, token, metadata):
     return None
 
 def poll_task_status(token, task_id, max_wait=3600, interval=10):
-    url = f"{DOMAIN}/video-status/{task_id}"
+    # https://api.momentslab.io/analysis-request/{analysis_request_id}
+    # https://api.momentslab.io/ingest-request/{job_request_id}
+    url = f"{DOMAIN}/ingest-request/{task_id}"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
@@ -333,7 +319,7 @@ def update_catalog(repo_guid, file_path, media_id, max_attempts=3):
         "repoGuid": repo_guid,
         "fileName": os.path.basename(file_path),
         "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
-        "providerName": section.get("provider", "axel_ai"),
+        "providerName": "momentslab",
         "providerData": {
             "assetId": media_id
         }
@@ -356,10 +342,11 @@ def update_catalog(repo_guid, file_path, media_id, max_attempts=3):
     logging.error("Catalog update failed after retries.")
     pass
 
+
 if __name__ == "__main__":
     time.sleep(random.uniform(0.0, 1.5))  # Avoid herd
 
-    parser = argparse.ArgumentParser(description="Upload video to Axel AI")
+    parser = argparse.ArgumentParser(description="Upload video to Momentslab")
     parser.add_argument("-m", "--mode", required=True, help="Operation mode")
     parser.add_argument("-c", "--config-name", required=True, help="Cloud config name")
     parser.add_argument("-sp", "--source-path", help="Source file path")
@@ -455,7 +442,7 @@ if __name__ == "__main__":
 
     try:
         # Get access token
-        token = get_access_token(section)
+        token = section.get("access_token", "").strip()
         if not token:
             logger.critical("Cannot proceed without access token.")
             sys.exit(1)
@@ -465,9 +452,9 @@ if __name__ == "__main__":
         if not mime_type:
             logging.critical(f"Could not detect MIME type for '{extract_file_name(args.source_path)}'")
         if "video" in mime_type:
-            endpoint = "upload-video-by-url"
+            upload_type = "video"
         elif "image" in mime_type:
-            endpoint = "upload-image-by-url"
+            upload_type = "image"
 
         # convert source path to URL format
         file_path = matched_file
@@ -478,10 +465,10 @@ if __name__ == "__main__":
         file_url = f"http://{client_ip}/proxy-link{file_path if file_path.startswith('/') else '/' + file_path}"
 
         # Upload file and get file_id from response
-        response = upload_file(file_url, endpoint, token, metadata_obj)
+        response = upload_file(file_url, upload_type, token, metadata_obj)
         
         if response:
-            task_id = response.get("_id")  # may not exist yet
+            task_id = response.get("analysis_request_id")  # may not exist yet
             if not task_id:
                 logging.warning("task_id not in upload response. Will extract after ready.")
         else:

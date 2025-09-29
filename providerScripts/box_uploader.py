@@ -487,7 +487,7 @@ def update_catalog(repo_guid, file_path, asset_id, folder_id, embed_url=None, ma
         "repoGuid": repo_guid,
         "fileName": os.path.basename(file_path),
         "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
-        "providerName": "box",
+        "providerName": cloud_config_data.get("provider", "box"),
         "providerData": {
             "assetId": asset_id,
             "folderId": folder_id,
