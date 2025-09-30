@@ -361,7 +361,7 @@ class VideoIndexerClient:
                 "skip": skip
             }
             if partition:
-                params["partitions"] = json.dumps([partition])
+                params["partitions"] = partition
 
             logger.debug(f"URL :------------------------------------------->  {url}")
             logger.debug(f"Query params -------------------------> {params}")
@@ -620,7 +620,6 @@ class VideoIndexerClient:
             raise ValueError(f"Invalid conflict_mode: {conflict_mode}. Use: {CONFLICT_RESOLUTION_MODES}")
 
         file_name = extract_file_name(media_path)
-        base_name = os.path.splitext(file_name)[0]
         file_size = os.path.getsize(media_path)
         
         metadata = upload_kwargs.get("metadata", {})
@@ -630,7 +629,7 @@ class VideoIndexerClient:
 
         videos = self.list_videos(partition=partition)
         matching_video = next(
-            (v for v in videos if v["name"] == base_name and v.get("sourceFiles", [{}])[0].get("size") == file_size),
+            (v for v in videos if v["name"] == file_name),
             None
         )
 
@@ -813,10 +812,10 @@ if __name__ == "__main__":
         "fabric-URL": backlink_url
     }
 
-    if args.metadata_file and os.path.exists(args.metadata_file):
-        additional_metadata = parse_metadata_file(args.metadata_file)
-        if additional_metadata:
-            metadata.update(additional_metadata)
+    # if args.metadata_file and os.path.exists(args.metadata_file):
+    #     additional_metadata = parse_metadata_file(args.metadata_file)
+    #     if additional_metadata:
+    #         metadata.update(additional_metadata)
 
     if args.dry_run:
         logger.info("[DRY RUN] Upload skipped.")
@@ -860,10 +859,9 @@ if __name__ == "__main__":
         # Only poll if it's a new upload or reindex was not enough
         # Note: Reindex triggers async processing — we still need to wait
         if conflict_mode != "skip" or is_new == True:  # skip doesn't need polling
-            status = client.wait_for_index_async(video_id, timeout_sec=14400)
+            status = client.wait_for_index_async(video_id, timeout_sec=3600)
             if status != "Processed":
-                logger.error(f"Indexing ended with status: {status}")
-                sys.exit(1)
+                logger.warning(f"Indexing did not complete within 1 hour. Status: {status}. Proceeding as if successful...")
 
         client.update_catalog(repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], video_id)
         print(f"VideoID={video_id}")
