@@ -840,3 +840,19 @@ def generate_log_csv_file(csv_file,file_details):
         if not file_exists:
             writer.writeheader()
         writer.writerow(file_dict)
+
+def flatten_dict(d, parent_key='', sep='.'):
+    items = []
+    for k, v in d.items():
+        new_key = f"{parent_key}{sep}{k}" if parent_key else k
+        if isinstance(v, dict):
+            items.extend(flatten_dict(v, new_key, sep=sep).items())
+        elif isinstance(v, list):
+            for i, item in enumerate(v):
+                if isinstance(item, dict):
+                    items.extend(flatten_dict(item, f"{new_key}[{i}]", sep=sep).items())
+                else:
+                    items.append((f"{new_key}[{i}]", item))
+        else:
+            items.append((new_key, v))
+    return dict(items)

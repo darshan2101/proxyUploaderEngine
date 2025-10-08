@@ -460,14 +460,19 @@ def get_shared_link_url(client, file_id):
             logging.info(f"No shared link found for file {file_id}. Creating one...")
             shared_link = client.file(file_id).get_shared_link(access='open', allow_download=True, allow_edit=True)
             logging.debug(f"New shared link created for file {file_id}: {shared_link}")
-
-        if shared_link and shared_link.get('url'):
-            embed_url = shared_link['url']
-            logging.info(f"Embed URL obtained: {embed_url}")
-            return embed_url
-        else:
-            logging.error("Failed to retrieve or create shared link.")
-            return None
+            # If shared_link is a string (e.g., "https://app.box.com/s/xyz"), use it directly.
+            if isinstance(shared_link, str) and shared_link.startswith("https://"):
+                embed_url = shared_link
+                logging.info(f"Embed URL obtained: {embed_url}")
+                return embed_url
+            # If shared_link is a dict and has a 'url' key, use that.
+            elif isinstance(shared_link, dict) and shared_link.get('url'):
+                embed_url = shared_link['url']
+                logging.info(f"Embed URL obtained: {embed_url}")
+                return embed_url
+            else:
+                logging.error("Failed to retrieve or create shared link.")
+                return None
 
     except BoxAPIException as e:
         logging.error(f"Box API error while fetching shared link for {file_id}: {e}")
@@ -598,8 +603,8 @@ if __name__ == '__main__':
             sys.exit(0)
 
         logging.info(f"Fetching upload target ID for path: {upload_path}")
-        base_id = args.parent_id or None
-        up_id = ensure_path(client, args.upload_path) if '/' in upload_path else upload_path
+        base_id = args.parent_id or "0"  # default to root only if not provided
+        up_id = ensure_path(client, args.upload_path, base_id=base_id)
         print(up_id)
         sys.exit(0)
     
