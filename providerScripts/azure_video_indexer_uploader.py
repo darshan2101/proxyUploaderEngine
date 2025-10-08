@@ -15,6 +15,7 @@ from configparser import ConfigParser
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, Tuple
+from action_functions import flatten_dict
 
 # =============================
 # Constants
@@ -23,7 +24,7 @@ from typing import Optional, Tuple
 VALID_MODES = [
     "proxy", "original", "get_base_target",
     "generate_video_proxy", "generate_video_frame_proxy",
-    "generate_intelligence_proxy", "generate_video_to_spritesheet"
+    "generate_intelligence_proxy", "generate_video_to_spritesheet", "send_extracted_metadata",
 ]
 
 # Azure Video Indexer API Constants
@@ -629,8 +630,17 @@ class VideoIndexerClient:
 
         videos = self.list_videos(partition=partition)
         matching_video = next(
-            (v for v in videos if v["name"] == file_name),
-            None
+            (
+                v
+                for v in videos
+                if v.get("name") == file_name
+                and (
+                    (lambda m: m and int(json.loads(m).get("fabric_size", -1)) == file_size)(
+                        v.get("metadata")
+                    )
+                )
+            ),
+            None,
         )
 
         if not matching_video:
@@ -712,6 +722,57 @@ class VideoIndexerClient:
                 logging.warning(f"Unexpected error in update_catalog attempt {attempt+1}: {e}")
                 break
         pass
+    
+    def get_ai_metadata(self, video_id, max_attempts=3):
+        self.get_account()
+        url = (
+            f"{API_ENDPOINT}/{self.account['location']}/Accounts/"
+            f"{self.account['properties']['accountId']}/Videos/{video_id}/Index"
+        )
+        params = {"accessToken": self.vi_access_token}
+        for attempt in range(max_attempts):
+            try:
+                response = make_request_with_retries("GET", url, params=params)
+                if response and response.status_code == 200:
+                    data = response.json()
+                    if data.get("state") != "Processed":
+                        logger.warning(f"Video not processed yet. Current state: {data.get('state')}")
+                        return None
+                    videos = data.get("videos", [])
+                    if videos and "insights" in videos[0]:
+                        return videos[0]["insights"]
+                    else:
+                        logger.warning("No insights found in response.")
+                        return None
+                else:
+                    logger.warning(f"Failed to fetch AI metadata (status {response.status_code if response else 'No response'}): {response.text if response else ''}")
+            except Exception as e:
+                logger.warning(f"Error fetching AI metadata (attempt {attempt+1}): {e}")
+            if attempt < max_attempts - 1:
+                time.sleep(2 ** attempt)
+        return None
+
+    def send_extracted_metadata(self, repo_guid, file_path, metadata, max_attempts=3):
+        url = "http://127.0.0.1:5080/catalogs/extendedMetadata"
+        node_api_key = get_node_api_key()
+        headers = {"apikey": node_api_key, "Content-Type": "application/json"}
+        payload = {
+            "repoGuid": repo_guid,
+            "providerName": section.get("provider", "azure_video_indexer"),
+            "extendedMetadata": [{
+                "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
+                "fileName": os.path.basename(file_path),
+                "metadata": metadata
+            }]
+        }
+        for _ in range(max_attempts):
+            try:
+                r = make_request_with_retries("POST", url, headers=headers, json=payload)
+                if r and r.status_code in (200, 201):
+                    return True
+            except Exception as e:
+                logging.warning(f"Metadata send error: {e}")
+        return False
 
 # =============================
 # Main Execution
@@ -727,6 +788,7 @@ if __name__ == "__main__":
     parser.add_argument("-cp", "--catalog-path", help="Catalog path")
     parser.add_argument("-mp", "--metadata-file", help="Metadata file path")
     parser.add_argument("-up", "--upload-path", help="Upload path (ignored if --resolved-upload-id)")
+    parser.add_argument("-id", "--asset-id", help="Asset ID for metadata operations")
     parser.add_argument("--resolved-upload-id", action="store_true", help="Use upload-path as account ID")
     parser.add_argument("-j", "--job-guid", help="SDNA Job GUID")
     parser.add_argument("--controller-address", help="Override Link IP:Port")
@@ -770,6 +832,25 @@ if __name__ == "__main__":
     except ValueError as e:
         logger.error(f"Missing config value: {e}")
         sys.exit(1)
+
+    if args.mode == "send_extracted_metadata":
+        if not (args.asset_id and args.repo_guid and args.catalog_path):
+            logging.error("Asset ID, Repo GUID, and Catalog path required.")
+            sys.exit(1)
+        client = VideoIndexerClient(consts)
+        client.authenticate()
+        ai_metadata = client.get_ai_metadata(args.asset_id)
+        catalog_path_clean = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
+        if ai_metadata:
+            if client.send_extracted_metadata(args.repo_guid, catalog_path_clean, flatten_dict(ai_metadata)):
+                logger.info("Extracted metadata sent successfully.")
+                sys.exit(0)
+            else:
+                logger.error("Failed to send extracted metadata.")
+                sys.exit(1)
+        else:
+            print(f"Metadata extraction failed for asset: {args.asset_id}")
+            sys.exit(7)
 
     matched_file = args.source_path
     if not matched_file or not os.path.exists(matched_file):
@@ -865,6 +946,18 @@ if __name__ == "__main__":
 
         client.update_catalog(repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], video_id)
         print(f"VideoID={video_id}")
+        ai_metadata = client.get_ai_metadata(video_id)
+        catalog_path_clean = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
+        if ai_metadata:
+            if client.send_extracted_metadata(repo_guid, catalog_path_clean, flatten_dict(ai_metadata)):
+                logger.info("Extracted metadata sent successfully.")
+            else:
+                logger.error("Failed to send extracted metadata.")
+                sys.exit(1)
+        else:
+            print(f"Metadata extraction failed for asset: {video_id}")
+            sys.exit(7)
+
         sys.exit(0)
 
     except Exception as e:
