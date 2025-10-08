@@ -171,8 +171,7 @@ def handle_browse(args):
     children = []
 
     if workspace_id:
-        # Use parent ID
-        children = [f for f in all_folders if f.get("parent") == parent_id]
+        children = [{"name": f["name"], "id": f["_id"]} for f in all_folders if f.get("parent") == parent_id]
     else:
         # Find folder with this ID and get its name
         parent_folder = next((f for f in all_folders if f["_id"] == parent_id), None)
@@ -180,7 +179,7 @@ def handle_browse(args):
             print('<?xml version="1.0" encoding="UTF-8"?><folders></folders>')
             sys.exit(0)
 
-        parent_path = parent_folder["name"]  # e.g., "Test-08-05"
+        parent_path = parent_folder["name"]
         # Children: folders where name starts with parent_path/ and has one more segment
         for f in all_folders:
             name = f.get("name", "")
@@ -188,8 +187,7 @@ def handle_browse(args):
                 relative = name[len(parent_path)+1:]
                 if "/" not in relative:  # Direct child
                     children.append(f)
-
-    children = [{"name": f["name"].split("/")[-1], "id": f["_id"]} for f in children]
+        children = [{"name": f["name"].split("/")[-1], "id": f["_id"]} for f in children]
     xml_output = add_CDATA_tags_with_id_for_folder(children)
     print(xml_output)
     sys.exit(0)

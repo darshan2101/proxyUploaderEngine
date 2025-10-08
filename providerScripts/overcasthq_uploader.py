@@ -19,10 +19,11 @@ from pathlib import Path
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 import warnings
+from action_functions import flatten_dict
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # Constants
-VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet"]
+VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet", "send_extracted_metadata"]
 CHUNK_SIZE = 5 * 1024 * 1024
 CONFLICT_RESOLUTION_MODES = ["skip", "overwrite"]
 DEFAULT_CONFLICT_RESOLUTION = "overwrite"
@@ -310,35 +311,6 @@ def remove_file(config_data, asset_id):
             time.sleep(delay)
     return False
 
-
-def get_asset_metadata(config_data, asset_id):
-    metadata_dict = {}
-    url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/assets/{asset_id}/metadata"
-    headers = {
-        'x-api-key': config_data["api_key"]
-    }
-    logger.debug(f"URL :------------------------------------------->  {url}")
-
-    for attempt in range(3):
-        try:
-            response = make_request_with_retries("GET", url, headers=headers)
-            if response and response.status_code == 200:
-                response_data = response.json()
-                for key, value in response_data['result']['items'].items():
-                    for data in value['items']:
-                        metadata_dict[f"{key}_{data['key']}"] = data['value']
-                return metadata_dict
-            else:
-                logging.warning(f"Metadata fetch failed: {response.status_code} {response.text}")
-        except Exception as e:
-            if attempt == 2:
-                logging.warning(f"Skipping metadata fetch after 3 attempts: {e}")
-                return metadata_dict
-            base_delay = [1, 3, 10][attempt]
-            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
-            time.sleep(delay)
-    return metadata_dict
-
 def get_asset_details(config_data, asset_id):
     data_dict = {}
     url = f"https://api-{config_data['hostname']}.overcasthq.com/v1/assets/{asset_id}"
@@ -374,8 +346,7 @@ def get_asset_details(config_data, asset_id):
                 data_dict['type'] = "file"
                 data_dict['size'] = info.get('file_size')
                 data_dict['asset_id'] = asset_id
-                data_dict['metadata'] = get_asset_metadata(config_data, asset_id)
-                return data_dict
+                return response_data.get("result", {})
             else:
                 logging.error(f"Response error. Status - {response.status_code}, Error - {response.text}")
                 return None
@@ -409,15 +380,16 @@ def create_asset(config_data, project_id, folder_id, file_path):
         asset_info = get_asset_details(config_data, asset['uuid'])
         if not asset_info:
             continue
-
-        metadata = asset_info.get('metadata', {})
-        orig_name = metadata.get('fix_original_name')
-        orig_size = metadata.get('fix_original_file_size')
+        name_part = asset_info.get('name', '')
+        ext_part = asset_info.get('info', {}).get('file_type', '')
+        orig_name = f"{name_part}.{ext_part}" if ext_part else name_part
+        orig_size = asset_info.get("storages", {}).get("original", {}).get("file_size")
 
         try:
             if orig_name == file_name and int(orig_size) == file_size:
                 logging.info(f"Duplicate asset found: {file_name} ({file_size} bytes)")
                 if conflict_resolution == "skip":
+                    update_catalog(args.repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], folder_id, asset_id)
                     logging.info(f"File '{file_name}' exists. Skipping upload.")
                     print(f"File '{file_name}' already exists. Skipping upload.")
                     sys.exit(0)
@@ -741,38 +713,107 @@ def upload_metadata_to_asset(hostname, api_key, backlink_url, asset_id, properti
     }
     logger.debug(f"URL :------------------------------------------->  {url}")
 
-    metadata = {"fabric URL": backlink_url}
+    metadata = {"fabric_URL": backlink_url}
     parsed_metadata = parse_metadata_file(properties_file)
     metadata.update(parsed_metadata)
 
+    failed_keys = []
     for key, value in metadata.items():
         value = value if value not in (None, '', [], {}) else "N/A"
         payload = {"key": key, "value": value}
         logging.debug(f"Sending metadata: {payload}")
 
+        success = False
         for attempt in range(3):
             try:
                 response = make_request_with_retries("POST", url, headers=headers, data=payload)
                 if response and response.status_code in (200, 201):
                     logging.info(f"Uploaded: {key} = {value}")
+                    success = True
                     break
                 else:
-                    if attempt == 2:
-                        logging.error(f"Failed to upload metadata '{key}': {response.status_code} {response.text}")
-                        return {"status_code": response.status_code, "detail": response.text}
                     base_delay = [1, 3, 10][attempt]
                     delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
                     time.sleep(delay)
             except Exception as e:
-                if attempt == 2:
-                    logging.error(f"Request error for key '{key}': {e}")
-                    return {"status_code": 500, "detail": str(e)}
                 base_delay = [1, 3, 10][attempt]
                 delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
                 time.sleep(delay)
+        if not success:
+            logging.error(f"Failed to upload metadata '{key}' after 3 attempts.")
+            failed_keys.append(key)
 
+    if failed_keys:
+        return {
+            "status_code": 207,
+            "detail": f"Metadata uploaded with failures. Failed keys: {failed_keys}"
+        }
     return {"status_code": 200, "detail": "Metadata uploaded successfully"}
 
+def get_asset_ai_metadata(config, asset_id, max_attempts=3):
+    url = f"https://api-{config['hostname']}.overcasthq.com/v1/assets/{asset_id}"
+    headers = {
+        'x-api-key': config["api_key"]
+    }
+    logger.debug(f"URL :------------------------------------------->  {url}")
+
+    for attempt in range(max_attempts):
+        try:
+            response = make_request_with_retries("GET", url, headers=headers)
+            if response and response.status_code == 200:
+                response_data = response.json()
+                ai_recognition = (
+                    response_data.get("result", {})
+                    .get("storages", {})
+                    .get("ai_general_recognition", [])
+                )
+                if ai_recognition and isinstance(ai_recognition, list):
+                    ai_file_url = ai_recognition[0].get("file", {}).get("url")
+                    if ai_file_url:
+                        try:
+                            ai_resp = requests.get(ai_file_url, timeout=30)
+                            ai_resp.raise_for_status()
+                            labels = ai_resp.json()
+                            return {"labels": labels}
+                        except Exception as e:
+                            logging.warning(f"Failed to fetch AI labels JSON: {e}")
+                            return {}
+                else:
+                    logging.info("No AI general recognition data found for asset.")
+                    return {}
+            else:
+                logging.warning(f"Metadata fetch failed: {response.status_code} {response.text}")
+        except Exception as e:
+            if attempt == max_attempts - 1:
+                logging.warning(f"Skipping metadata fetch after {max_attempts} attempts: {e}")
+                return {}
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return {}
+
+def send_extracted_metadata(config, repo_guid, file_path, metadata, max_attempts=3):
+    url = "http://127.0.0.1:5080/catalogs/extendedMetadata"
+    node_api_key = get_node_api_key()
+    headers = {"apikey": node_api_key, "Content-Type": "application/json"}
+    payload = {
+        "repoGuid": repo_guid,
+        "providerName": config.get("provider", "overcasthq"),
+        "extendedMetadata": [{
+            "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
+            "fileName": os.path.basename(file_path),
+            "metadata": flatten_dict(metadata)
+        }]
+    }
+    for _ in range(max_attempts):
+        try:
+            r = make_request_with_retries("POST", url, headers=headers, json=payload)
+            logging.debug(f"Metadata send response: {r.status_code} {r.text if r else 'No response'}")
+            if r and r.status_code in (200, 201):
+                return True
+        except Exception as e:
+            logging.warning(f"Metadata send error: {r.text if r else str(e)}")
+    return False
 
 if __name__ == '__main__':
     # Random delay to avoid thundering herd
@@ -782,12 +823,13 @@ if __name__ == '__main__':
     parser.add_argument("-m", "--mode", required=True, help="Mode: proxy, original, get_base_target, etc.")
     parser.add_argument("-c", "--config-name", required=True, help="Name of cloud configuration")
     parser.add_argument("-j", "--job-guid", help="Job GUID of SDNA job")
+    parser.add_argument("-id", "--asset-id", help="Asset ID for metadata operations")
     parser.add_argument("--parent-id", help="Optional parent folder ID for path resolution")
     parser.add_argument("-p", "--project-id", help="Project ID for OvercastHQ")
     parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
     parser.add_argument("-sp", "--source-path", help="Source file path for upload")
     parser.add_argument("-mp", "--metadata-file", help="Path to metadata file (JSON/CSV/XML)")
-    parser.add_argument("-up", "--upload-path", required=True, help="Target path or ID in Overcast HQ")
+    parser.add_argument("-up", "--upload-path", help="Target path or ID in Overcast HQ")
     parser.add_argument("-sl", "--size-limit", help="File size limit in MB for original upload")
     parser.add_argument("-r", "--repo-guid", help="Repository GUID for catalog update")
     parser.add_argument("--dry-run", action="store_true", help="Perform dry run without uploading")
@@ -836,6 +878,23 @@ if __name__ == '__main__':
     logging.debug(f"Project ID: {project_id}")
     logging.debug(f"Source path: {args.source_path}")
     logging.debug(f"Upload path: {args.upload_path}")
+
+    if args.mode == "send_extracted_metadata":
+        if not (args.asset_id and args.repo_guid and args.catalog_path):
+            logging.error("Asset ID, Repo GUID, and Catalog path required.")
+            sys.exit(1)
+        ai_metadata = get_asset_ai_metadata(cloud_config_data, args.asset_id)
+        catalog_path_clean = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
+        if ai_metadata and "labels" in ai_metadata and ai_metadata["labels"]:
+            if send_extracted_metadata(cloud_config_data, args.repo_guid, catalog_path_clean, ai_metadata):
+                logging.info("Extracted metadata sent successfully.")
+                sys.exit(0)
+            else:
+                logging.error("Failed to send extracted metadata.")
+                sys.exit(1)
+        else:
+            print(f"Metadata extraction failed for asset: {args.asset_id}")
+            sys.exit(7)
 
     if mode == "get_base_target":
         if args.resolved_upload_id:
@@ -928,11 +987,11 @@ if __name__ == '__main__':
     # Upload file parts
     try:
         multipart_upload_to_s3(parsed["result"], cloud_config_data, matched_file)
+        update_catalog(args.repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], folder_id, asset_id)
         logging.info("File upload completed successfully.")
     except Exception as e:
         logging.critical(f"File upload failed: {e}")
         sys.exit(1)
-    update_catalog(args.repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], folder_id, asset_id)
     # Upload metadata
     try:
         meta_response = upload_metadata_to_asset(
@@ -942,7 +1001,11 @@ if __name__ == '__main__':
             asset_id=asset_id,
             properties_file=args.metadata_file
         )
-        if meta_response["status_code"] != 200:
+        if meta_response["status_code"] == 207:
+            logging.error(f"Metadata upload partial failure: {meta_response['detail']}")
+            print("File uploaded, but some metadata failed.")
+            # Don't exit with error — file is uploaded
+        elif meta_response["status_code"] != 200:
             logging.error(f"Metadata upload failed: {meta_response['detail']}")
             print("File uploaded, but metadata failed.")
             # Don't exit with error — file is uploaded
@@ -950,6 +1013,23 @@ if __name__ == '__main__':
             logging.info("Metadata uploaded successfully.")
     except Exception as e:
         logging.warning(f"Metadata upload encountered error: {e}")
+
+    try:
+        ai_metadata = get_asset_ai_metadata(cloud_config_data, asset_id)
+        catalog_path_clean = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
+        if ai_metadata and "labels" in ai_metadata and ai_metadata["labels"]:
+            if send_extracted_metadata(cloud_config_data, args.repo_guid, catalog_path_clean, ai_metadata):
+                logging.info("AI metadata sent successfully.")
+            else:
+                logging.error("Failed to send AI metadata.")
+                sys.exit(1)
+        else:
+            print(f"Metadata extraction failed for asset: {asset_id}")
+            sys.exit(7)
+    except Exception as e:
+        logging.warning(f"AI metadata extraction/send error: {e}")
+        print(f"Metadata extraction failed for asset: {asset_id}")
+        sys.exit(7)
 
     logging.info("OvercastHQ upload process completed.")
     sys.exit(0)
