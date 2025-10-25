@@ -449,37 +449,40 @@ def upload_file_with_conflict_resolution(client, folder_id, file_path, conflict_
             "error": str(e)
         }
 
+def get_shared_link_url(client, file_id, max_attempts=3):
+    for attempt in range(max_attempts):
+        try:
+            shared_link = client.file(file_id).get().shared_link
+            logging.debug(f"Existing shared link for file {file_id}: {shared_link}")
 
-def get_shared_link_url(client, file_id):
-    try:
-        shared_link = client.file(file_id).get().shared_link
-        logging.debug(f"Existing shared link for file {file_id}: {shared_link}")
+            if not shared_link or not shared_link.get('url'):
+                logging.info(f"No shared link found for file {file_id}. Creating one...")
+                shared_link = client.file(file_id).get_shared_link(access='open', allow_download=True, allow_edit=True)
+                logging.debug(f"New shared link created for file {file_id}: {shared_link}")
 
-        if not shared_link or not shared_link.get('url'):
-            # Create shared link if it doesn't exist
-            logging.info(f"No shared link found for file {file_id}. Creating one...")
-            shared_link = client.file(file_id).get_shared_link(access='open', allow_download=True, allow_edit=True)
-            logging.debug(f"New shared link created for file {file_id}: {shared_link}")
-            # If shared_link is a string (e.g., "https://app.box.com/s/xyz"), use it directly.
-            if isinstance(shared_link, str) and shared_link.startswith("https://"):
-                embed_url = shared_link
-                logging.info(f"Embed URL obtained: {embed_url}")
-                return embed_url
-            # If shared_link is a dict and has a 'url' key, use that.
-            elif isinstance(shared_link, dict) and shared_link.get('url'):
-                embed_url = shared_link['url']
-                logging.info(f"Embed URL obtained: {embed_url}")
-                return embed_url
-            else:
-                logging.error("Failed to retrieve or create shared link.")
-                return None
+                if isinstance(shared_link, str) and shared_link.startswith("https://"):
+                    embed_url = shared_link
+                    logging.info(f"Embed URL obtained: {embed_url}")
+                    return embed_url
+                elif isinstance(shared_link, dict) and shared_link.get('url'):
+                    embed_url = shared_link['url']
+                    logging.info(f"Embed URL obtained: {embed_url}")
+                    return embed_url
+                else:
+                    logging.error("Failed to retrieve or create shared link.")
+                    return None
 
-    except BoxAPIException as e:
-        logging.error(f"Box API error while fetching shared link for {file_id}: {e}")
-        return None
-    except Exception as e:
-        logging.error(f"Unexpected error while fetching shared link: {e}", exc_info=True)
-        return None
+        except BoxAPIException as e:
+            logging.error(f"Box API error while fetching shared link for {file_id}: {e}")
+            return None
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to get embed url after 3 attempts: {e}")
+                raise
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+            return None
 
 def update_catalog(repo_guid, file_path, asset_id, folder_id, embed_url=None, max_attempts=5):
     url = "http://127.0.0.1:5080/catalogs/providerData"
@@ -503,33 +506,47 @@ def update_catalog(repo_guid, file_path, asset_id, folder_id, embed_url=None, ma
 
     for attempt in range(max_attempts):
         try:
+            logging.debug(f"[Attempt {attempt+1}/{max_attempts}] Starting catalog update request to {url}")
             response = make_request_with_retries("POST", url, headers=headers, json=payload)
-            if response and response.status_code in (200, 201):
-                logging.info(f"Catalog updated successfully: {response.text}")
+            if response is None:
+                logging.error(f"[Attempt {attempt+1}] Response is None!")
+                time.sleep(5)
+                continue
+            try:
+                resp_json = response.json() if response.text.strip() else {}
+            except Exception as e:
+                logging.warning(f"Failed to parse response JSON: {e}")
+                resp_json = {}
+            if response.status_code in (200, 201):
+                logging.info("Catalog updated successfully.")
                 return True
-            if response and response.status_code == 404:
-                try:
-                    resp_json = response.json()
-                    if resp_json.get("message", "").lower() == "catalog item not found":
-                        wait_time = 60 + (attempt * 30)
-                        logging.warning(
-                            f"[Attempt {attempt+1}/{max_attempts}] Catalog item not found. "
-                            f"Waiting {wait_time} seconds before retrying..."
-                        )
-                        time.sleep(wait_time)
-                        continue
-                except Exception:
-                    logging.warning(f"Failed to parse JSON on 404 response: {response.text}")
-                logging.warning(f"Catalog update failed (status 404): {response.text}")
-                break
-            logging.warning(
-                f"Catalog update failed (status {response.status_code if response else 'No response'}): "
-                f"{response.text if response else ''}"
-            )
-            break
+            # --- Handle 404 explicitly ---
+            if response.status_code == 404:
+                logging.info("[404 DETECTED] Entering 404 handling block")
+                message = resp_json.get('message', '')
+                logging.debug(f"[404] Raw message from response: [{repr(message)}]")
+                clean_message = message.strip().lower()
+                logging.debug(f"[404] Cleaned message: [{repr(clean_message)}]")
+
+                if clean_message == "catalog item not found":
+                    wait_time = 60 + (attempt * 10)
+                    logging.warning(f"[404] Known 'not found' case. Waiting {wait_time} seconds before retry...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logging.error(f"[404] Unexpected message: {message}")
+                    break  # non-retryable 404
+            else:
+                logging.warning(f"[Attempt {attempt+1}] Non-404 error status: {response.status_code}")
+
         except Exception as e:
-            logging.warning(f"Unexpected error in update_catalog attempt {attempt+1}: {e}")
-            break
+            logging.exception(f"[Attempt {attempt+1}] Unexpected exception in update_catalog: {e}")
+        # Default retry delay for non-404 or unhandled cases
+        if attempt < max_attempts - 1:
+            fallback_delay = 5 + attempt * 2
+            logging.debug(f"Sleeping {fallback_delay}s before next attempt")
+            time.sleep(fallback_delay)
+
     pass
 
 if __name__ == '__main__':
@@ -687,11 +704,11 @@ if __name__ == '__main__':
         if parsed is not None:
             file_obj = client.file(asset.get("file_id"))
             try:
-                 apply_metadata_with_upsert(file_obj, parsed)
-                 logging.info('Metadata applied successfully.')
+                apply_metadata_with_upsert(file_obj, parsed)
+                logging.info('Metadata applied successfully.')
             except Exception as e:
-                 logging.error(f"Failed to apply metadata: {e}", exc_info=True)
-                 logging.warning("File uploaded successfully, but metadata application failed. Continuing as success.")
+                logging.error(f"Failed to apply metadata: {e}", exc_info=True)
+                logging.warning("File uploaded successfully, but metadata application failed. Continuing as success.")
             print(f"File uploaded successfully: {args.source_path} to folder ID: {folder_id} ")
             sys.exit(0)
         else:

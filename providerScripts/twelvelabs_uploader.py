@@ -9,12 +9,13 @@ import urllib.parse
 from configparser import ConfigParser
 import random
 import time
+from action_functions import flatten_dict
 from requests.adapters import HTTPAdapter
 from requests.exceptions import RequestException, SSLError, ConnectionError, Timeout
 import xml.etree.ElementTree as ET
 
 # Constants
-VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet"]
+VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet", "send_extracted_metadata"]
 CHUNK_SIZE = 5 * 1024 * 1024 
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
@@ -270,6 +271,8 @@ def upload_asset(api_key, index_id, file_path):
     if existing_video_id:
         if conflict_resolution == "skip":
             logging.info(f"File '{file_name}' exists. Skipping upload.")
+            update_catalog(args.repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], index_id, existing_video_id)
+            logging.info("Catalog updated with existing asset. Exiting successfully.")
             print(f"File '{file_name}' already exists. Skipping upload.")
             sys.exit(0)
         elif conflict_resolution == "overwrite":
@@ -329,7 +332,7 @@ def upload_asset(api_key, index_id, file_path):
     # Should not reach here
     raise RuntimeError("Upload failed.")
 
-def poll_task_status(api_key, task_id, max_wait=10800, interval=10):
+def poll_task_status(api_key, task_id, max_wait=1200, interval=10):
     url = f"https://api.twelvelabs.io/v1.3/tasks/{task_id}"
     headers = {"x-api-key": api_key}
     logger.debug(f"URL :------------------------------------------->  {url}")
@@ -399,31 +402,43 @@ def add_metadata(api_key, index_id, video_id, metadata):
         "Content-Type": "application/json"
     }
     payload = {"user_metadata": metadata}
-    logger.debug(f"URL :------------------------------------------->  {url}")
-    logging.debug(f"Metadata payload -------------------------> {payload}")
-
     for attempt in range(3):
         try:
             response = make_request_with_retries("PUT", url, json=payload, headers=headers)
             if not response:
+                logger.warning(f"[add_metadata] [Attempt {attempt+1}] No response received.")
+                if attempt == 2:
+                    raise RuntimeError("No response from Twelve Labs after 3 attempts")
+                time.sleep([1, 3, 10][attempt] + random.uniform(0, 1))
                 continue
+
+            logger.debug(f"[add_metadata] [Attempt {attempt+1}] Status: {response.status_code}, Body: {response.text}")
+
             if response.status_code == 204:
-                logging.info("Metadata updated successfully (204 No Content).")
+                logger.info("[add_metadata] Metadata updated successfully (204 No Content).")
                 return None
             elif response.status_code == 200:
-                logging.info("Metadata updated successfully.")
+                logger.info("[add_metadata] Metadata updated successfully (200 OK).")
                 return response.json()
             else:
+                error_detail = response.text or "No error body"
+                logger.error(
+                    f"[add_metadata] [Attempt {attempt+1}] Request failed: status={response.status_code}, response={error_detail}"
+                )
                 if attempt == 2:
-                    raise RuntimeError(f"Metadata update failed: {response.status_code} {response.text}")
+                    raise RuntimeError(f"Metadata update failed permanently: {response.status_code} {error_detail}")
+
+                delay = [1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt])
+                time.sleep(delay)
+
         except Exception as e:
+            logger.exception(f"[add_metadata] [Attempt {attempt+1}] Exception: {e}")
             if attempt == 2:
-                logging.critical(f"Failed to add metadata after 3 attempts: {e}")
-                raise
-            base_delay = [1, 3, 10][attempt]
-            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+                raise RuntimeError(f"Metadata update failed after 3 attempts: {e}")
+            delay = [1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt])
             time.sleep(delay)
-    raise RuntimeError("Metadata update failed after retries.")
+
+    raise RuntimeError("Metadata update failed after all retries.")
 
 def update_catalog(repo_guid, file_path, index_id, video_id, max_attempts=3):
     url = "http://127.0.0.1:5080/catalogs/providerData"
@@ -441,39 +456,161 @@ def update_catalog(repo_guid, file_path, index_id, video_id, max_attempts=3):
         "providerData": {
             "assetId": video_id,
             "indexId": index_id,
-            "providerUiLink": f"https://playground.twelvelabs.io/indexes/{index_id}/videos?page=1&task_id={video_id}"
+            "providerUiLink": f"https://playground.twelvelabs.io/indexes/{index_id}/analyze?v={video_id}"
         }
     }
     for attempt in range(max_attempts):
         try:
+            logging.debug(f"[Attempt {attempt+1}/{max_attempts}] Starting catalog update request to {url}")
             response = make_request_with_retries("POST", url, headers=headers, json=payload)
-            if response and response.status_code in (200, 201):
-                logging.info(f"Catalog updated successfully: {response.text}")
+            if response is None:
+                logging.error(f"[Attempt {attempt+1}] Response is None!")
+                time.sleep(5)
+                continue
+            try:
+                resp_json = response.json() if response.text.strip() else {}
+            except Exception as e:
+                logging.warning(f"Failed to parse response JSON: {e}")
+                resp_json = {}
+            if response.status_code in (200, 201):
+                logging.info("Catalog updated successfully.")
                 return True
-            if response and response.status_code == 404:
-                try:
-                    resp_json = response.json()
-                    if resp_json.get("message", "").lower() == "catalog item not found":
-                        wait_time = 60 + (attempt * 30)
-                        logging.warning(
-                            f"[Attempt {attempt+1}/{max_attempts}] Catalog item not found. "
-                            f"Waiting {wait_time} seconds before retrying..."
-                        )
-                        time.sleep(wait_time)
-                        continue  # retry outer loop
-                except Exception:
-                    logging.warning(f"Failed to parse JSON on 404 response: {response.text}")
-                logging.warning(f"Catalog update failed (status 404): {response.text}")
-                break
-            logging.warning(
-                f"Catalog update failed (status {response.status_code if response else 'No response'}): "
-                f"{response.text if response else ''}"
-            )
-            break
+            # --- Handle 404 explicitly ---
+            if response.status_code == 404:
+                logging.info("[404 DETECTED] Entering 404 handling block")
+                message = resp_json.get('message', '')
+                logging.debug(f"[404] Raw message from response: [{repr(message)}]")
+                clean_message = message.strip().lower()
+                logging.debug(f"[404] Cleaned message: [{repr(clean_message)}]")
+
+                if clean_message == "catalog item not found":
+                    wait_time = 60 + (attempt * 10)
+                    logging.warning(f"[404] Known 'not found' case. Waiting {wait_time} seconds before retry...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logging.error(f"[404] Unexpected message: {message}")
+                    break  # non-retryable 404
+            else:
+                logging.warning(f"[Attempt {attempt+1}] Non-404 error status: {response.status_code}")
+
         except Exception as e:
-            logging.warning(f"Unexpected error in update_catalog attempt {attempt+1}: {e}")
-            break
+            logging.exception(f"[Attempt {attempt+1}] Unexpected exception in update_catalog: {e}")
+        # Default retry delay for non-404 or unhandled cases
+        if attempt < max_attempts - 1:
+            fallback_delay = 5 + attempt * 2
+            logging.debug(f"Sleeping {fallback_delay}s before next attempt")
+            time.sleep(fallback_delay)
+
     pass
+
+def get_ai_metadata(api_key, export_prompt, video_id, max_attempts=3):
+    summary_categories = ["summary","chapter","highlight"]
+    endpoints = {
+        "gist": {
+            "url": "https://api.twelvelabs.io/v1.3/gist",
+            "payload": {
+                "video_id": video_id,
+                "types": [
+                    "title",
+                    "topic",
+                    "hashtag"
+                ]
+            }
+        },
+        "summary": {
+            "url": "https://api.twelvelabs.io/v1.3/summarize",
+            "payload": {
+                "video_id": video_id
+            }
+        },
+        "open": {
+            "url": "https://api.twelvelabs.io/v1.3/analyze",
+            "payload": {
+                "video_id": video_id,
+                "stream": False,
+                "prompt": export_prompt
+            }
+        }
+    }
+    headers = {"x-api-key": api_key}
+    metadata = {}
+
+    # Handle gist and open as before
+    for category in ["gist", "open"]:
+        info = endpoints[category]
+        url = info["url"]
+        payload = info["payload"]
+        for attempt in range(max_attempts):
+            try:
+                response = make_request_with_retries("POST", url, headers=headers, json=payload)
+                if response and response.status_code == 200:
+                    data = response.json()
+                    metadata[category] = data
+                    logging.info(f"Retrieved {category} metadata successfully.")
+                    break
+                else:
+                    logging.warning(f"{category} metadata request failed: {response.status_code if response else 'No response'}")
+            except Exception as e:
+                logging.warning(f"Error retrieving {category} metadata on attempt {attempt+1}: {e}")
+            if attempt < max_attempts - 1:
+                base_delay = [1, 3, 10][attempt]
+                delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+                time.sleep(delay)
+            else:
+                logging.error(f"Failed to retrieve {category} metadata after {max_attempts} attempts.")
+
+    # Handle summary: call for each summary category
+    summary_url = endpoints["summary"]["url"]
+    metadata["summary"] = {}
+    for key in summary_categories:
+        payload = {
+            "video_id": video_id,
+            "type": key
+        }
+        for attempt in range(max_attempts):
+            try:
+                response = make_request_with_retries("POST", summary_url, headers=headers, json=payload)
+                if response and response.status_code == 200:
+                    data = response.json()
+                    # Store the summary result under its key
+                    metadata["summary"][key] = data
+                    logging.info(f"Retrieved summary ({key}) successfully.")
+                    break
+                else:
+                    logging.warning(f"Summary ({key}) request failed: {response.status_code if response else 'No response'}")
+            except Exception as e:
+                logging.warning(f"Error retrieving summary ({key}) on attempt {attempt+1}: {e}")
+            if attempt < max_attempts - 1:
+                base_delay = [1, 3, 10][attempt]
+                delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+                time.sleep(delay)
+            else:
+                logging.error(f"Failed to retrieve summary ({key}) after {max_attempts} attempts.")
+
+    return metadata
+
+def send_extracted_metadata(repo_guid, file_path, metadata, max_attempts=3):
+    url = "http://127.0.0.1:5080/catalogs/extendedMetadata"
+    node_api_key = get_node_api_key()
+    headers = {"apikey": node_api_key, "Content-Type": "application/json"}
+    payload = {
+        "repoGuid": repo_guid,
+        "providerName": cloud_config_data.get("provider", "twelvelabs"),
+        "extendedMetadata": [{
+            "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
+            "fileName": os.path.basename(file_path),
+            "metadata": flatten_dict(metadata)
+        }]
+    }
+    for _ in range(max_attempts):
+        try:
+            r = make_request_with_retries("POST", url, headers=headers, json=payload)
+            if r and r.status_code in (200, 201):
+                return True
+        except Exception as e:
+            logging.warning(f"Metadata send error: {e}")
+    return False
 
 if __name__ == '__main__':
     time.sleep(random.uniform(0.0, 1.5))
@@ -482,17 +619,20 @@ if __name__ == '__main__':
     parser.add_argument("-m", "--mode", required=True, help="Mode: proxy, original, get_base_target")
     parser.add_argument("-c", "--config-name", required=True, help="Name of cloud configuration")
     parser.add_argument("-j", "--job-guid", help="Job GUID of SDNA job")
+    parser.add_argument("-id", "--asset-id", help="Asset ID for metadata operations")
     parser.add_argument("--parent-id", help="Parent folder ID")
     parser.add_argument("-cp", "--catalog-path", help="Catalog path")
     parser.add_argument("-sp", "--source-path", help="Source file path")
     parser.add_argument("-mp", "--metadata-file", help="Path to metadata file")
-    parser.add_argument("-up", "--upload-path", required=True, help="Twelve Labs index ID or upload path")
+    parser.add_argument("-up", "--upload-path", help="Twelve Labs index ID or upload path")
     parser.add_argument("-sl", "--size-limit", help="File size limit in MB")
     parser.add_argument("--dry-run", action="store_true", help="Dry run mode")
     parser.add_argument("--log-level", default="debug", help="Logging level")
     parser.add_argument("-r", "--repo-guid", help="Repo GUID")
     parser.add_argument("--resolved-upload-id", action="store_true", help="Treat upload-path as index ID")
     parser.add_argument("--controller-address", help="Controller IP:Port")
+    parser.add_argument("--export-ai-metadata", help="Export AI metadata")
+    parser.add_argument("--export-prompt",help= "Prompt for open ended analysis")
 
     args = parser.parse_args()
 
@@ -519,6 +659,26 @@ if __name__ == '__main__':
     if not api_key:
         logging.error("API key not found in config.")
         sys.exit(1)
+    if args.export_ai_metadata:
+        cloud_config_data["export_ai_metadata"] = "true" if args.export_ai_metadata.lower() == "true" else "false"
+
+    if args.mode == "send_extracted_metadata":
+        if not (args.asset_id and args.repo_guid and args.catalog_path):
+            logging.error("Asset ID, Repo GUID, and Catalog path required.")
+            sys.exit(1)
+        
+        if not args.export_prompt:
+            logging.error("Prompt is required for open ended analysis")
+            sys.exit(1)
+
+        get_ai_metadata = get_ai_metadata(api_key, args.export_prompt, args.asset_id)
+        if get_ai_metadata:
+            if not send_extracted_metadata(args.repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], get_ai_metadata):
+                logger.error("Failed to send extracted metadata.")
+                sys.exit(1)
+            else:
+                logger.info("Extracted metadata sent successfully.")
+                sys.exit(0)
 
     index_id = args.upload_path if args.resolved_upload_id else cloud_config_data.get('index_id')
     if not index_id:
@@ -581,13 +741,22 @@ if __name__ == '__main__':
             properties_file=args.metadata_file
         )
         # Rename forbidden metadata fields by prefixing with 'fabric-'
-        forbidden_fields = {
-            "duration", "filename", "fps", "height", "model_names", "size", "video_title", "width"
+        RESERVED_METADATA_FIELDS = {
+            "duration", "filename", "fps", "height", "model_names",
+            "size", "video_title", "width", "id", "index_id", "video_id"
         }
-        if isinstance(metadata_obj, dict):
-            for key in list(metadata_obj.keys()):
-                if key in forbidden_fields:
-                    metadata_obj[f"fabric-{key}"] = metadata_obj.pop(key)
+
+        safe_metadata = {}
+        for key, value in metadata_obj.items():
+            # Normalize key to lowercase for comparison
+            if key.lower() in RESERVED_METADATA_FIELDS:
+                new_key = f"fabric-{key}"
+                safe_metadata[new_key] = value
+                logger.debug(f"Renamed reserved metadata key: '{key}' → '{new_key}'")
+            else:
+                safe_metadata[key] = value
+
+        metadata_obj = safe_metadata
         logging.info("Metadata prepared successfully.")
     except Exception as e:
         logging.error(f"Failed to prepare metadata: {e}")
@@ -625,7 +794,29 @@ if __name__ == '__main__':
             sys.exit(1)
 
         logging.info(f"Indexing complete. Final Video ID: {final_video_id}")
-        update_catalog(args.repo_guid, catalog_path.replace("\\", "/").split("/1/", 1)[-1], index_id, final_video_id)
+        if update_catalog(args.repo_guid, catalog_path.replace("\\", "/").split("/1/", 1)[-1], index_id, final_video_id):
+            logging.debug("Catalog updation succeeded")
+
+        # Step 4: Send extracted AI metadata to local controller if enabled and task is ready
+        try:
+            if cloud_config_data.get('export_ai_metadata') == "true" and poll_result.get('status') == "ready":
+                ai_metadata = get_ai_metadata(api_key, args.export_prompt, final_video_id)
+                if ai_metadata:
+                    if not send_extracted_metadata(args.repo_guid, catalog_path.replace("\\", "/").split("/1/", 1)[-1], ai_metadata):
+                        logger.error("Failed to send extracted AI metadata.")
+                        sys.exit(7)
+                    else:
+                        logger.info("Extracted AI metadata sent successfully.")
+                else:
+                    logger.error("AI metadata could not be retrieved.")
+                    sys.exit(7)
+            elif cloud_config_data.get('export_ai_metadata') == "true":
+                logger.error("Poll result status is not 'ready'; cannot export AI metadata.")
+                sys.exit(7)
+        except Exception as e:
+            logger.error(f"Exception while exporting AI metadata: {e}")
+            sys.exit(7)
+
         # Re-apply metadata if not done earlier (e.g., video_id wasn't available)
         if not video_id:
             try:

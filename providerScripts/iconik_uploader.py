@@ -923,33 +923,47 @@ def update_catalog(repo_guid, file_path, collection_id, asset_id, max_attempts=5
     }
     for attempt in range(max_attempts):
         try:
+            logging.debug(f"[Attempt {attempt+1}/{max_attempts}] Starting catalog update request to {url}")
             response = make_request_with_retries("POST", url, headers=headers, json=payload)
-            if response and response.status_code in (200, 201):
-                logging.info(f"Catalog updated successfully: {response.text}")
+            if response is None:
+                logging.error(f"[Attempt {attempt+1}] Response is None!")
+                time.sleep(5)
+                continue
+            try:
+                resp_json = response.json() if response.text.strip() else {}
+            except Exception as e:
+                logging.warning(f"Failed to parse response JSON: {e}")
+                resp_json = {}
+            if response.status_code in (200, 201):
+                logging.info("Catalog updated successfully.")
                 return True
-            if response and response.status_code == 404:
-                try:
-                    resp_json = response.json()
-                    if resp_json.get("message", "").lower() == "catalog item not found":
-                        wait_time = 60 + (attempt * 30)
-                        logging.warning(
-                            f"[Attempt {attempt+1}/{max_attempts}] Catalog item not found. "
-                            f"Waiting {wait_time} seconds before retrying..."
-                        )
-                        time.sleep(wait_time)
-                        continue  # retry outer loop
-                except Exception:
-                    logging.warning(f"Failed to parse JSON on 404 response: {response.text}")
-                logging.warning(f"Catalog update failed (status 404): {response.text}")
-                break
-            logging.warning(
-                f"Catalog update failed (status {response.status_code if response else 'No response'}): "
-                f"{response.text if response else ''}"
-            )
-            break
+            # --- Handle 404 explicitly ---
+            if response.status_code == 404:
+                logging.info("[404 DETECTED] Entering 404 handling block")
+                message = resp_json.get('message', '')
+                logging.debug(f"[404] Raw message from response: [{repr(message)}]")
+                clean_message = message.strip().lower()
+                logging.debug(f"[404] Cleaned message: [{repr(clean_message)}]")
+
+                if clean_message == "catalog item not found":
+                    wait_time = 60 + (attempt * 10)
+                    logging.warning(f"[404] Known 'not found' case. Waiting {wait_time} seconds before retry...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logging.error(f"[404] Unexpected message: {message}")
+                    break  # non-retryable 404
+            else:
+                logging.warning(f"[Attempt {attempt+1}] Non-404 error status: {response.status_code}")
+
         except Exception as e:
-            logging.warning(f"Unexpected error in update_catalog attempt {attempt+1}: {e}")
-            break
+            logging.exception(f"[Attempt {attempt+1}] Unexpected exception in update_catalog: {e}")
+        # Default retry delay for non-404 or unhandled cases
+        if attempt < max_attempts - 1:
+            fallback_delay = 5 + attempt * 2
+            logging.debug(f"Sleeping {fallback_delay}s before next attempt")
+            time.sleep(fallback_delay)
+
     pass
 
 if __name__ == '__main__':

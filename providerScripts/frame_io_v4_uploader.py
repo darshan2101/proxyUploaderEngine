@@ -252,11 +252,11 @@ def remove_file(config_data, asset_id):
         except Exception as e:
             if attempt == 2:
                 logging.critical(f"Failed to remove asset after 3 attempts: {e}")
-                return None
+                return False
             base_delay = [1, 3, 10][attempt]
             delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
             time.sleep(delay)
-    return None    
+    return False
 
 def create_folder(config_data,folder_name,parent_id):
     url = f"{config_data['domain']}/v4/accounts/{config_data['account_id']}/folders/{parent_id}/folders"
@@ -362,6 +362,7 @@ def create_asset(config_data,folder_id,file_path):
                 return response.json(), response.status_code
             else:
                 logging.error(f"Failed to create asset for file '{file_path}'. Status: {response.status_code}, Response: {response.text}")
+                return response.json(), response.status_code
         except Exception as e:
             logging.warning(f"Initiate upload error (attempt {attempt + 1}): {e}")
             if attempt == 2:
@@ -373,8 +374,8 @@ def create_asset(config_data,folder_id,file_path):
 
 def update_catalog(repo_guid, file_path, project_id, folder_id, asset_id, max_attempts=5):
     url = "http://127.0.0.1:5080/catalogs/providerData"
-    # Read NodeAPIKey from client services config
     node_api_key = get_node_api_key()
+    logging.debug(f"URL for catalog update: {url}")
     headers = {
         "apikey": node_api_key,
         "Content-Type": "application/json"
@@ -394,35 +395,49 @@ def update_catalog(repo_guid, file_path, project_id, folder_id, asset_id, max_at
 
     for attempt in range(max_attempts):
         try:
+            logging.debug(f"[Attempt {attempt+1}/{max_attempts}] Starting catalog update request to {url}")
             response = make_request_with_retries("POST", url, headers=headers, json=payload)
-            if response and response.status_code in (200, 201):
-                logging.info(f"Catalog updated successfully: {response.text}")
+            if response is None:
+                logging.error(f"[Attempt {attempt+1}] Response is None!")
+                time.sleep(5)
+                continue
+            try:
+                resp_json = response.json() if response.text.strip() else {}
+            except Exception as e:
+                logging.warning(f"Failed to parse response JSON: {e}")
+                resp_json = {}
+            if response.status_code in (200, 201):
+                logging.info("Catalog updated successfully.")
                 return True
-            if response and response.status_code == 404:
-                try:
-                    resp_json = response.json()
-                    if resp_json.get("message", "").lower() == "catalog item not found":
-                        wait_time = 60 + (attempt * 30)
-                        logging.warning(
-                            f"[Attempt {attempt+1}/{max_attempts}] Catalog item not found. "
-                            f"Waiting {wait_time} seconds before retrying..."
-                        )
-                        time.sleep(wait_time)
-                        continue  # retry outer loop
-                except Exception:
-                    logging.warning(f"Failed to parse JSON on 404 response: {response.text}")
-                logging.warning(f"Catalog update failed (status 404): {response.text}")
-                break
-            logging.warning(
-                f"Catalog update failed (status {response.status_code if response else 'No response'}): "
-                f"{response.text if response else ''}"
-            )
-            break
+            # --- Handle 404 explicitly ---
+            if response.status_code == 404:
+                logging.info("[404 DETECTED] Entering 404 handling block")
+                message = resp_json.get('message', '')
+                logging.debug(f"[404] Raw message from response: [{repr(message)}]")
+                clean_message = message.strip().lower()
+                logging.debug(f"[404] Cleaned message: [{repr(clean_message)}]")
+
+                if clean_message == "catalog item not found":
+                    wait_time = 60 + (attempt * 10)
+                    logging.warning(f"[404] Known 'not found' case. Waiting {wait_time} seconds before retry...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logging.error(f"[404] Unexpected message: {message}")
+                    break  # non-retryable 404
+            else:
+                logging.warning(f"[Attempt {attempt+1}] Non-404 error status: {response.status_code}")
+
         except Exception as e:
-            logging.warning(f"Unexpected error in update_catalog attempt {attempt+1}: {e}")
-            break
+            logging.exception(f"[Attempt {attempt+1}] Unexpected exception in update_catalog: {e}")
+        # Default retry delay for non-404 or unhandled cases
+        if attempt < max_attempts - 1:
+            fallback_delay = 5 + attempt * 2
+            logging.debug(f"Sleeping {fallback_delay}s before next attempt")
+            time.sleep(fallback_delay)
+
     pass
-        
+
 def upload_parts(file_path, asset_info):
     upload_urls = asset_info['data']['upload_urls']
     content_type = asset_info['data']['media_type']
@@ -597,20 +612,20 @@ if __name__ == '__main__':
         folder_id = find_upload_id(upload_path, cloud_config_data, args.parent_id)
     
     if not folder_id:
-        logging.warning(f"failed to find location no upload asset")
+        logging.warning(f"failed to find location to upload asset")
         sys.exit(1)
 
     asset_info, creation_status = create_asset(cloud_config_data, folder_id, args.source_path)
     if creation_status not in (200, 201) or asset_info is None:
-        logging.error(f"Failed to create asset: {getattr(asset_info, 'text', asset_info)}")
+        logging.error(f"Failed to create asset: {asset_info.text}")
         sys.exit(1)
 
-    parts_info = upload_parts(args.source_path, asset_info.json())
+    parts_info = upload_parts(args.source_path, asset_info)
+    update_catalog(args.repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], project_id, folder_id, asset_info['data']['id'])
     if not parts_info or parts_info.get("status_code", 0) not in (200, 201):
         detail = parts_info['detail'] if parts_info else 'No detail available'
         logging.error(f"Failed to upload file parts: {detail}")
         sys.exit(1)
     else:
-        update_catalog(args.repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], project_id, folder_id, asset_info['data']['id'])
         logging.info("All parts uploaded successfully to Frame.io")
         sys.exit(0)
