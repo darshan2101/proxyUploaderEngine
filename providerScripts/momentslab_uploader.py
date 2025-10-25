@@ -195,24 +195,26 @@ def prepare_metadata_to_upload(repo_guid ,relative_path, file_name, file_size, b
 
 def upload_file(file_path, type, token, metadata):
     headers = {
-        "Authorization": f"Bearer {token}"
+        "Authorization": f"Bearer {token}",
+        "X-Nb-Workspace": "ml-api-euw1",
+        "X-Nb-Workspace": "ml-api-euw1"
     }
     logging.info(f"Uploading file: {file_path}  with headers: {headers}")
     original_file_name = os.path.basename(file_path)
     name_part, ext_part = os.path.splitext(original_file_name)
-    sanitized_name_part = name_part.strip()
+    sanitized_name_part = name_part.strip().replace(" ", "_")
     file_name = sanitized_name_part + ext_part
-    
+
     if file_name != original_file_name:
-        logging.info(f"Filename sanitized from '{original_file_name}' to '{file_name}'")
+        logging.info(f"Filename sanitized from '{original_file_name}' to '{file_name}' (spaces replaced with underscores)")
     url = f"{DOMAIN}/ingest-request"
     payload = {
         "type": type,
         "external_id": uuid.uuid4(),
-        "filename": file_name,
-        "title": file_name,
+        "filename": file_name,  # spaces replaced with underscores
+        "title": original_file_name,  # keep original with spaces
         "source": {
-            "type": "url",
+            "type": "URL",
             "url": file_path
         },
         "analysis_parameters": {
@@ -246,6 +248,7 @@ def poll_task_status(token, task_id, max_wait=3600, interval=10):
     url = f"{DOMAIN}/ingest-request/{task_id}"
     headers = {
         "Authorization": f"Bearer {token}",
+        "X-Nb-Workspace": "ml-api-euw1",
         "Content-Type": "application/json"
     }
     logger.debug(f"URL :------------------------------------------->  {url}")
@@ -351,12 +354,14 @@ if __name__ == "__main__":
     parser.add_argument("-c", "--config-name", required=True, help="Cloud config name")
     parser.add_argument("-sp", "--source-path", help="Source file path")
     parser.add_argument("-cp", "--catalog-path", help="Catalog path")
+    parser.add_argument("-up", "--upload-path", help="Catalog path")
     parser.add_argument("-mp", "--metadata-file", help="Metadata file path")
     parser.add_argument("-j", "--job-guid", help="SDNA Job GUID")
     parser.add_argument("--controller-address", help="Override Link IP:Port")
     parser.add_argument("--parent-id", help="Parent folder ID (unused)")
     parser.add_argument("-sl", "--size-limit", help="File size limit in MB")
     parser.add_argument("-r", "--repo-guid", help="Override repo GUID")
+    parser.add_argument("--resolved-upload-id", action="store_true", help="Treat upload-path as index ID")
     parser.add_argument("--dry-run", action="store_true", help="Dry run")
     parser.add_argument("--log-level", default="info", help="Log level")
 
