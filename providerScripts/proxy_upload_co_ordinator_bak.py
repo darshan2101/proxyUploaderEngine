@@ -31,7 +31,7 @@ PROVIDER_SCRIPTS = {
     "tessact": "tessact_uploader.py",
     "overcasthq": "overcasthq_uploader.py",
     "AWS": "s3_uploader.py",
-    "trint": "trint_uplaoder.py",
+    "trint": "trint_uploader.py",
     "twelvelabs": "twelvelabs_uploader.py",
     "box": "box_uploader.py",
     "cloud": "dropbox_uploader.py",
@@ -40,6 +40,8 @@ PROVIDER_SCRIPTS = {
     "AZURE": "azure_video_indexer_uploader.py",
     "azure_video_indexer": "azure_video_indexer_uploader.py",
     "axel_ai": "axel_ai_uploader.py",
+    "momentslab": "momentslab_uploader.py",
+    "rubicx": "rubicx_uploader.py"
 }
 
 # New upload modes
@@ -435,9 +437,7 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
     if config.get("provider") in PATH_BASED_PROVIDERS:
         cmd += ["--bucket-name", config["bucket"]]
     if config.get("export"):
-        cmd += ["--export-ai-metadata", config["export"]]
-    if config.get("export_prompt") and config.get("provider") == "twelvelabs":
-        cmd += ["--export-prompt", config["export_prompt"]]
+        cmd += ["--export-ai-metadata", str(config["export"])]
     if dry_run:
         cmd.append("--dry-run")
     if upload_path_id:
@@ -763,15 +763,20 @@ def retry_ai_metadata_failures(config):
         for idx, row in enumerate(pending_records):
             asset_id, source_path, catalog_path = row[0], row[1], row[2]
             metadata_path = row[3] if len(row) > 3 and row[3] else None
-
+            upload_path = config["upload_path"]
+            if ":" in upload_path:
+                parent_id, _ = upload_path.split(":", 1)
+                base_id = parent_id.strip("/")
             cmd = [
                 "python3", config["script_path"],
                 "--mode", "send_extracted_metadata",
                 "--asset-id", asset_id,
                 "--config-name", config["cloud_config_name"],
                 "--catalog-path", catalog_path,
-                "--repo-guid", config["repo_guid"]
+                "--repo-guid", config["repo_guid"],
             ]
+            if config.get("provider") == "twelvelabs":
+                cmd += ["--upload-path", base_id]
             if metadata_path and os.path.exists(metadata_path):
                 cmd += ["--metadata-file", metadata_path]
             if config.get("export"):
@@ -1209,7 +1214,7 @@ if __name__ == '__main__':
             bucket_id, bucket_name = request_data["bucket"].split(":", 1)
             request_data["upload_path"] = f"/{bucket_id}:/{bucket_name}"
             
-    export_ai_metadata = request_data.get("export")
+    export_ai_metadata = request_data.get("export_ai_metadata")
     if export_ai_metadata and str(export_ai_metadata).lower() in ("1","true","yes"):
         request_data["export"] = True
 

@@ -115,9 +115,9 @@ def make_request_with_retries(method, url, **kwargs):
     session = get_retry_session()
     last_exception = None
 
-    for attempt in range(3):  # Max 3 attempts
+    for attempt in range(3):
         try:
-            response = session.request(method, url, timeout=(10, 30), **kwargs)
+            response = session.request(method, url, **kwargs)
             if response.status_code < 500:
                 return response
             else:
@@ -127,7 +127,7 @@ def make_request_with_retries(method, url, **kwargs):
             if attempt < 2:  # Only sleep if not last attempt
                 base_delay = [1, 3, 10][attempt]
                 jitter = random.uniform(0, 1)
-                delay = base_delay + jitter * ([1, 1, 5][attempt])  # e.g., 1-2, 3-4, 10-15
+                delay = base_delay + jitter * ([1, 1, 5][attempt])
                 logging.warning(f"Attempt {attempt + 1} failed due to {type(e).__name__}: {e}. "
                                 f"Retrying in {delay:.2f}s...")
                 time.sleep(delay)
@@ -139,7 +139,7 @@ def make_request_with_retries(method, url, **kwargs):
 
     if last_exception:
         raise last_exception
-    return None  # Should not reach here
+    return None
 
 def prepare_metadata_to_upload(repo_guid ,relative_path, file_name, file_size, backlink_url, properties_file = None):    
     metadata = {
@@ -220,7 +220,7 @@ def file_exists_in_index(api_key, index_id, filename, file_size):
                 total_pages = page_info.get("total_page", 1)
                 page += 1
 
-            return None  # No match
+            return None
 
         except Exception as e:
             if attempt == 2:
@@ -287,7 +287,6 @@ def upload_asset(api_key, index_id, file_path):
 
     for attempt in range(3):
         try:
-            # Open file on each retry
             with open(file_path, 'rb') as f:
                 files = {"video_file": f}
                 logging.info(f"Uploading '{file_name}' to Twelve Labs index {index_id}... (Attempt {attempt + 1})")
@@ -317,10 +316,9 @@ def upload_asset(api_key, index_id, file_path):
         except Exception as e:
             if "4xx" in str(e).lower():
                 logging.error(f"Client error during upload: {e}")
-                raise  # Don't retry 4xx
+                raise
             logging.warning(f"Transient error on attempt {attempt + 1}: {e}")
 
-        # Apply jittered backoff
         if attempt < 2:
             base_delay = [1, 3, 10][attempt]
             delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
@@ -329,7 +327,6 @@ def upload_asset(api_key, index_id, file_path):
             logging.critical(f"Upload failed after 3 attempts: {file_name}")
             raise RuntimeError("Upload failed after retries.")
 
-    # Should not reach here
     raise RuntimeError("Upload failed.")
 
 def poll_task_status(api_key, task_id, max_wait=1200, interval=10):
@@ -369,7 +366,7 @@ def poll_task_status(api_key, task_id, max_wait=1200, interval=10):
 
             if status == "ready":
                 logging.info(f"Task {task_id} completed successfully.")
-                return data  # Success — return full task object
+                return data
 
             elif status == "failed":
                 reason = data.get("error", "No error message provided")
@@ -504,7 +501,7 @@ def update_catalog(repo_guid, file_path, index_id, video_id, max_attempts=3):
 
     pass
 
-def get_ai_metadata(api_key, export_prompt, video_id, max_attempts=3):
+def get_ai_metadata(api_key, export_prompt, index_id, video_id, max_attempts=3):
     summary_categories = ["summary","chapter","highlight"]
     endpoints = {
         "gist": {
@@ -530,6 +527,13 @@ def get_ai_metadata(api_key, export_prompt, video_id, max_attempts=3):
                 "video_id": video_id,
                 "stream": False,
                 "prompt": export_prompt
+            }
+        },
+        "embeddings_and_transcript": {
+            "url": f"https://api.twelvelabs.io/v1.3/indexes/{index_id}/videos/{video_id}",
+            "params": {
+                "embedding_option": ["audio", "visual-text"],
+                "transcription": "true"
             }
         }
     }
@@ -559,6 +563,30 @@ def get_ai_metadata(api_key, export_prompt, video_id, max_attempts=3):
                 time.sleep(delay)
             else:
                 logging.error(f"Failed to retrieve {category} metadata after {max_attempts} attempts.")
+
+    # Handle embeddings and transcription
+    if "embeddings_and_transcript" in endpoints:
+        info = endpoints["embeddings_and_transcript"]
+        url = info["url"]
+        params = info["params"]
+        for attempt in range(max_attempts):
+            try:
+                response = make_request_with_retries("GET", url, headers=headers, params=params)
+                if response and response.status_code == 200:
+                    data = response.json()
+                    metadata["embeddings_and_transcript"] = data
+                    logging.info("Retrieved embeddings and transcription metadata successfully.")
+                    break
+                else:
+                    logging.warning(f"Embeddings/transcript request failed: {response.status_code if response else 'No response'}")
+            except Exception as e:
+                logging.warning(f"Error retrieving embeddings/transcript on attempt {attempt+1}: {e}")
+            if attempt < max_attempts - 1:
+                base_delay = [1, 3, 10][attempt]
+                delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+                time.sleep(delay)
+            else:
+                logging.error("Failed to retrieve embeddings and transcription after max attempts.")
 
     # Handle summary: call for each summary category
     summary_url = endpoints["summary"]["url"]
@@ -632,7 +660,6 @@ if __name__ == '__main__':
     parser.add_argument("--resolved-upload-id", action="store_true", help="Treat upload-path as index ID")
     parser.add_argument("--controller-address", help="Controller IP:Port")
     parser.add_argument("--export-ai-metadata", help="Export AI metadata")
-    parser.add_argument("--export-prompt",help= "Prompt for open ended analysis")
 
     args = parser.parse_args()
 
@@ -661,19 +688,18 @@ if __name__ == '__main__':
         sys.exit(1)
     if args.export_ai_metadata:
         cloud_config_data["export_ai_metadata"] = "true" if args.export_ai_metadata.lower() == "true" else "false"
+    export_prompt = args.export_ai_metadata
+    if not export_prompt:
+        export_prompt = "Provide a detailed summary, chapters, highlights, topics, hashtags, embeddings, and transcription of the video."
 
     if args.mode == "send_extracted_metadata":
         if not (args.asset_id and args.repo_guid and args.catalog_path):
             logging.error("Asset ID, Repo GUID, and Catalog path required.")
             sys.exit(1)
-        
-        if not args.export_prompt:
-            logging.error("Prompt is required for open ended analysis")
-            sys.exit(1)
-
-        get_ai_metadata = get_ai_metadata(api_key, args.export_prompt, args.asset_id)
-        if get_ai_metadata:
-            if not send_extracted_metadata(args.repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], get_ai_metadata):
+        index_id = args.upload_path if args.resolved_upload_id else cloud_config_data.get('index_id')
+        ai_metadata = get_ai_metadata(api_key, export_prompt, index_id, args.asset_id)
+        if ai_metadata:
+            if not send_extracted_metadata(args.repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], ai_metadata):
                 logger.error("Failed to send extracted metadata.")
                 sys.exit(1)
             else:
@@ -800,7 +826,7 @@ if __name__ == '__main__':
         # Step 4: Send extracted AI metadata to local controller if enabled and task is ready
         try:
             if cloud_config_data.get('export_ai_metadata') == "true" and poll_result.get('status') == "ready":
-                ai_metadata = get_ai_metadata(api_key, args.export_prompt, final_video_id)
+                ai_metadata = get_ai_metadata(api_key, export_prompt, index_id, final_video_id)
                 if ai_metadata:
                     if not send_extracted_metadata(args.repo_guid, catalog_path.replace("\\", "/").split("/1/", 1)[-1], ai_metadata):
                         logger.error("Failed to send extracted AI metadata.")

@@ -14,20 +14,11 @@ import uuid
 from requests.adapters import HTTPAdapter
 from requests.exceptions import RequestException, SSLError, ConnectionError, Timeout
 import xml.etree.ElementTree as ET
-from action_functions import flatten_dict
-
-# --- IMPORTS FOR S3 ---
-try:
-    import boto3
-    from botocore.exceptions import ClientError, NoCredentialsError
-except ImportError:
-    logging.critical("boto3 is required for S3 upload. Install it via 'pip install boto3'.")
-    sys.exit(1)
 
 # Constants
 VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet"]
 CHUNK_SIZE = 20 * 1024 * 1024 
-LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
+LINUX_CONFIG_PATH = "DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
 CONFLICT_RESOLUTION_MODES = ["skip", "overwrite"]
@@ -36,7 +27,7 @@ DOMAIN = "https://api.momentslab.com"
 UPLOAD_ENDPOINTS = ["/ingest-request", "/analysis-request"]
 
 # Detect platform
-IS_LINUX = os.path.isdir("/opt/sdna/bin")
+IS_LINUX = True
 DNA_CLIENT_SERVICES = LINUX_CONFIG_PATH if IS_LINUX else MAC_CONFIG_PATH
 
 # Initialize logger
@@ -155,57 +146,6 @@ def make_request_with_retries(method, url, timeout=(10, 30), **kwargs):
         raise last_exception
     return None
 
-def upload_to_s3_and_get_presigned_url(
-    file_path,
-    bucket,
-    region,
-    aws_access_key_id,
-    aws_secret_access_key,
-    expiration=3600
-):
-    s3_client = boto3.client(
-        's3',
-        region_name=region,
-        aws_access_key_id=aws_access_key_id,
-        aws_secret_access_key=aws_secret_access_key
-    )
-
-    file_name = os.path.basename(file_path)
-    s3_key = f"uploads/{uuid.uuid4().hex}_{file_name}"
-
-    try:
-        logging.info(f"Uploading {file_path} to s3://{bucket}/{s3_key}")
-        s3_client.upload_file(file_path, bucket, s3_key)
-        logging.info("S3 upload successful.")
-
-        presigned_url = s3_client.generate_presigned_url(
-            'get_object',
-            Params={'Bucket': bucket, 'Key': s3_key},
-            ExpiresIn=expiration
-        )
-        return presigned_url, bucket, s3_key  # <-- return key for cleanup
-
-    except (ClientError, NoCredentialsError) as e:
-        logging.error(f"S3 upload or URL generation failed: {e}")
-        raise
-    except Exception as e:
-        logging.error(f"Unexpected error during S3 upload: {e}")
-        raise
-
-def delete_s3_object(bucket, key, aws_access_key_id, aws_secret_access_key, region):
-    """Delete an S3 object after successful processing."""
-    try:
-        s3_client = boto3.client(
-            's3',
-            region_name=region,
-            aws_access_key_id=aws_access_key_id,
-            aws_secret_access_key=aws_secret_access_key
-        )
-        s3_client.delete_object(Bucket=bucket, Key=key)
-        logging.info(f"Cleaned up S3 object: s3://{bucket}/{key}")
-    except Exception as e:
-        logging.warning(f"Failed to delete S3 object s3://{bucket}/{key}: {e}")
-
 def prepare_metadata_to_upload(repo_guid ,relative_path, file_name, file_size, backlink_url, properties_file = None):    
     metadata = {
         "relativePath": relative_path if relative_path.startswith("/") else "/" + relative_path,
@@ -253,102 +193,121 @@ def prepare_metadata_to_upload(repo_guid ,relative_path, file_name, file_size, b
     
     return metadata
 
-def upload_file(source_filename, presigned_url, type, token, metadata):
+def upload_file(file_path, type, token, metadata):
     headers = {
         "Authorization": f"Bearer {token}",
+        "X-Nb-Workspace": "ml-api-euw1",
         "X-Nb-Workspace": "ml-api-euw1"
     }
-    logging.info(f"Uploading via presigned URL: {presigned_url}")
-
-    original_file_name = metadata.get("fileName", "unknown")
-    name_part, ext_part = os.path.splitext(source_filename)
+    logging.info(f"Uploading file: {file_path}  with headers: {headers}")
+    original_file_name = os.path.basename(file_path)
+    name_part, ext_part = os.path.splitext(original_file_name)
     sanitized_name_part = name_part.strip().replace(" ", "_")
     file_name = sanitized_name_part + ext_part
 
-    url = f"{DOMAIN}/analysis-request"
+    if file_name != original_file_name:
+        logging.info(f"Filename sanitized from '{original_file_name}' to '{file_name}' (spaces replaced with underscores)")
+    url = f"{DOMAIN}/ingest-request"
     payload = {
         "type": type,
-        "external_id": str(uuid.uuid4()),
-        "filename": file_name,
-        "title": original_file_name,
+        "external_id": uuid.uuid4(),
+        "filename": file_name,  # spaces replaced with underscores
+        "title": original_file_name,  # keep original with spaces
         "source": {
             "type": "URL",
-            "url": presigned_url
+            "url": file_path
         },
         "analysis_parameters": {
-            "tasks": ["mxt"]
-        }
+            "tasks": [ "mxt"]
+        },
+        "metadata": metadata
     }
     logging.debug(f"Upload payload: {payload}")
-
     for attempt in range(3):
         try:
             response = make_request_with_retries("POST", url, json=payload, headers=headers, timeout=None)
-            if response and response.status_code in (200, 201):
-                logging.info("Video upload request to MomentsLab successful.")
-                return response.json()
+            if response and response.status_code == 200:
+                logging.info("Video uploaded successfully.")
+                response_data = response.json()
+                logging.debug(f"Upload response data: {response_data}")
+                return response_data
             else:
-                logging.error(f"MomentsLab upload failed: {response.status_code} {response.text if response else 'No response'}")
+                logging.error(f"Failed to upload video: {response.status_code} {response.text}")
         except Exception as e:
             if attempt == 2:
-                logging.critical(f"Failed to upload to MomentsLab after 3 attempts: {e}")
+                logging.critical(f"Failed to get asset ID after 3 attempts: {e}")
                 return None
-            delay = [1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt])
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
             time.sleep(delay)
     return None
 
 def poll_task_status(token, task_id, max_wait=3600, interval=10):
-    url = f"{DOMAIN.strip()}/analysis-request/{task_id}"
+    # https://api.momentslab.io/analysis-request/{analysis_request_id}
+    # https://api.momentslab.io/ingest-request/{job_request_id}
+    url = f"{DOMAIN}/ingest-request/{task_id}"
     headers = {
         "Authorization": f"Bearer {token}",
-        "X-Nb-Workspace": "ml-api-euw1"
+        "X-Nb-Workspace": "ml-api-euw1",
+        "Content-Type": "application/json"
     }
-    logging.info(f"Polling task {task_id}. Max wait: {max_wait}s")
-    start_time = time.time()
-    attempt = 0
+    logger.debug(f"URL :------------------------------------------->  {url}")
+    logging.info(f"Polling task {task_id} status. Max wait: {max_wait}s")
 
-    while time.time() - start_time < max_wait:
+    start_time = time.time()
+    attempt_counter = 0
+
+    while (time.time() - start_time) < max_wait:
         try:
             response = make_request_with_retries("GET", url, headers=headers)
             if not response:
-                raise ConnectionError("No response")
+                raise ConnectionError("No response from server")
 
-            # Handle non-200
-            if response.status_code != 200:
-                if attempt < 2:
-                    delay = [1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt])
-                    time.sleep(delay)
-                    attempt += 1
-                    continue
-                logging.error(f"Polling failed with HTTP {response.status_code}")
+            if response.status_code == 404:
+                logging.error(f"Task {task_id} not found (404)")
                 return False
+            elif response.status_code != 200:
+                logging.warning(f"Status {response.status_code}: {response.text}")
+                if attempt_counter < 2:
+                    attempt_counter += 1
+                    delay = [1, 3, 10][attempt_counter-1] + random.uniform(0, [1, 1, 5][attempt_counter-1])
+                    time.sleep(delay)
+                    continue
+                else:
+                    logging.critical(f"Failed to fetch task status after retries: {response.text}")
+                    return False
 
-            data = response.json()
-            media_id = data.get("media_id")
-            error_msg = data.get("errorMessage")
+            status_dict = response.json()["response"]["status"]
+            all_processed = True
+            for key, obj in status_dict.items():
+                if obj.get("status") == "failed":
+                    reason = obj.get("error", "No error message provided")
+                    logging.error(f"Task {task_id} failed for '{key}': {reason}")
+                    return False
+                if obj.get("status") != "processed":
+                    all_processed = False
 
-            if media_id is not None:
-                logging.info(f"Media ready. ID: {media_id}")
-                return data
+            if all_processed:
+                logging.info(f"Task {task_id} completed successfully. All objects processed.")
+                return status_dict  # Success — return status dict
 
-            if error_msg is not None:
-                logging.error(f"Job failed: {error_msg}")
-                return data
-
-            attempt = 0
-            time.sleep(interval)
+            # Reset retry counter on successful poll
+            attempt_counter = 0
 
         except Exception as e:
-            logging.debug(f"Exception: {e}")
-            if attempt < 2:
-                delay = [1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt])
+            logging.debug(f"Exception during polling: {e}")
+            if attempt_counter < 2:
+                attempt_counter += 1
+                delay = [1, 3, 10][attempt_counter-1] + random.uniform(0, [1, 1, 5][attempt_counter-1])
                 time.sleep(delay)
-                attempt += 1
-            else:
-                logging.error(f"Polling failed after retries: {e}")
-                return False
+                continue
+            logging.warning(f"Polling transient error after retries: {e}")
 
-    logging.critical(f"Polling timed out after {max_wait}s")
+        # Wait before next poll
+        time.sleep(interval)
+
+    # Timeout
+    logging.critical(f"Polling timed out after {max_wait}s. Task {task_id} did not reach all 'processed'.")
     return False
 
 def update_catalog(repo_guid, file_path, media_id, max_attempts=3):
@@ -386,73 +345,25 @@ def update_catalog(repo_guid, file_path, media_id, max_attempts=3):
     logging.error("Catalog update failed after retries.")
     pass
 
-def get_ai_metadata(token, media_id):
-    url = f"{DOMAIN.strip()}/media/{media_id}/analysis"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "X-Nb-Workspace": "ml-api-euw1"
-    }
-    for attempt in range(3):
-        try:
-            response = make_request_with_retries("GET", url, headers=headers)
-            if response and response.status_code == 200:
-                data = response.json()
-                logging.info(f"AI metadata retrieved for media ID {media_id}")
-                return data
-            else:
-                logging.error(f"Failed to retrieve AI metadata: {response.status_code if response else 'No response'} {response.text if response else ''}")
-        except Exception as e:
-            logging.error(f"Error retrieving AI metadata: {e}")
-            if attempt == 2:
-                logging.critical(f"Failed to get access token after 3 attempts: {e}")
-                return None
-            base_delay = [1, 3, 10][attempt]
-            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
-            time.sleep(delay)
-    return {}
-
-def send_extracted_metadata(config, repo_guid, file_path, metadata, max_attempts=3):
-    url = "http://127.0.0.1:5080/catalogs/extendedMetadata"
-    node_api_key = get_node_api_key()
-    headers = {"apikey": node_api_key, "Content-Type": "application/json"}
-    payload = {
-        "repoGuid": repo_guid,
-        "providerName": config.get("provider", "tessact"),
-        "extendedMetadata": [{
-            "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
-            "fileName": os.path.basename(file_path),
-            "metadata": flatten_dict(metadata)
-        }]
-    }
-    for _ in range(max_attempts):
-        try:
-            r = make_request_with_retries("POST", url, headers=headers, json=payload)
-            if r and r.status_code in (200, 201):
-                return True
-        except Exception as e:
-            logging.warning(f"Metadata send error: {e}")
-    return False
 
 if __name__ == "__main__":
-    time.sleep(random.uniform(0.0, 1.5))
+    time.sleep(random.uniform(0.0, 1.5))  # Avoid herd
 
-    parser = argparse.ArgumentParser(description="Upload video to Momentslab via S3")
-    parser.add_argument("-m", "--mode", required=True, help="Mode: proxy, original, get_base_target, etc.")
-    parser.add_argument("-c", "--config-name", required=True, help="Name of cloud configuration")
-    parser.add_argument("-j", "--job-guid", help="Job GUID of SDNA job")
-    parser.add_argument("-id", "--asset-id", help="Asset ID for metadata operations")
-    parser.add_argument("--parent-id", help="Optional parent folder ID for path resolution")
-    parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
-    parser.add_argument("-sp", "--source-path", help="Source file path for upload")
-    parser.add_argument("-mp", "--metadata-file", help="Path to metadata file (JSON/CSV/XML)")
-    parser.add_argument("-up", "--upload-path", help="Target path or ID in MomentsLab")
-    parser.add_argument("-sl", "--size-limit", help="File size limit in MB for original upload")
-    parser.add_argument("-r", "--repo-guid", help="Repository GUID for catalog update")
-    parser.add_argument("--dry-run", action="store_true", help="Perform dry run without uploading")
-    parser.add_argument("--log-level", default="debug", help="Logging level (debug, info, warning, error)")
-    parser.add_argument("--resolved-upload-id", action="store_true", help="Treat upload-path as resolved folder ID")
-    parser.add_argument("--controller-address", help="Controller IP:Port override")
-    parser.add_argument("--export-ai-metadata", action="store_true", help="Export AI metadata")
+    parser = argparse.ArgumentParser(description="Upload video to Momentslab")
+    parser.add_argument("-m", "--mode", required=True, help="Operation mode")
+    parser.add_argument("-c", "--config-name", required=True, help="Cloud config name")
+    parser.add_argument("-sp", "--source-path", help="Source file path")
+    parser.add_argument("-cp", "--catalog-path", help="Catalog path")
+    parser.add_argument("-up", "--upload-path", help="Catalog path")
+    parser.add_argument("-mp", "--metadata-file", help="Metadata file path")
+    parser.add_argument("-j", "--job-guid", help="SDNA Job GUID")
+    parser.add_argument("--controller-address", help="Override Link IP:Port")
+    parser.add_argument("--parent-id", help="Parent folder ID (unused)")
+    parser.add_argument("-sl", "--size-limit", help="File size limit in MB")
+    parser.add_argument("-r", "--repo-guid", help="Override repo GUID")
+    parser.add_argument("--resolved-upload-id", action="store_true", help="Treat upload-path as index ID")
+    parser.add_argument("--dry-run", action="store_true", help="Dry run")
+    parser.add_argument("--log-level", default="info", help="Log level")
 
     args = parser.parse_args()
     setup_logging(args.log_level)
@@ -477,44 +388,6 @@ if __name__ == "__main__":
 
     section = cloud_config[args.config_name]
     
-    token = section.get("token", "").strip()
-    if not token:
-        logger.critical("Cannot proceed without access token.")
-        sys.exit(1)
-        
-    section = cloud_config[args.config_name]
-    if args.export_ai_metadata:
-        section["export_ai_metadata"] = "true" if args.export_ai_metadata.lower() == "true" else "false"
-    
-    # Read and validate S3 configuration from config section
-    s3_bucket = section.get("s3_bucket", "").strip()
-    s3_region = section.get("s3_region", "us-east-1").strip()
-    aws_access_key_id = section.get("aws_access_key_id", "").strip()
-    aws_secret_access_key = section.get("aws_secret_access_key", "").strip()
-
-    if not all([s3_bucket, aws_access_key_id, aws_secret_access_key]):
-        logger.critical("Missing required S3 configuration in cloud_targets.conf section: "
-                        "s3_bucket, aws_access_key_id, aws_secret_access_key")
-        sys.exit(1)
-    
-    if args.mode == "send_extracted_metadata":
-        if not (args.asset_id and args.repo_guid and args.catalog_path):
-            logging.error("Asset ID, Repo GUID, and Catalog path required.")
-            sys.exit(1)
-
-        ai_metadata = get_ai_metadata(token, args.asset_id)
-        catalog_path_clean = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
-        if ai_metadata:
-            if send_extracted_metadata(section, args.repo_guid, catalog_path_clean, ai_metadata):
-                logger.info("Extracted metadata sent successfully.")
-                sys.exit(0)
-            else:
-                logger.error("Failed to send extracted metadata.")
-                sys.exit(7)
-        else:
-            print(f"Metadata extraction failed for asset: {args.asset_id}")
-            sys.exit(7)
-    
     matched_file = args.source_path
     if not matched_file or not os.path.exists(matched_file):
         logger.error(f"Source file not found: {matched_file}")
@@ -530,6 +403,7 @@ if __name__ == "__main__":
                 sys.exit(4)
         except ValueError:
             logging.warning(f"Invalid size limit: {args.size_limit}")
+
 
     # Backlink URL
     catalog_path = args.catalog_path or matched_file
@@ -572,76 +446,49 @@ if __name__ == "__main__":
         metadata_obj = {}
 
     try:
-        # Determine upload type
+        # Get access token
+        token = section.get("access_token", "").strip()
+        if not token:
+            logger.critical("Cannot proceed without access token.")
+            sys.exit(1)
+
+        # Determine upload endpoint based on MIME type
         mime_type = magic.from_file(args.source_path, mime=True)
         if not mime_type:
             logging.critical(f"Could not detect MIME type for '{extract_file_name(args.source_path)}'")
-            sys.exit(1)
         if "video" in mime_type:
             upload_type = "video"
         elif "image" in mime_type:
             upload_type = "image"
-        else:
-            logging.critical(f"Unsupported MIME type for upload: {mime_type}")
-            sys.exit(1)
 
-        # --- Upload to S3 and get presigned URL ---
-        presigned_url, s3_bucket_used, s3_key_used = upload_to_s3_and_get_presigned_url(
-            file_path=matched_file,
-            bucket=s3_bucket,
-            region=s3_region,
-            aws_access_key_id=aws_access_key_id,
-            aws_secret_access_key=aws_secret_access_key,
-            expiration=3600
-        )
+        # convert source path to URL format
+        file_path = matched_file
+        proxy_prefix = "/sdna_fs/ADMINISTRATORDROPBOX/primary/proxy-link/"
+        if file_path.startswith(proxy_prefix):
+            file_path = file_path[len(proxy_prefix):]
 
-        # Upload to MomentsLab using presigned URL
-        response = upload_file(extract_file_name(args.source_path), presigned_url, upload_type, token, metadata_obj)
-        logging.debug(f"Upload response: {response}")
+        file_url = f"http://{client_ip}/proxy-link{file_path if file_path.startswith('/') else '/' + file_path}"
+
+        # Upload file and get file_id from response
+        response = upload_file(file_url, upload_type, token, metadata_obj)
         
-        if not response:
-            logger.error("Upload to MomentsLab failed.")
-            sys.exit(1)
-
-        task_id = response.get("analysis_request_id")
-        if not task_id:
-            logging.error("No analysis_request_id in response.")
-            sys.exit(1)
-
-        # Poll for completion
-        poll_result = poll_task_status(token, task_id, max_wait=3600)
-        if not poll_result:
-            logging.error("Task polling failed or timed out.")
+        if response:
+            task_id = response.get("analysis_request_id")  # may not exist yet
+            if not task_id:
+                logging.warning("task_id not in upload response. Will extract after ready.")
+        else:
+            logger.error(f"Upload failed: {response.status_code} {response.text if response else 'No response'}")
             sys.exit(1)
             
-        media_id = poll_result.get("media_id")
-        if media_id:
-            delete_s3_object(
-                bucket=s3_bucket_used,
-                key=s3_key_used,
-                aws_access_key_id=aws_access_key_id,
-                aws_secret_access_key=aws_secret_access_key,
-                region=s3_region
-            )
-            # Update local catalog
-            clean_catalog_path = catalog_path.replace("\\", "/").split("/1/", 1)[-1]
-            catalog_success = update_catalog(args.repo_guid, clean_catalog_path, media_id)
-            if not catalog_success:
-                logger.error("Catalog update failed.")
-        
-        if section.get("export_ai_metadata") == "true" and media_id:
-            ai_metadata = get_ai_metadata(token, media_id)
+        # Step 3: Poll for indexing completion
+        poll_result = poll_task_status(task_id, token, max_wait=300)
+        if not poll_result:
+            logging.error("Task polling failed or timed out.")
 
-            if ai_metadata:
-                if send_extracted_metadata(section, args.repo_guid, clean_catalog_path, ai_metadata):
-                    logger.info("Extracted metadata sent successfully.")
-                else:
-                    logger.error("Failed to send extracted metadata.")
-                    print(f"Metadata extraction failed for asset: {media_id}")
-                    sys.exit(7)
-            else:
-                print(f"Metadata extraction failed for asset: {media_id}")
-                sys.exit(7)
+        update_catalog(args.repo_guid, catalog_path.replace("\\", "/").split("/1/", 1)[-1], task_id) 
+        logging.info("Operation completed successfully.")
+        sys.exit(0)
+            
     except Exception as e:
         logger.critical(f"Operation failed: {e}")
         print(f"Error: {str(e)}")
