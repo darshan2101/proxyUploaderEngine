@@ -21,6 +21,7 @@ LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
 RUBICX_BASE_URL = "https://api.rubicx.ai"
+
 # Detect platform
 IS_LINUX = os.path.isdir("/opt/sdna/bin")
 DNA_CLIENT_SERVICES = LINUX_CONFIG_PATH if IS_LINUX else MAC_CONFIG_PATH
@@ -186,13 +187,11 @@ def upload_asset(api_key, file_path):
                     files=files
                 )
 
-            # Handle 4xx: client errors → no retry
             if 400 <= response.status_code < 500:
                 error_msg = f"Client error: {response.status_code} {response.text}"
                 logging.error(error_msg)
                 raise RuntimeError(error_msg)
 
-            # Success
             if response.status_code in (200, 201):
                 try:
                     result = response.json()
@@ -207,7 +206,6 @@ def upload_asset(api_key, file_path):
                     logging.error(f"Invalid JSON response: {response.text}")
                     raise RuntimeError("Invalid response from Rubicx")
 
-            # Server error (5xx) → retry
             logging.warning(f"Server error {response.status_code}: {response.text}. Retrying...")
 
         except (ConnectionError, Timeout, requests.exceptions.ChunkedEncodingError) as e:
@@ -218,7 +216,6 @@ def upload_asset(api_key, file_path):
                 raise
             logging.warning(f"Transient error on attempt {attempt + 1}: {e}")
 
-        # Jittered backoff before retry
         if attempt < 2:
             base_delay = [1, 3, 10][attempt]
             delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
@@ -227,37 +224,77 @@ def upload_asset(api_key, file_path):
             logging.critical(f"Upload failed after 3 attempts: {file_name}")
             raise RuntimeError("Upload failed after retries.")
 
-    raise RuntimeError("Upload failed.") 
+    raise RuntimeError("Upload failed.")
 
 def start_analysis(api_key, video_id):
     url = f"{RUBICX_BASE_URL}/api/videos/{video_id}/analyze"
     headers = {"X-API-Key": api_key}
-    params = {"api_key": api_key} 
+    params = {"api_key": api_key}
     response = make_request_with_retries("POST", url, headers=headers, params=params)
     if not (response and response.status_code == 200):
         raise RuntimeError(f"Analysis start failed: {response.status_code if response else 'No response'}")
 
-def poll_analysis_progress(api_key, video_id, max_wait=1800, interval=5):
-    progress_url = f"{RUBICX_BASE_URL}/api/videos/{video_id}/analysis/progress"
-    batch_status_url = f"{RUBICX_BASE_URL}/api/videos/{video_id}/batch-status"
+def poll_analysis_progress(api_key, video_id, max_wait=300, interval=5):
     headers = {"X-API-Key": api_key}
-    params = {"api_key": api_key} 
+    params = {"api_key": api_key}
     start_time = time.time()
-    while (time.time() - start_time) < max_wait:
+    deadline = start_time + max_wait
+
+    # === Step: Wait for analysis progress to complete ===
+    progress_url = f"{RUBICX_BASE_URL}/api/videos/{video_id}/analysis/progress"
+    logging.info("Step 3: Polling analysis progress...")
+    while time.time() < deadline:
         try:
-            resp1 = make_request_with_retries("GET", progress_url, headers=headers, params=params)
-            if resp1 and resp1.status_code == 200:
-                status = resp1.json().get("status")
+            resp = make_request_with_retries("GET", progress_url, headers=headers, params=params)
+            if resp and resp.status_code == 200:
+                data = resp.json()
+                status = data.get("status")
+                progress_pct = data.get("progress", 0)
+                logging.info(f"Analysis progress: {status} ({progress_pct}%)")
                 if status == "completed":
-                    return True
-            resp2 = make_request_with_retries("GET", batch_status_url, headers=headers, params=params)
-            if resp2 and resp2.status_code == 200:
-                if resp2.json().get("status") == "completed":
+                    logging.info("Step 3: Analysis progress completed.")
+                    break
+        except Exception as e:
+            logging.debug(f"Progress polling error: {e}")
+        time.sleep(interval)
+    else:
+        logging.warning("Step 3: Analysis progress did not complete within 5 minutes.")
+        raise TimeoutError("Analysis progress timeout (5 min)")
+
+    # === Step: Wait for batch status to fully complete ===
+    batch_status_url = f"{RUBICX_BASE_URL}/api/videos/{video_id}/batch-status"
+    logging.info("Step 4: Polling batch status...")
+    while time.time() < deadline:
+        try:
+            resp = make_request_with_retries("GET", batch_status_url, headers=headers, params=params)
+            if resp and resp.status_code == 200:
+                batch_data = resp.json()
+                progress_info = batch_data.get("progress_info", {})
+                
+                total = progress_info.get("total_batches", 0)
+                completed = progress_info.get("completed_batches", 0)
+                pct = progress_info.get("completion_percentage", 0.0)
+                overall_status = progress_info.get("overall_status", "")
+                
+                logging.info(
+                    f"Batch status: {completed}/{total} batches, "
+                    f"{pct}% complete, overall: '{overall_status}'"
+                )
+                
+                if (
+                    total > 0 and
+                    completed == total and
+                    abs(pct - 100.0) < 0.01 and
+                    overall_status == "completed"
+                ):
+                    logging.info("Step 4: Batch processing fully completed.")
                     return True
         except Exception as e:
-            logging.debug(f"Polling error: {e}")
+            logging.debug(f"Batch status polling error: {e}")
         time.sleep(interval)
-    raise TimeoutError("Analysis polling timed out")
+    else:
+        logging.warning("Step 4: Batch status did not reach full completion within 5 minutes.")
+        raise TimeoutError("Batch status timeout (5 min)")
 
 def fetch_metadata(api_key, video_id):
     url = f"{RUBICX_BASE_URL}/api/videos/{video_id}/metadata"
@@ -271,10 +308,28 @@ def fetch_metadata(api_key, video_id):
 def fetch_batch_results(api_key, video_id):
     url = f"{RUBICX_BASE_URL}/api/videos/{video_id}/batch-results"
     headers = {"X-API-Key": api_key}
-    params = {"api_key": api_key} 
-    response = make_request_with_retries("GET", url, headers=headers, params=params)
+    logging.debug(f"headers: {headers}")
+    data = {"api_key": api_key}  # Required by current Rubicx backend
+    logging.debug(f"data: {data}")
+    response = make_request_with_retries("POST", url, headers=headers, data=data)
+    response_data = response.json() if response else None
+    if response and response.status_code == 200:
+        if response_data.get("success") == True and response_data.get("status") == "completed":
+            return True
+        else:
+            logging.warning("Batch results indicate failure or incomplete status.")
+            return False
+    logging.warning("Batch results not available or failed.")
+    return False
+
+def fetch_metadata(api_key, video_id):
+    url = f"{RUBICX_BASE_URL}/api/videos/{video_id}/metadata"
+    payload = {"api_key": api_key}
+    headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
+    response = make_request_with_retries("POST", url, json=payload, headers=headers)
     if response and response.status_code == 200:
         return response.json()
+    logging.error(f"Metadata POST failed: {response.status_code if response else 'No response'}")
     return {}
 
 # --- Main ---
@@ -328,14 +383,14 @@ if __name__ == '__main__':
         if not (args.asset_id and args.repo_guid and args.catalog_path):
             logging.error("Asset ID, Repo GUID, and Catalog path required for send_extracted_metadata mode.")
             sys.exit(1)
+        batch_completed = fetch_batch_results(api_key, args.asset_id)
+        if not batch_completed:
+            logging.error("Batch processing not completed. Cannot fetch metadata.")
+            print(f"Metadata extraction failed for asset: {args.asset_id}")
+            sys.exit(7)
         metadata = fetch_metadata(api_key, args.asset_id)
-        batch_results = fetch_batch_results(api_key, args.asset_id)
-        full_metadata = {
-            "rubicx_metadata": metadata,
-            "rubicx_batch_results": batch_results
-        }
         clean_path = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
-        if send_extracted_metadata(args.repo_guid, clean_path, full_metadata):
+        if send_extracted_metadata(args.repo_guid, clean_path, metadata):
             logging.info("Extracted metadata sent successfully.")
             sys.exit(0)
         else:
@@ -382,24 +437,28 @@ if __name__ == '__main__':
         logging.info("Analysis started.")
 
         # Poll until complete
-        poll_analysis_progress(api_key, video_id)
-        logging.info("Analysis completed.")
+        try:
+            poll_analysis_progress(api_key, video_id, max_wait=300)
+        except TimeoutError as e:
+            logging.error(f"Analysis or batch timeout: {e}. Skipping metadata.")
+            sys.exit(7)
 
-        # Fetch metadata
-        metadata = fetch_metadata(api_key, video_id)
+        # Fetch metadata only if polling succeeded
         batch_results = fetch_batch_results(api_key, video_id)
-        full_metadata = {
-            "rubicx_metadata": metadata,
-            "rubicx_batch_results": batch_results
-        }
+        if not batch_results:
+            logging.error("Batch results indicate failure or incomplete status. Skipping metadata.")
+            print(f"Metadata extraction failed for asset: {video_id}")
+            sys.exit(7)
+        metadata = fetch_metadata(api_key, video_id)
 
         # Send to local controller
-        if send_extracted_metadata(args.repo_guid, clean_catalog_path, flatten_dict(full_metadata)):
+        if send_extracted_metadata(args.repo_guid, clean_catalog_path, metadata):
             logging.info("Rubicx metadata sent successfully.")
             sys.exit(0)
         else:
             logging.error("Failed to send metadata to controller.")
-            sys.exit(1)
+            print(f"Metadata extraction failed for asset: {video_id}")
+            sys.exit(7)
 
     except Exception as e:
         logging.critical(f"Rubicx processing failed: {e}")

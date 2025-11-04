@@ -82,6 +82,19 @@ def get_cloud_config_path():
     logging.info(f"Using cloud config path: {path}")
     return path
 
+def load_advanced_ai_settings(config_path):
+    if not config_path or not os.path.exists(config_path):
+        logging.warning("Advanced AI settings file not provided or not found. Using defaults.")
+        return None
+    try:
+        with open(config_path, 'r') as f:
+            settings = json.load(f)
+        logging.debug(f"Loaded advanced AI settings: {settings}")
+        return settings
+    except Exception as e:
+        logging.error(f"Failed to parse advanced AI settings file {config_path}: {e}")
+        return None
+
 def get_node_api_key():
     api_key = ""
     try:
@@ -493,128 +506,134 @@ def update_catalog(repo_guid, file_path, index_id, video_id, max_attempts=3):
 
         except Exception as e:
             logging.exception(f"[Attempt {attempt+1}] Unexpected exception in update_catalog: {e}")
-        # Default retry delay for non-404 or unhandled cases
-        if attempt < max_attempts - 1:
-            fallback_delay = 5 + attempt * 2
-            logging.debug(f"Sleeping {fallback_delay}s before next attempt")
-            time.sleep(fallback_delay)
-
+            if attempt < max_attempts - 1:
+                fallback_delay = 5 + attempt * 2
+                logging.debug(f"Sleeping {fallback_delay}s before next attempt")
+                time.sleep(fallback_delay)
     pass
 
-def get_ai_metadata(api_key, export_prompt, index_id, video_id, max_attempts=3):
-    summary_categories = ["summary","chapter","highlight"]
-    endpoints = {
-        "gist": {
-            "url": "https://api.twelvelabs.io/v1.3/gist",
-            "payload": {
-                "video_id": video_id,
-                "types": [
-                    "title",
-                    "topic",
-                    "hashtag"
-                ]
-            }
-        },
-        "summary": {
-            "url": "https://api.twelvelabs.io/v1.3/summarize",
-            "payload": {
-                "video_id": video_id
-            }
-        },
-        "open": {
-            "url": "https://api.twelvelabs.io/v1.3/analyze",
-            "payload": {
-                "video_id": video_id,
-                "stream": False,
-                "prompt": export_prompt
-            }
-        },
-        "embeddings_and_transcript": {
-            "url": f"https://api.twelvelabs.io/v1.3/indexes/{index_id}/videos/{video_id}",
-            "params": {
-                "embedding_option": ["audio", "visual-text"],
-                "transcription": "true"
-            }
-        }
-    }
+def get_ai_metadata(api_key, index_id, video_id, advanced_settings=None, max_attempts=3):
+    if not advanced_settings or not isinstance(advanced_settings, dict):
+        logging.warning("No valid advanced_settings provided. Skipping all AI metadata extraction.")
+        return {}
+
     headers = {"x-api-key": api_key}
+    logging.debug(f"Advanced AI settings: {advanced_settings}")
     metadata = {}
 
-    # Handle gist and open as before
-    for category in ["gist", "open"]:
-        info = endpoints[category]
-        url = info["url"]
-        payload = info["payload"]
-        for attempt in range(max_attempts):
-            try:
-                response = make_request_with_retries("POST", url, headers=headers, json=payload)
-                if response and response.status_code == 200:
-                    data = response.json()
-                    metadata[category] = data
-                    logging.info(f"Retrieved {category} metadata successfully.")
-                    break
+    # === Gist ===
+    if "gist" in advanced_settings and isinstance(advanced_settings["gist"], dict):
+        gist_config = advanced_settings["gist"]
+        allowed_types = {"title", "topic", "hashtag"}
+        if "types" in gist_config and isinstance(gist_config["types"], list):
+            filtered_types = [t for t in gist_config["types"] if t in allowed_types]
+            if filtered_types:
+                payload = {"video_id": video_id, "types": filtered_types}
+                url = "https://api.twelvelabs.io/v1.3/gist"
+                for attempt in range(max_attempts):
+                    try:
+                        response = make_request_with_retries("POST", url, headers=headers, json=payload)
+                        if response and response.status_code == 200:
+                            metadata["gist"] = response.json()
+                            logging.info("Retrieved gist metadata successfully.")
+                            break
+                    except Exception as e:
+                        logging.warning(f"Gist attempt {attempt+1} failed: {e}")
+                    if attempt < max_attempts - 1:
+                        time.sleep([1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt]))
                 else:
-                    logging.warning(f"{category} metadata request failed: {response.status_code if response else 'No response'}")
-            except Exception as e:
-                logging.warning(f"Error retrieving {category} metadata on attempt {attempt+1}: {e}")
-            if attempt < max_attempts - 1:
-                base_delay = [1, 3, 10][attempt]
-                delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
-                time.sleep(delay)
+                    logging.error("Gist failed after max retries.")
             else:
-                logging.error(f"Failed to retrieve {category} metadata after {max_attempts} attempts.")
+                logging.warning("No valid gist types found (only 'title', 'topic', 'hashtag' allowed). Skipping gist.")
+        else:
+            logging.warning("Gist block missing 'types' or invalid. Skipping gist.")
 
-    # Handle embeddings and transcription
-    if "embeddings_and_transcript" in endpoints:
-        info = endpoints["embeddings_and_transcript"]
-        url = info["url"]
-        params = info["params"]
+    # === Open-ended ===
+    if "open_ended" in advanced_settings and isinstance(advanced_settings["open_ended"], dict):
+        open_cfg = advanced_settings["open_ended"]
+        if "prompt" not in open_cfg:
+            logging.warning("open_ended block missing required 'prompt'. Skipping open-ended analysis.")
+        else:
+            payload = {"video_id": video_id, "stream": False, "prompt": open_cfg["prompt"]}
+            # Add optional fields only if present
+            if "max_tokens" in open_cfg:
+                payload["max_tokens"] = int(open_cfg["max_tokens"])
+            if "temperature" in open_cfg:
+                payload["temperature"] = float(open_cfg["temperature"])
+            if "response_format" in open_cfg:
+                payload["response_format"] = open_cfg["response_format"]  # Full object
+
+            url = "https://api.twelvelabs.io/v1.3/analyze"
+            for attempt in range(max_attempts):
+                try:
+                    response = make_request_with_retries("POST", url, headers=headers, json=payload)
+                    if response and response.status_code == 200:
+                        metadata["open"] = response.json()
+                        logging.info("Retrieved open-ended metadata successfully.")
+                        break
+                except Exception as e:
+                    logging.warning(f"Open-ended attempt {attempt+1} failed: {e}")
+                if attempt < max_attempts - 1:
+                    time.sleep([1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt]))
+            else:
+                logging.error("Open-ended failed after max retries.")
+
+    # === Summary ===
+    if "summary" in advanced_settings and isinstance(advanced_settings["summary"], dict):
+        summary_block = advanced_settings["summary"]
+        subtypes_list = summary_block.get("subtypes")
+        if isinstance(subtypes_list, list) and subtypes_list:
+            metadata["summary"] = {}
+            url = "https://api.twelvelabs.io/v1.3/summarize"
+            for subtype in subtypes_list:
+                subtype_config = summary_block.get(subtype, {})
+                if not isinstance(subtype_config, dict):
+                    subtype_config = {}
+                payload = {"video_id": video_id, "type": subtype}
+                # Common fields for all summary subtypes
+                if "prompt" in subtype_config:
+                    payload["prompt"] = subtype_config["prompt"]
+                if "temperature" in subtype_config:
+                    payload["temperature"] = float(subtype_config["temperature"])
+                if "max_tokens" in subtype_config:
+                    payload["max_tokens"] = int(subtype_config["max_tokens"])
+                # response_format ONLY allowed for "summary" subtype
+                if subtype == "summary" and "response_format" in subtype_config:
+                    payload["response_format"] = subtype_config["response_format"]
+
+                for attempt in range(max_attempts):
+                    try:
+                        response = make_request_with_retries("POST", url, headers=headers, json=payload)
+                        if response and response.status_code == 200:
+                            metadata["summary"][subtype] = response.json()
+                            logging.info(f"Retrieved summary ({subtype}) successfully.")
+                            break
+                    except Exception as e:
+                        logging.warning(f"Summary ({subtype}) attempt {attempt+1} failed: {e}")
+                    if attempt < max_attempts - 1:
+                        time.sleep([1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt]))
+                else:
+                    logging.error(f"Summary ({subtype}) failed after max retries.")
+        else:
+            logging.warning("Summary block missing 'subtypes' or it's empty. Skipping all summary generation.")
+
+    # === Embeddings & Transcript ===
+    if "embeddings_and_transcript" in advanced_settings and advanced_settings["embeddings_and_transcript"] == "true":
+        url = f"https://api.twelvelabs.io/v1.3/indexes/{index_id}/videos/{video_id}"
+        params = {"embedding_option": ["audio", "visual-text"], "transcription": "true"}
         for attempt in range(max_attempts):
             try:
                 response = make_request_with_retries("GET", url, headers=headers, params=params)
                 if response and response.status_code == 200:
-                    data = response.json()
-                    metadata["embeddings_and_transcript"] = data
-                    logging.info("Retrieved embeddings and transcription metadata successfully.")
+                    metadata["embeddings_and_transcript"] = response.json()
+                    logging.info("Retrieved embeddings and transcription successfully.")
                     break
-                else:
-                    logging.warning(f"Embeddings/transcript request failed: {response.status_code if response else 'No response'}")
             except Exception as e:
-                logging.warning(f"Error retrieving embeddings/transcript on attempt {attempt+1}: {e}")
+                logging.warning(f"Embeddings/transcript attempt {attempt+1} failed: {e}")
             if attempt < max_attempts - 1:
-                base_delay = [1, 3, 10][attempt]
-                delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
-                time.sleep(delay)
-            else:
-                logging.error("Failed to retrieve embeddings and transcription after max attempts.")
-
-    # Handle summary: call for each summary category
-    summary_url = endpoints["summary"]["url"]
-    metadata["summary"] = {}
-    for key in summary_categories:
-        payload = {
-            "video_id": video_id,
-            "type": key
-        }
-        for attempt in range(max_attempts):
-            try:
-                response = make_request_with_retries("POST", summary_url, headers=headers, json=payload)
-                if response and response.status_code == 200:
-                    data = response.json()
-                    # Store the summary result under its key
-                    metadata["summary"][key] = data
-                    logging.info(f"Retrieved summary ({key}) successfully.")
-                    break
-                else:
-                    logging.warning(f"Summary ({key}) request failed: {response.status_code if response else 'No response'}")
-            except Exception as e:
-                logging.warning(f"Error retrieving summary ({key}) on attempt {attempt+1}: {e}")
-            if attempt < max_attempts - 1:
-                base_delay = [1, 3, 10][attempt]
-                delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
-                time.sleep(delay)
-            else:
-                logging.error(f"Failed to retrieve summary ({key}) after {max_attempts} attempts.")
+                time.sleep([1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt]))
+        else:
+            logging.error("Embeddings/transcript failed after max retries.")
 
     return metadata
 
@@ -660,6 +679,7 @@ if __name__ == '__main__':
     parser.add_argument("--resolved-upload-id", action="store_true", help="Treat upload-path as index ID")
     parser.add_argument("--controller-address", help="Controller IP:Port")
     parser.add_argument("--export-ai-metadata", help="Export AI metadata")
+    parser.add_argument("--export-prompt",help= "Prompt for open ended analysis")
 
     args = parser.parse_args()
 
@@ -688,16 +708,22 @@ if __name__ == '__main__':
         sys.exit(1)
     if args.export_ai_metadata:
         cloud_config_data["export_ai_metadata"] = "true" if args.export_ai_metadata.lower() == "true" else "false"
-    export_prompt = args.export_ai_metadata
-    if not export_prompt:
-        export_prompt = "Provide a detailed summary, chapters, highlights, topics, hashtags, embeddings, and transcription of the video."
+
+    # Load advanced AI settings
+    advanced_settings_path = cloud_config_data.get("advanced_settings")
+    advanced_ai_settings = None
+    if advanced_settings_path:
+        advanced_ai_settings = load_advanced_ai_settings(advanced_settings_path)
 
     if args.mode == "send_extracted_metadata":
         if not (args.asset_id and args.repo_guid and args.catalog_path):
             logging.error("Asset ID, Repo GUID, and Catalog path required.")
             sys.exit(1)
         index_id = args.upload_path if args.resolved_upload_id else cloud_config_data.get('index_id')
-        ai_metadata = get_ai_metadata(api_key, export_prompt, index_id, args.asset_id)
+        if not advanced_ai_settings:
+            logging.error("Advanced AI settings required for metadata extraction.")
+            sys.exit(1)
+        ai_metadata = get_ai_metadata(api_key, index_id, args.asset_id, advanced_settings=advanced_ai_settings)
         if ai_metadata:
             if not send_extracted_metadata(args.repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], ai_metadata):
                 logger.error("Failed to send extracted metadata.")
@@ -823,24 +849,28 @@ if __name__ == '__main__':
         if update_catalog(args.repo_guid, catalog_path.replace("\\", "/").split("/1/", 1)[-1], index_id, final_video_id):
             logging.debug("Catalog updation succeeded")
 
-        # Step 4: Send extracted AI metadata to local controller if enabled and task is ready
+        # Step 4: Send extracted AI metadata ...
         try:
             if cloud_config_data.get('export_ai_metadata') == "true" and poll_result.get('status') == "ready":
-                ai_metadata = get_ai_metadata(api_key, export_prompt, index_id, final_video_id)
+                ai_metadata = get_ai_metadata(api_key, index_id, final_video_id, advanced_settings=advanced_ai_settings)
                 if ai_metadata:
                     if not send_extracted_metadata(args.repo_guid, catalog_path.replace("\\", "/").split("/1/", 1)[-1], ai_metadata):
                         logger.error("Failed to send extracted AI metadata.")
+                        print(f"Metadata extraction failed for asset: {final_video_id}")
                         sys.exit(7)
                     else:
                         logger.info("Extracted AI metadata sent successfully.")
                 else:
                     logger.error("AI metadata could not be retrieved.")
+                    print(f"Metadata extraction failed for asset: {final_video_id}")
                     sys.exit(7)
             elif cloud_config_data.get('export_ai_metadata') == "true":
                 logger.error("Poll result status is not 'ready'; cannot export AI metadata.")
+                print(f"Metadata extraction failed for asset: {final_video_id}")
                 sys.exit(7)
         except Exception as e:
             logger.error(f"Exception while exporting AI metadata: {e}")
+            print(f"Metadata extraction failed for asset: {final_video_id}")
             sys.exit(7)
 
         # Re-apply metadata if not done earlier (e.g., video_id wasn't available)

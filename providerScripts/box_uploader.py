@@ -14,7 +14,6 @@ import time
 from requests.adapters import HTTPAdapter
 from requests.exceptions import RequestException, SSLError, ConnectionError, Timeout
 from boxsdk import OAuth2, Client
-from boxsdk.object.metadata import MetadataUpdate
 from boxsdk.exception import BoxAPIException
 
 # Constants
@@ -44,7 +43,7 @@ def extract_file_name(path):
 def remove_file_name_from_path(path):
     return os.path.dirname(path)
 
-def calculate_sha1(file_path,chunk_size):
+def calculate_sha1(file_path, chunk_size):
     sha1 = hashlib.sha1()
     with open(file_path, 'rb') as f:
         while True:
@@ -52,8 +51,8 @@ def calculate_sha1(file_path,chunk_size):
             if not chunk:
                 break
             sha1.update(chunk)
-
-    return sha1.digest()
+    # v4 requires SHA-1 as hex string, not bytes
+    return sha1.hexdigest()
 
 def get_cloud_config_path():
     if IS_LINUX:
@@ -309,13 +308,12 @@ def prepare_metadata_to_upload( backlink_url, properties_file):
 
 def apply_metadata_with_upsert(file_obj, metadata_dict, template='properties', scope='global'):
     try:
-        return file_obj.metadata(scope, template).create(metadata_dict)
+        # v4: using add_metadata instead of .metadata().create()
+        return file_obj.add_metadata(metadata_dict, scope=scope, template=template)
     except BoxAPIException as e:
         if e.status == 409 and 'conflict' in str(e).lower():
-            update_ops = MetadataUpdate()
-            for key, value in metadata_dict.items():
-                update_ops.replace(key, value)
-            return file_obj.metadata(scope, template).update(update_ops)
+            # v4: update_metadata takes a dict directly, no MetadataUpdate object
+            return file_obj.update_metadata(metadata_dict, scope=scope, template=template)
         else:
             logging.error(f"Failed to apply metadata: {e}", exc_info=True)
 
@@ -390,14 +388,11 @@ def upload_file_with_conflict_resolution(client, folder_id, file_path, conflict_
             }
         # Small file
         if file_size < min_upload_session_size:
-            if existing_file and conflict_resolution == "new_version":
-                file_obj = client.file(existing_file.id)
-                uploaded_file = file_obj.update_contents(file_path)
-            elif existing_file and conflict_resolution == "overwrite":
+            if existing_file and conflict_resolution in ("overwrite", "new_version"):
                 file_obj = client.file(existing_file.id)
                 uploaded_file = file_obj.update_contents(file_path)
             else:
-                uploaded_file = folder.upload(file_path, file_name=upload_name)
+                uploaded_file = folder.upload(file_path, file_name=upload_name, file_description=backlink_url)
             return {
                 "success": True,
                 "file_id": uploaded_file.id,
@@ -407,29 +402,35 @@ def upload_file_with_conflict_resolution(client, folder_id, file_path, conflict_
         # Large file (chunked upload)
         else:
             if existing_file and conflict_resolution in ("overwrite", "new_version"):
+                # Box v4: For new version of large file, use file.get_chunked_uploader()
                 file_obj = client.file(existing_file.id)
-                upload_session = file_obj.create_upload_session(file_size=file_size)
+                with open(file_path, 'rb') as stream:
+                    chunked_uploader = file_obj.get_chunked_uploader(stream, file_size)
+                    uploaded_file = chunked_uploader.start()
             else:
-                upload_session = folder.create_upload_session(file_name=upload_name, file_size=file_size)
-            chunk_size = upload_session.part_size
-            parts = []
-            offset = 0
-            with open(file_path, 'rb') as file_stream:
-                while offset < file_size:
-                    bytes_to_read = min(chunk_size, file_size - offset)
-                    part_data = file_stream.read(bytes_to_read)
-                    part = upload_session.upload_part_bytes(
-                        part_data,
-                        offset=offset,
-                        total_size=file_size
-                    )
-                    parts.append(part)
-                    offset += bytes_to_read
-            content_sha1 = calculate_sha1(file_path, chunk_size)
-            uploaded_file = upload_session.commit(
-                parts=parts,
-                content_sha1=content_sha1
-            )
+                # Box v4: Create upload session via FOLDER
+                folder = client.folder(folder_id)
+                upload_session = folder.create_upload_session(file_size=file_size, file_name=upload_name)
+                chunk_size = upload_session.part_size
+                parts = []
+                offset = 0
+                sha1 = hashlib.sha1()
+                with open(file_path, 'rb') as file_stream:
+                    while offset < file_size:
+                        bytes_to_read = min(chunk_size, file_size - offset)
+                        part_data = file_stream.read(bytes_to_read)
+                        sha1.update(part_data)
+                        part = upload_session.upload_part_bytes(
+                            part_data,
+                            offset=offset,
+                            total_size=file_size
+                        )
+                        parts.append(part)
+                        offset += bytes_to_read
+                uploaded_file = upload_session.commit(
+                    sha1.digest(),
+                    file_attributes={'name': upload_name, 'description': backlink_url},
+                )
             return {
                 "success": True,
                 "file_id": uploaded_file.id,
@@ -452,37 +453,31 @@ def upload_file_with_conflict_resolution(client, folder_id, file_path, conflict_
 def get_shared_link_url(client, file_id, max_attempts=3):
     for attempt in range(max_attempts):
         try:
-            shared_link = client.file(file_id).get().shared_link
-            logging.debug(f"Existing shared link for file {file_id}: {shared_link}")
+            file_obj = client.file(file_id)
+            file_info = file_obj.get()
+            # Check if shared link already exists
+            if file_info.shared_link and file_info.shared_link.get('url'):
+                return file_info.shared_link['url']
 
-            if not shared_link or not shared_link.get('url'):
-                logging.info(f"No shared link found for file {file_id}. Creating one...")
-                shared_link = client.file(file_id).get_shared_link(access='open', allow_download=True, allow_edit=True)
-                logging.debug(f"New shared link created for file {file_id}: {shared_link}")
-
-                if isinstance(shared_link, str) and shared_link.startswith("https://"):
-                    embed_url = shared_link
-                    logging.info(f"Embed URL obtained: {embed_url}")
-                    return embed_url
-                elif isinstance(shared_link, dict) and shared_link.get('url'):
-                    embed_url = shared_link['url']
-                    logging.info(f"Embed URL obtained: {embed_url}")
-                    return embed_url
-                else:
-                    logging.error("Failed to retrieve or create shared link.")
-                    return None
+            # Create shared link using get_shared_link (v4 method)
+            shared_link_url = file_obj.get_shared_link(
+                access='open',
+                allow_download=True,
+                allow_edit=True
+            )
+            return shared_link_url
 
         except BoxAPIException as e:
             logging.error(f"Box API error while fetching shared link for {file_id}: {e}")
             return None
         except Exception as e:
-            if attempt == 2:
-                logging.critical(f"Failed to get embed url after 3 attempts: {e}")
-                raise
+            if attempt == max_attempts - 1:
+                logging.critical(f"Failed to get embed url after {max_attempts} attempts: {e}")
+                return None
             base_delay = [1, 3, 10][attempt]
             delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
             time.sleep(delay)
-            return None
+    return None
 
 def update_catalog(repo_guid, file_path, asset_id, folder_id, embed_url=None, max_attempts=5):
     url = "http://127.0.0.1:5080/catalogs/providerData"
