@@ -277,7 +277,13 @@ def upload_file(source_filename, presigned_url, type, token, metadata):
         },
         "analysis_parameters": {
             "tasks": ["mxt"]
-        }
+        },
+        "metadata": [
+            {
+                "field_uid": "text_field_1",
+                "value": backlink_url
+            }
+        ]
     }
     logging.debug(f"Upload payload: {payload}")
 
@@ -297,7 +303,7 @@ def upload_file(source_filename, presigned_url, type, token, metadata):
             time.sleep(delay)
     return None
 
-def poll_task_status(token, task_id, max_wait=3600, interval=10):
+def poll_task_status(token, task_id, max_wait=1200, interval=30):
     url = f"{DOMAIN.strip()}/analysis-request/{task_id}"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -331,8 +337,8 @@ def poll_task_status(token, task_id, max_wait=3600, interval=10):
                 logging.info(f"Media ready. ID: {media_id}")
                 return data
 
-            if error_msg is not None:
-                logging.error(f"Job failed: {error_msg}")
+            if error_msg is not None or data.get("status") == "FAILED":
+                logging.error(f"Analysis Job failed: {error_msg or 'Unknown error'}")
                 return data
 
             attempt = 0
@@ -452,7 +458,7 @@ if __name__ == "__main__":
     parser.add_argument("--log-level", default="debug", help="Logging level (debug, info, warning, error)")
     parser.add_argument("--resolved-upload-id", action="store_true", help="Treat upload-path as resolved folder ID")
     parser.add_argument("--controller-address", help="Controller IP:Port override")
-    parser.add_argument("--export-ai-metadata", action="store_true", help="Export AI metadata")
+    parser.add_argument("--export-ai-metadata", help="Export AI metadata")
 
     args = parser.parse_args()
     setup_logging(args.log_level)
@@ -609,8 +615,8 @@ if __name__ == "__main__":
             sys.exit(1)
 
         # Poll for completion
-        poll_result = poll_task_status(token, task_id, max_wait=3600)
-        if not poll_result:
+        poll_result = poll_task_status(token, task_id)
+        if not poll_result or "media_id" not in poll_result:
             logging.error("Task polling failed or timed out.")
             sys.exit(1)
             

@@ -1,7 +1,7 @@
-import requests
 import time
 import csv
 import os
+import re
 import posixpath
 import subprocess
 import logging
@@ -11,17 +11,22 @@ import sys
 import random
 import argparse
 from datetime import datetime
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from configparser import ConfigParser
+import plistlib
+
 
 # Debug configuration
 DEBUG_PRINT = True
 DEBUG_TO_FILE = True
-
+IS_LINUX = True
+DNA_CLIENT_SERVICES = "./DNAClientServices.conf" if IS_LINUX else "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 PROXY_GENERATION_HOST = "http://127.0.0.1:8000"
-PROVIDERS_SUPPORTING_GET_BASE_TARGET = ["frameio" , "frameio_v2", "frameio_v4", "tessact", "overcasthq", "trint", "twelvelabs", "box", "googledrive", "iconik"]
+PROVIDERS_SUPPORTING_GET_BASE_TARGET = ["frameio" , "frameio_v2", "frameio_v4", "tessact", "overcasthq", "trint", "twelvelabs", "box", "box_v4", "googledrive", "iconik"]
 PATH_BASED_PROVIDERS = ["cloud", "AWS", "axel_ai"]
-ACCOUNT_BASED_PROVIDERS = ["azure_video_indexer", "AZURE"]
+ACCOUNT_BASED_PROVIDERS = ["azure_video_indexer", "AZURE", "AZUREVISION"]
 
 # Mapping provider names to their respective upload scripts
 PROVIDER_SCRIPTS = {
@@ -34,6 +39,7 @@ PROVIDER_SCRIPTS = {
     "trint": "trint_uploader.py",
     "twelvelabs": "twelvelabs_uploader.py",
     "box": "box_uploader.py",
+    "box_v4": "box_uploader.py",
     "cloud": "dropbox_uploader.py",
     "googledrive": "google_drive_uploader.py",
     "iconik": "iconik_uploader.py",
@@ -41,7 +47,8 @@ PROVIDER_SCRIPTS = {
     "azure_video_indexer": "azure_video_indexer_uploader.py",
     "axel_ai": "axel_ai_uploader.py",
     "momentslab": "momentslab_uploader.py",
-    "rubicx": "rubicx_uploader.py"
+    "rubicx": "rubicx_uploader.py",
+    "azure_vision": "azure_vision_uploader.py"
 }
 
 # New upload modes
@@ -56,6 +63,29 @@ def debug_print(log_path, text_string):
     if DEBUG_PRINT and DEBUG_TO_FILE:
         with open(log_path, "a") as debug_file:
             debug_file.write(f"{output}\n")
+
+def get_metadata_store_path():
+    host, path = "", ""
+    try:
+        if IS_LINUX:
+            parser = ConfigParser()
+            parser.read(DNA_CLIENT_SERVICES)
+            host = parser.get('General', 'MetaXtendHost', fallback='').strip()
+            path = parser.get('General', 'MetaXtendPath', fallback='').strip()
+        else:
+            with open(DNA_CLIENT_SERVICES, 'rb') as fp:
+                cfg = plistlib.load(fp) or {}
+                host = str(cfg.get("MetaXtendHost", "")).strip()
+                path = str(cfg.get("MetaXtendPath", "")).strip()
+    except Exception as e:
+        logging.error(f"Error reading Metadata Store or MetaXtend settings: {e}")
+        return None, None  # ← return None instead of sys.exit
+
+    if not host or not path:
+        logging.info("MetaXtend settings not found.")
+        return None, None
+
+    return host, path
 
 # Writes job progress details to an XML file at specified path
 def send_progress(progressDetails, request_id):
@@ -118,6 +148,20 @@ def resolve_base_upload_id(logging_path,script_path, cloud_config_name, upload_p
     except Exception as e:
         return upload_path
 
+def parse_scene_detection_filename(filename):
+    # Primary format: ...-Scene-001_00-00-00.040.jpg
+    match = re.search(r"-Scene-(\d{3})_(\d{2}-\d{2}-\d{2}\.\d{3})", filename)
+    if match:
+        return match.group(1), match.group(2)
+    
+    # Fallback format: ..._001.jpg  or ...001.png
+    match = re.search(r"_(\d{3})\.[^.]+$", filename)
+    if match:
+        scene_no = match.group(1)
+        return scene_no, ""  # placeholder timestamp
+    
+    return None, None
+
 def build_proxy_map(records, config, progressDetails):
     proxy_map = {}
     proxy_dir = config["proxy_directory"]
@@ -133,6 +177,10 @@ def build_proxy_map(records, config, progressDetails):
         if upload_type == "sprite_sheet":
             # New behavior - folder with multiple files (search recursively)
             return base_source_path, find_folder_with_files(proxy_dir, base_name, upload_type, log_path)
+        elif upload_type == "video_proxy_sample_scene_change":
+            # Use FULL filename with extension as folder name for azure vision frames
+            folder_name = os.path.basename(base_source_path)
+            return base_source_path, find_folder_with_files(proxy_dir, folder_name, upload_type, log_path)        
         else:
             # Original behavior - single file proxy
             pattern = f"{base_name}*.*"
@@ -189,6 +237,10 @@ def find_folder_with_files(proxy_dir, folder_name, upload_type, log_path):
             if upload_type == "sprite_sheet" and is_spreadsheet_file(str(file_path)):
                 all_matching_files.append(str(file_path))
                 debug_print(log_path, f"[FIND FOLDER] Found spreadsheet file: {file_path}")
+            elif upload_type == "video_proxy_sample_scene_change":
+                if file_path.suffix.lower() in {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}:
+                    all_matching_files.append(str(file_path))
+                    debug_print(log_path, f"[FIND FOLDER] Found vision frame: {file_path}")
     
     debug_print(log_path, f"[FIND FOLDER] Total matching files found: {len(all_matching_files)}")
     return all_matching_files if all_matching_files else None
@@ -255,91 +307,91 @@ def resolve_proxy_file(proxy_dir, original_source_path, pattern, log_path):
     debug_print(log_path, "[MISS] No proxy file found for this pattern.")
     return None
 
-# validate params per mode for proxy_generation
-def validate_proxy_params(mode, params):
-    required_keys = {
-        "generate_video_proxy": ["proxy_params"],
-        "generate_video_frame_proxy": ["frame_formate", "proxy_params"],
-        "generate_intelligence_proxy": [],
-        "generate_video_to_spritesheet": ["frame_formate", "tile_layout", "image_geometry"]
-    }
-    missing = [k for k in required_keys.get(mode, []) if not params.get(k)]
-    if missing:
-        raise ValueError(f"Missing required proxy parameters for mode '{mode}': {', '.join(missing)}")
+# # validate params per mode for proxy_generation
+# def validate_proxy_params(mode, params):
+#     required_keys = {
+#         "generate_video_proxy": ["proxy_params"],
+#         "generate_video_frame_proxy": ["frame_formate", "proxy_params"],
+#         "generate_intelligence_proxy": [],
+#         "generate_video_to_spritesheet": ["frame_formate", "tile_layout", "image_geometry"]
+#     }
+#     missing = [k for k in required_keys.get(mode, []) if not params.get(k)]
+#     if missing:
+#         raise ValueError(f"Missing required proxy parameters for mode '{mode}': {', '.join(missing)}")
 
-#payload generation for proxy job creation
-def build_payload_for_proxy_mode(mode, input_path, output_path, config_params):
-    payload = {
-        "file_path": input_path,
-        "output_path": output_path
-    }
-    if mode == "generate_video_proxy":
-        required = ["proxy_params"]
-        payload.update({k: config_params[k] for k in required if k in config_params})
-    elif mode == "generate_video_frame_proxy":
-        required = ["frame_formate", "proxy_params"]
-        optional = ["frame_params"]
-        payload.update({k: config_params[k] for k in required if k in config_params})
-        payload.update({k: config_params[k] for k in optional if k in config_params})
-    elif mode == "generate_intelligence_proxy":
-        optional = ["proxy_params"]
-        payload.update({k: config_params[k] for k in optional if k in config_params})
-    elif mode == "generate_video_to_spritesheet":
-        required = ["frame_formate", "tile_layout", "image_geometry"]
-        optional = ["frame_params"]
-        payload.update({k: config_params[k] for k in required if k in config_params})
-        payload.update({k: config_params[k] for k in optional if k in config_params})
-    return payload
+# #payload generation for proxy job creation
+# def build_payload_for_proxy_mode(mode, input_path, output_path, config_params):
+#     payload = {
+#         "file_path": input_path,
+#         "output_path": output_path
+#     }
+#     if mode == "generate_video_proxy":
+#         required = ["proxy_params"]
+#         payload.update({k: config_params[k] for k in required if k in config_params})
+#     elif mode == "generate_video_frame_proxy":
+#         required = ["frame_formate", "proxy_params"]
+#         optional = ["frame_params"]
+#         payload.update({k: config_params[k] for k in required if k in config_params})
+#         payload.update({k: config_params[k] for k in optional if k in config_params})
+#     elif mode == "generate_intelligence_proxy":
+#         optional = ["proxy_params"]
+#         payload.update({k: config_params[k] for k in optional if k in config_params})
+#     elif mode == "generate_video_to_spritesheet":
+#         required = ["frame_formate", "tile_layout", "image_geometry"]
+#         optional = ["frame_params"]
+#         payload.update({k: config_params[k] for k in required if k in config_params})
+#         payload.update({k: config_params[k] for k in optional if k in config_params})
+#     return payload
 
-# generate proxy asset according to options
-def generate_proxy_asset(config_mode, input_path, output_path, extra_params, generator_tool = "ffmpeg"):
-    base_url = f"{PROXY_GENERATION_HOST}/{generator_tool}/"
-    mode_url_map = {
-        "generate_video_proxy": "generate_video_proxy",
-        "generate_video_frame_proxy": "generate_video_frame_proxy",
-        "generate_intelligence_proxy": "generate_intelligence_video_proxy",
-        "generate_video_to_spritesheet": "generate_video_to_sprite_sheet"
-    }
-    if config_mode not in mode_url_map:
-        raise ValueError(f"Unsupported proxy generation mode: {config_mode}")
+# # generate proxy asset according to options
+# def generate_proxy_asset(config_mode, input_path, output_path, extra_params, generator_tool = "ffmpeg"):
+#     base_url = f"{PROXY_GENERATION_HOST}/{generator_tool}/"
+#     mode_url_map = {
+#         "generate_video_proxy": "generate_video_proxy",
+#         "generate_video_frame_proxy": "generate_video_frame_proxy",
+#         "generate_intelligence_proxy": "generate_intelligence_video_proxy",
+#         "generate_video_to_spritesheet": "generate_video_to_sprite_sheet"
+#     }
+#     if config_mode not in mode_url_map:
+#         raise ValueError(f"Unsupported proxy generation mode: {config_mode}")
 
-    url = base_url + mode_url_map[config_mode]
-    validate_proxy_params(config_mode, extra_params)
-    payload = build_payload_for_proxy_mode(config_mode, input_path, output_path, extra_params)
+#     url = base_url + mode_url_map[config_mode]
+#     validate_proxy_params(config_mode, extra_params)
+#     payload = build_payload_for_proxy_mode(config_mode, input_path, output_path, extra_params)
 
-    try:
-        response = requests.post(url, json=payload, headers={"Content-Type": "application/json"})
-        if response.status_code != 200:
-            raise Exception(f"API call failed with status {response.status_code}: {response.text}")
+#     try:
+#         response = requests.post(url, json=payload, headers={"Content-Type": "application/json"})
+#         if response.status_code != 200:
+#             raise Exception(f"API call failed with status {response.status_code}: {response.text}")
 
-        jobid = response.json().get("jobid")
-        if not jobid:
-            raise Exception("No jobid returned from proxy generation call")
+#         jobid = response.json().get("jobid")
+#         if not jobid:
+#             raise Exception("No jobid returned from proxy generation call")
 
-        # Poll job status
-        job_status_url = f"{PROXY_GENERATION_HOST}/job_details/{jobid}"
-        start_time = time.time()
-        timeout = 600  # 10 minutes
-        poll_interval = 3
+#         # Poll job status
+#         job_status_url = f"{PROXY_GENERATION_HOST}/job_details/{jobid}"
+#         start_time = time.time()
+#         timeout = 600  # 10 minutes
+#         poll_interval = 3
 
-        while time.time() - start_time < timeout:
-            job_resp = requests.get(job_status_url)
-            if job_resp.status_code != 200:
-                raise Exception(f"Failed to fetch job status: {job_resp.text}")
-            job_data = job_resp.json()
-            status = job_data.get("jobstatus")
+#         while time.time() - start_time < timeout:
+#             job_resp = requests.get(job_status_url)
+#             if job_resp.status_code != 200:
+#                 raise Exception(f"Failed to fetch job status: {job_resp.text}")
+#             job_data = job_resp.json()
+#             status = job_data.get("jobstatus")
 
-            if status == "Success":
-                return
-            elif status == "Failed":
-                raise RuntimeError(f"Proxy generation job {jobid} failed: {job_data.get('description')}")
+#             if status == "Success":
+#                 return
+#             elif status == "Failed":
+#                 raise RuntimeError(f"Proxy generation job {jobid} failed: {job_data.get('description')}")
 
-            time.sleep(poll_interval)
+#             time.sleep(poll_interval)
 
-        raise TimeoutError(f"Proxy generation job {jobid} timed out after {timeout} seconds")
+#         raise TimeoutError(f"Proxy generation job {jobid} timed out after {timeout} seconds")
 
-    except Exception as e:
-        raise RuntimeError(f"Proxy generation failed: {e}")
+#     except Exception as e:
+#         raise RuntimeError(f"Proxy generation failed: {e}")
 
 # Determine source path: override > proxy_map > base path (only for non-proxy modes) 
 def resolve_source_path_for_upload_asset(record, config, override_source_path=None, proxy_map=None):
@@ -548,7 +600,7 @@ def calculate_total_size(records, config, proxy_map=None):
             full_path = r[0]
 
         if config["mode"] == "proxy":
-            if upload_type == "sprite_sheet":
+            if upload_type in ("sprite_sheet", "video_proxy_sample_scene_change"):
                 # New behavior - multiple files
                 proxy_files = proxy_map.get(full_path) if proxy_map else None
                 if proxy_files and isinstance(proxy_files, list):
@@ -777,12 +829,11 @@ def retry_ai_metadata_failures(config):
             ]
             if config.get("provider") == "twelvelabs":
                 cmd += ["--upload-path", base_id]
+                cmd.append("--resolved-upload-id")
             if metadata_path and os.path.exists(metadata_path):
                 cmd += ["--metadata-file", metadata_path]
             if config.get("export"):
-                cmd += ["--export-ai-metadata", config["export"]]
-            if config.get("export_prompt") and config.get("provider") == "twelvelabs":
-                cmd += ["--export-prompt", config["export_prompt"]]
+                cmd += ["--export-ai-metadata", str(config["export"])]
 
             debug_print(config["logging_path"], f"[AI METADATA RETRY CMD] {' '.join(cmd)}")
             result = subprocess.run(cmd, capture_output=True, text=True)
@@ -837,26 +888,26 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
 
         # Proxy generation step if mode requires it
         override_source_path = None
-        if config["mode"] in [
-            "generate_video_proxy", "generate_video_frame_proxy",
-            "generate_intelligence_proxy", "generate_video_to_spritesheet"
-        ]:
-            base_source_path = os.path.join(*original_source_path.split("/./")) if "/./" in original_source_path else original_source_path
-            name_wo_ext, ext = os.path.splitext(os.path.basename(base_source_path))
-            proxy_ext = ".png" if "spritesheet" in config["mode"] else ext
-            proxy_output_path = os.path.join(config["proxy_output_base_path"], name_wo_ext + proxy_ext)
+        # if config["mode"] in [
+        #     "generate_video_proxy", "generate_video_frame_proxy",
+        #     "generate_intelligence_proxy", "generate_video_to_spritesheet"
+        # ]:
+        #     base_source_path = os.path.join(*original_source_path.split("/./")) if "/./" in original_source_path else original_source_path
+        #     name_wo_ext, ext = os.path.splitext(os.path.basename(base_source_path))
+        #     proxy_ext = ".png" if "spritesheet" in config["mode"] else ext
+        #     proxy_output_path = os.path.join(config["proxy_output_base_path"], name_wo_ext + proxy_ext)
 
-            try:
-                generate_proxy_asset(config["mode"], base_source_path, proxy_output_path, config.get("proxy_extra_params", {}))
-                override_source_path = proxy_output_path
-                debug_print(config["logging_path"], f"[PROXY GENERATION] Generated proxy: {proxy_output_path}")
-            except Exception as e:
-                msg = f"[ERROR] Proxy generation failed: {e}"
-                debug_print(config["logging_path"], msg)
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                write_csv_row(issues_log, ["Error", base_source_path, timestamp, msg])
-                send_progress(progressDetails, config["repo_guid"])
-                return
+        #     try:
+        #         generate_proxy_asset(config["mode"], base_source_path, proxy_output_path, config.get("proxy_extra_params", {}))
+        #         override_source_path = proxy_output_path
+        #         debug_print(config["logging_path"], f"[PROXY GENERATION] Generated proxy: {proxy_output_path}")
+        #     except Exception as e:
+        #         msg = f"[ERROR] Proxy generation failed: {e}"
+        #         debug_print(config["logging_path"], msg)
+        #         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        #         write_csv_row(issues_log, ["Error", base_source_path, timestamp, msg])
+        #         send_progress(progressDetails, config["repo_guid"])
+        #         return
 
         # Handle different upload modes
         if upload_type == "sprite_sheet" and config["mode"] == "proxy":
@@ -935,6 +986,118 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
             else:
                 # return {"status": "partial", "file": base_source_path, "uploaded": success_count, "failed": failure_count}
                 return {"status": "partial", "file": base_source_path, "uploaded": success_count, "failed": failure_count, "record": record}
+
+        elif upload_type == "video_proxy_sample_scene_change" and config["mode"] == "proxy":
+            base_source_path = os.path.join(*original_source_path.split("/./")) if "/./" in original_source_path else original_source_path
+            proxy_files = proxy_map.get(base_source_path) if proxy_map else None
+            if not proxy_files or not isinstance(proxy_files, list):
+                msg = f"[AZURE VISION] No scene frames for {base_source_path}"
+                debug_print(config["logging_path"], msg)
+                write_csv_row(issues_log, ["Error", base_source_path, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg])
+                return {"status": "failure", "file": base_source_path, "error": msg, "record": record}
+
+            _, metaxtend_base = get_metadata_store_path()
+            if not metaxtend_base:
+                msg = "[AZURE VISION] MetaXtend path not configured"
+                debug_print(config["logging_path"], msg)
+                write_csv_row(issues_log, ["Error", base_source_path, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg])
+                return {"status": "failure", "file": base_source_path, "error": msg, "record": record}
+
+            try:
+                norm_src = original_source_path.strip("/").replace("\\", "/")
+                comps = ["".join(c if c.isalnum() or c in "._-()" else "_" for c in p) for p in norm_src.split("/") if p]
+                out_dir = Path(metaxtend_base) / config["repo_guid"] / Path(*comps)
+                out_dir.mkdir(parents=True, exist_ok=True)
+                final_out = out_dir / "azure_vision.json"
+            except Exception as e:
+                msg = f"[AZURE VISION] Path error: {e}"
+                debug_print(config["logging_path"], msg)
+                write_csv_row(issues_log, ["Error", base_source_path, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg])
+                return {"status": "failure", "file": base_source_path, "error": msg, "record": record}
+
+            scene_groups = defaultdict(list)
+            for fp in proxy_files:
+                fn = Path(fp).name
+                scene_no, ts = parse_scene_detection_filename(fn)
+                if scene_no:
+                    scene_groups[scene_no].append((ts, fp))
+                else:
+                    debug_print(config["logging_path"], f"[SKIP] Unrecognized: {fn}")
+
+            all_scenes, processed, failed = [], 0, []
+            dry_run = config.get("dry_run", False)
+            max_retries = config.get("max_frame_retries", 3)
+            timeout = config.get("vision_timeout", 180)
+
+            for scene_no in sorted(scene_groups):
+                frames = []
+                for ts, fp in sorted(scene_groups[scene_no]):
+                    if dry_run:
+                        frames.append({"timestamp": ts, "analysis": {"caption": {"text": "dry-run", "confidence": 1.0}}, "embedding": [0.1]*1024, "embedding_length": 1024, "source_file": Path(fp).name})
+                        processed += 1
+                        continue
+
+                    temp_out = out_dir / f"temp_{scene_no}_{ts}.json"
+                    success = False
+                    for attempt in range(max_retries):
+                        try:
+                            cmd = ["python", config["script_path"], "-m", "analyze_and_embed", "-c", config["cloud_config_name"], "-i", fp, "-o", str(temp_out), "--log-level", config.get("vision_log_level", "info")]
+                            debug_print(config["logging_path"], f"[VISION CMD] Attempt {attempt+1} for {fp}: {' '.join(cmd)}")
+                            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                            debug_print(config["logging_path"], f" [return_code] {result.returncode} [VISION CMD OUTPUT] {result.stdout.strip()}")
+                            if result.returncode == 0 and temp_out.exists() and temp_out.stat().st_size > 0:
+                                try:
+                                    with open(temp_out, 'r', encoding='utf-8') as f:
+                                        data = json.load(f)
+                                    if data.get("analysis") or data.get("embedding"):
+                                        frames.append({
+                                            "timestamp": ts,
+                                            "analysis": data.get("analysis"),
+                                            "embedding": data.get("embedding"),
+                                            "embedding_length": data.get("embedding_length", 0),
+                                            "source_file": Path(fp).name
+                                        })
+                                        success, processed = True, processed + 1
+                                        break
+                                except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                                    debug_print(config["logging_path"], f"[JSON/UTF8 ERROR] {temp_out}: {e}")
+                        except (subprocess.TimeoutExpired, Exception):
+                            pass
+                        if attempt < max_retries - 1:
+                            time.sleep(5 + attempt * 2)
+                    if not success:
+                        failed.append({"scene": scene_no, "timestamp": ts, "file": fp})
+                    temp_out.unlink(missing_ok=True)
+
+                if frames:
+                    all_scenes.append({"scene_no": scene_no, "frame_count": len(frames), "frames": frames})
+
+            if not dry_run:
+                output_data = {
+                    "source": base_source_path,
+                    "processed_at": datetime.now().isoformat(),
+                    "total_scenes": len(all_scenes),
+                    "total_frames_processed": processed,
+                    "total_frames_failed": len(failed),
+                    "scenes": all_scenes
+                }
+                if failed:
+                    output_data["failed_frames"] = failed
+                with open(final_out, 'w', encoding='utf-8') as f:
+                    json.dump(output_data, f, indent=2, ensure_ascii=False)
+                debug_print(config["logging_path"], f"[VISION OUTPUT] {final_out}")
+            else:
+                debug_print(config["logging_path"], f"[DRY RUN] Would write to {final_out}")
+
+            progressDetails["processedFiles"] += 1
+            send_progress(progressDetails, config["repo_guid"])
+
+            if processed == 0:
+                return {"status": "failure", "file": base_source_path, "error": "No frames succeeded", "record": record}
+            elif failed:
+                return {"status": "partial_success", "file": base_source_path, "output": str(final_out), "processed": processed, "failed": len(failed), "record": record}
+            else:
+                return {"status": "success", "file": base_source_path, "output": str(final_out), "processed": processed, "record": record}
 
         else:
             # Original single file upload behavior
@@ -1236,6 +1399,12 @@ if __name__ == '__main__':
         request_data["upload_type"] = request_data["proxy_type"]
     else:
         request_data["upload_type"] = "video_proxy"
+        
+    # Azure Vision defaults
+    if request_data.get("upload_type") == "video_proxy_sample_scene_change":
+        request_data.setdefault("max_frame_retries", 3)
+        request_data.setdefault("vision_timeout", 180)
+        request_data.setdefault("vision_log_level", "info")
 
     for key in required_keys:
         if key not in request_data:

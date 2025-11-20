@@ -116,6 +116,29 @@ def get_node_api_key():
     logging.info("Successfully retrieved Node API key.")
     return api_key
 
+def get_metadata_store_path():
+    host, path = "", ""
+    try:
+        if IS_LINUX:
+            parser = ConfigParser()
+            parser.read(DNA_CLIENT_SERVICES)
+            host = parser.get('General', 'MetaXtendHost', fallback='').strip()
+            path = parser.get('General', 'MetaXtendPath', fallback='').strip()
+        else:
+            with open(DNA_CLIENT_SERVICES, 'rb') as fp:
+                cfg = plistlib.load(fp) or {}
+                host = str(cfg.get("MetaXtendHost", "")).strip()
+                path = str(cfg.get("MetaXtendPath", "")).strip()
+    except Exception as e:
+        logging.error(f"Error reading Metadata Store or MetaXtend settings: {e}")
+        sys.exit(5)
+
+    if not host or not path:
+        logging.info("MetaXtend settings not found.")
+        sys.exit(5)
+
+    return host, path
+
 def get_retry_session(retries=3, backoff_factor_range=(1.0, 2.0)):
     session = requests.Session()
     # handling retry delays manually via backoff in the range
@@ -618,7 +641,7 @@ def get_ai_metadata(api_key, index_id, video_id, advanced_settings=None, max_att
             logging.warning("Summary block missing 'subtypes' or it's empty. Skipping all summary generation.")
 
     # === Embeddings & Transcript ===
-    if "embeddings_and_transcript" in advanced_settings and advanced_settings["embeddings_and_transcript"] == "true":
+    if "embeddings_and_transcript" in advanced_settings and advanced_settings["embeddings_and_transcript"] == True:
         url = f"https://api.twelvelabs.io/v1.3/indexes/{index_id}/videos/{video_id}"
         params = {"embedding_option": ["audio", "visual-text"], "transcription": "true"}
         for attempt in range(max_attempts):
@@ -637,7 +660,41 @@ def get_ai_metadata(api_key, index_id, video_id, advanced_settings=None, max_att
 
     return metadata
 
-def send_extracted_metadata(repo_guid, file_path, metadata, max_attempts=3):
+def store_metadata_file(repo_guid, file_path, metadata, max_attempts=3):
+    host, meta_path = get_metadata_store_path()
+    if not host or not meta_path:
+        logging.error("Metadata Store settings not found.")
+        return None
+    logging.debug(f"Metadata Store Host: {host}, Path: {meta_path}")
+    clean_file_path = file_path if file_path.startswith("/") else f"/{file_path}"
+    logging.debug(f"Clean file path for metadata storage: {clean_file_path}")
+    metadata_dir = os.path.join(meta_path, repo_guid, clean_file_path.lstrip("/"))
+    logging.debug(f"Local metadata directory: {metadata_dir}")
+    os.makedirs(metadata_dir, exist_ok=True)
+    provider = cloud_config_data.get('provider', 'twelvelabs')
+    metadata_file_path = os.path.join(metadata_dir, f"{provider}.json")
+    logging.debug(f"Metadata file path: {metadata_file_path}")
+
+    for attempt in range(max_attempts):
+        try:
+            with open(metadata_file_path, 'w') as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=4)
+            logging.info(f"Metadata file stored at: {metadata_file_path}")
+
+            base = host if host.endswith('/') else host + '/'
+            rel_path = f"{repo_guid}/{clean_file_path}/{provider}.json".lstrip("/")
+            rel_path_enc = urllib.parse.quote(rel_path, safe="/")
+            metadata_file_url = urllib.parse.urljoin(base, rel_path_enc)
+            logging.debug(f"Metadata file URL: {metadata_file_url}")
+            return metadata_file_url
+        except Exception as e:
+            logging.warning(f"Failed to store metadata file (Attempt {attempt+1}): {e}")
+            if attempt < max_attempts - 1:
+                time.sleep([1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt]))
+    logging.error("Failed to store metadata file after max retries.")
+    return None
+
+def send_extracted_metadata(repo_guid, file_path, metadataFileURL, max_attempts=3):
     url = "http://127.0.0.1:5080/catalogs/extendedMetadata"
     node_api_key = get_node_api_key()
     headers = {"apikey": node_api_key, "Content-Type": "application/json"}
@@ -647,7 +704,7 @@ def send_extracted_metadata(repo_guid, file_path, metadata, max_attempts=3):
         "extendedMetadata": [{
             "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
             "fileName": os.path.basename(file_path),
-            "metadata": flatten_dict(metadata)
+            "metadataFilePath": metadataFileURL
         }]
     }
     for _ in range(max_attempts):
@@ -720,16 +777,18 @@ if __name__ == '__main__':
             logging.error("Asset ID, Repo GUID, and Catalog path required.")
             sys.exit(1)
         index_id = args.upload_path if args.resolved_upload_id else cloud_config_data.get('index_id')
+        clean_catalog_path = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
         if not advanced_ai_settings:
             logging.error("Advanced AI settings required for metadata extraction.")
             sys.exit(1)
         ai_metadata = get_ai_metadata(api_key, index_id, args.asset_id, advanced_settings=advanced_ai_settings)
         if ai_metadata:
-            if not send_extracted_metadata(args.repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], ai_metadata):
-                logger.error("Failed to send extracted metadata.")
+            metadata_url = store_metadata_file(args.repo_guid, clean_catalog_path, ai_metadata)
+            if not send_extracted_metadata(args.repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], metadata_url):
+                logging.error("Failed to send extracted metadata.")
                 sys.exit(1)
             else:
-                logger.info("Extracted metadata sent successfully.")
+                logging.info("Extracted metadata sent successfully.")
                 sys.exit(0)
 
     index_id = args.upload_path if args.resolved_upload_id else cloud_config_data.get('index_id')
@@ -854,7 +913,8 @@ if __name__ == '__main__':
             if cloud_config_data.get('export_ai_metadata') == "true" and poll_result.get('status') == "ready":
                 ai_metadata = get_ai_metadata(api_key, index_id, final_video_id, advanced_settings=advanced_ai_settings)
                 if ai_metadata:
-                    if not send_extracted_metadata(args.repo_guid, catalog_path.replace("\\", "/").split("/1/", 1)[-1], ai_metadata):
+                    metadata_url = store_metadata_file(args.repo_guid, clean_catalog_path, ai_metadata)
+                    if not send_extracted_metadata(args.repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], metadata_url):
                         logger.error("Failed to send extracted AI metadata.")
                         print(f"Metadata extraction failed for asset: {final_video_id}")
                         sys.exit(7)

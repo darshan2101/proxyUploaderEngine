@@ -428,7 +428,7 @@ def create_asset(config_data, project_id, folder_id, file_path):
                         logging.info(f"Deleted existing asset for: {file_path}")
                     else:
                         logging.error(f"Failed to delete asset: {file_path}")
-            break  # No need to check further
+                break
         except (TypeError, ValueError):
             logging.debug(f"Invalid original file size metadata on asset {asset['uuid']}: {orig_size}")
             continue
