@@ -9,20 +9,85 @@ import urllib.parse
 from configparser import ConfigParser
 import random
 import time
-from action_functions import flatten_dict
 from requests.adapters import HTTPAdapter
 from requests.exceptions import RequestException, SSLError, ConnectionError, Timeout
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Constants
 VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet", "send_extracted_metadata"]
-CHUNK_SIZE = 5 * 1024 * 1024 
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
 CONFLICT_RESOLUTION_MODES = ["skip", "overwrite"]
 DEFAULT_CONFLICT_RESOLUTION = "skip"
 
+DEFAULT_TWELVELABS_CONFIG = {
+    "gist": {
+        "types": ["title", "topic", "hashtag"]
+    },
+    "summary": {
+        "subtypes": ["summary", "chapter", "highlight"],
+        "summary": {
+            "prompt": "Generate detailed summary of this video containing content and keypoints and give suitable title.",
+            "temperature": 0.3,
+            "max_tokens": 300,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "content": {"type": "string"},
+                        "key_points": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        }
+                    },
+                    "required": ["title", "content"]
+                }
+            }
+        },
+        "chapter": {
+            "prompt": "Generate a summary for a blog post, with chapter based insights.",
+            "max_tokens": 500
+        },
+        "highlight": {
+            "prompt": "Generate a list of key highlights from the video content.",
+            "max_tokens": 300
+        }
+    },
+    "open_ended": {
+        "prompt": "Analyze the video and generate a structured minified JSON capturing: celebrities or people featured, objects or items visible in the scene, atmosphere or mood, actions or key events, and a transcript of the dialogue. Include only these details and follow the schema strictly. Do not include title, summary, or keywords.",
+        "temperature": 0.35,
+        "max_tokens": 1024,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "type": "object",
+                "properties": {
+                    "celebrities": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "objects": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "object_count": {"type": "integer"},
+                    "atmosphere": {"type": "string"},
+                    "actions": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "transcript": {"type": "string"}
+                },
+                "required": ["celebrities", "objects", "atmosphere", "actions", "transcript"]
+            }
+        }
+    },
+    "embeddings_and_transcript": True
+}
 # Detect platform
 IS_LINUX = os.path.isdir("/opt/sdna/bin")
 DNA_CLIENT_SERVICES = LINUX_CONFIG_PATH if IS_LINUX else MAC_CONFIG_PATH
@@ -82,18 +147,62 @@ def get_cloud_config_path():
     logging.info(f"Using cloud config path: {path}")
     return path
 
-def load_advanced_ai_settings(config_path):
-    if not config_path or not os.path.exists(config_path):
-        logging.warning("Advanced AI settings file not provided or not found. Using defaults.")
-        return None
+def get_admin_dropbox_path():
     try:
-        with open(config_path, 'r') as f:
-            settings = json.load(f)
-        logging.debug(f"Loaded advanced AI settings: {settings}")
-        return settings
+        if IS_LINUX:
+            parser = ConfigParser()
+            parser.read(DNA_CLIENT_SERVICES)
+            log_path = parser.get('General', 'LogPath', fallback='').strip()
+        else:
+            with open(DNA_CLIENT_SERVICES, 'rb') as fp:
+                cfg = plistlib.load(fp) or {}
+                log_path = str(cfg.get("LogPath", "")).strip()
+        if log_path:
+            logging.info(f"Admin dropbox path from LogPath: {log_path}")
+            return log_path
+        else:
+            logging.warning("LogPath not found in DNAClientServices config")
+            return None
     except Exception as e:
-        logging.error(f"Failed to parse advanced AI settings file {config_path}: {e}")
+        logging.error(f"Error reading admin dropbox path: {e}")
         return None
+
+def get_advanced_ai_config(config_name, provider_name):
+    admin_dropbox = get_admin_dropbox_path()
+    if not admin_dropbox:
+        logging.warning("Admin dropbox path not available, using default Twelve Labs config")
+        return DEFAULT_TWELVELABS_CONFIG if provider_name.lower() == "twelvelabs" else None
+    config_file_path = os.path.join(admin_dropbox, "AdvancedAiExport", "Configs", f"{config_name}.json")
+    logging.debug(f"Checking for config-specific AI settings at: {config_file_path}")
+    if os.path.exists(config_file_path):
+        try:
+            with open(config_file_path, 'r') as f:
+                config_data = json.load(f)
+            if not isinstance(config_data, dict):
+                logging.error(f"Invalid JSON format in {config_file_path}")
+            else:
+                logging.info(f"Loaded advanced AI config from: {config_file_path}")
+                return config_data
+        except Exception as e:
+            logging.error(f"Error reading config file {config_file_path}: {e}")
+    sample_file_path = os.path.join(admin_dropbox, "AdvancedAiExport", "Samples", f"{provider_name}.json")
+    logging.debug(f"Checking for provider sample at: {sample_file_path}")
+    if os.path.exists(sample_file_path):
+        try:
+            with open(sample_file_path, 'r') as f:
+                sample_data = json.load(f)
+            if not isinstance(sample_data, dict):
+                logging.error(f"Invalid JSON format in {sample_file_path}")
+            else:
+                logging.info(f"Loaded advanced AI config from provider sample: {sample_file_path}")
+                return sample_data
+        except Exception as e:
+            logging.error(f"Error reading sample file {sample_file_path}: {e}")
+    if provider_name.lower() == "twelvelabs":
+        logging.info("Using hardcoded default Twelve Labs AI config")
+        return DEFAULT_TWELVELABS_CONFIG
+    logging.warning(f"No advanced AI config found for provider '{provider_name}'")
+    return None
 
 def get_node_api_key():
     api_key = ""
@@ -160,12 +269,11 @@ def make_request_with_retries(method, url, **kwargs):
                 logging.warning(f"Received {response.status_code} from {url}. Retrying...")
         except (SSLError, ConnectionError, Timeout) as e:
             last_exception = e
-            if attempt < 2:  # Only sleep if not last attempt
+            if attempt < 2:
                 base_delay = [1, 3, 10][attempt]
                 jitter = random.uniform(0, 1)
                 delay = base_delay + jitter * ([1, 1, 5][attempt])
-                logging.warning(f"Attempt {attempt + 1} failed due to {type(e).__name__}: {e}. "
-                                f"Retrying in {delay:.2f}s...")
+                logging.warning(f"Attempt {attempt + 1} failed due to {type(e).__name__}: {e}. Retrying in {delay:.2f}s...")
                 time.sleep(delay)
             else:
                 logging.error(f"All retry attempts failed for {url}. Last error: {e}")
@@ -177,7 +285,7 @@ def make_request_with_retries(method, url, **kwargs):
         raise last_exception
     return None
 
-def prepare_metadata_to_upload(repo_guid ,relative_path, file_name, file_size, backlink_url, properties_file = None):    
+def prepare_metadata_to_upload(repo_guid ,relative_path, file_name, file_size, backlink_url, properties_file=None):    
     metadata = {
         "relativePath": relative_path if relative_path.startswith("/") else "/" + relative_path,
         "repoGuid": repo_guid,
