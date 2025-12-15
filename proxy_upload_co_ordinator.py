@@ -20,7 +20,6 @@ import requests
 from process_central_helper import ProcessCentralHelper
 
 
-
 # Debug configuration
 DEBUG_PRINT = True
 DEBUG_TO_FILE = True
@@ -58,17 +57,13 @@ PROVIDER_SCRIPTS = {
     "momentslab": "momentslab_uploader.py",
     "rubicx": "rubicx_uploader.py",
     "azure_vision": "azure_vision_uploader.py",
-    "googlecloud": "google_vision_uploader.py"
+    "google_vision": "google_vision_uploader.py"
 }
 
 NORMALIZER_SCRIPTS = {
     "azure_vision": "azure_vision_metadata_normalizer.py",
     "AWS": "rekognition_metadata_normalizer.py",
-    "axel_ai": "axel_ai_metadata_normalizer.py",
-    "AZURE": "azure_vision_metadata_normalizer.py",
-    "momentslab": "momentslab_metadata_normalizer.py",
-    "twelvelabs": "twelvelabs_metadata_normalizer.py",
-    "rubicx": "rubicx_metadata_normalizer.py",
+    "google_vision": "google_vision_metadata_normalizer.py"
 }
 
 # New upload modes
@@ -85,6 +80,35 @@ def debug_print(log_path, text_string):
     if DEBUG_PRINT and DEBUG_TO_FILE:
         with open(log_path, "a") as debug_file:
             debug_file.write(f"{output}\n")
+            
+def get_advanced_ai_config(config_name, provider_name="gcp_vision"):
+    admin_dropbox = get_admin_dropbox_path()
+    if not admin_dropbox:
+        logging.info("Admin dropbox not available")
+        return {}
+
+    config_file = os.path.join(admin_dropbox, "AdvancedAiExport", "Configs", f"{config_name}.json")
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+                if isinstance(cfg, dict):
+                    logging.info(f"Loaded advanced config: {config_file}")
+                    return cfg
+        except Exception as e:
+            logging.error(f"Failed to load config: {e}")
+
+    sample_file = os.path.join(admin_dropbox, "AdvancedAiExport", "Samples", f"{provider_name}.json")
+    if os.path.exists(sample_file):
+        try:
+            with open(sample_file, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+                if isinstance(cfg, dict):
+                    logging.info(f"Loaded sample config: {sample_file}")
+                    return cfg
+        except Exception as e:
+            logging.error(f"Failed to load sample: {e}")
+    return {}            
             
 def get_job_address():
     # Read Servers.conf to get job-address
@@ -138,6 +162,50 @@ def get_node_api_key():
 
     logging.info("Successfully retrieved Node API key.")
     return api_key
+
+def get_admin_dropbox_path():
+    try:
+        if IS_LINUX:
+            parser = ConfigParser()
+            parser.read(DNA_CLIENT_SERVICES)
+            log_path = parser.get('General', 'LogPath', fallback='').strip()
+        else:
+            with open(DNA_CLIENT_SERVICES, 'rb') as fp:
+                cfg = plistlib.load(fp) or {}
+                log_path = str(cfg.get("LogPath", "")).strip()
+        return log_path or None
+    except Exception as e:
+        logging.error(f"Error reading admin dropbox path: {e}")
+        return None
+
+def get_advanced_ai_config(config_name, provider):
+    admin_dropbox = get_admin_dropbox_path()
+    if not admin_dropbox:
+        logging.info("Admin dropbox not available")
+        return {}
+
+    config_file = os.path.join(admin_dropbox, "AdvancedAiExport", "Configs", f"{config_name}.json")
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+                if isinstance(cfg, dict):
+                    logging.info(f"Loaded advanced config: {config_file}")
+                    return cfg
+        except Exception as e:
+            logging.error(f"Failed to load config: {e}")
+
+    sample_file = os.path.join(admin_dropbox, "AdvancedAiExport", "Samples", f"{provider}.json")
+    if os.path.exists(sample_file):
+        try:
+            with open(sample_file, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+                if isinstance(cfg, dict):
+                    logging.info(f"Loaded sample config: {sample_file}")
+                    return cfg
+        except Exception as e:
+            logging.error(f"Failed to load sample: {e}")
+    return {}
         
 def get_retry_session():
     session = requests.Session()
@@ -275,6 +343,7 @@ def parse_scene_detection_filename(filename):
     # Must have: underscore + number + extension
     fallback_pattern = r"_(\d+)\.[^.]+$"
     match = re.search(fallback_pattern, filename)
+    
     if match:
         scene_no = match.group(1)
         return scene_no, "1", ""
@@ -294,7 +363,7 @@ def build_proxy_map(records, config, progressDetails):
         base_source_path = os.path.join(*original_source_path.split("/./")) if "/./" in original_source_path else original_source_path
         base_name = os.path.splitext(os.path.basename(base_source_path))[0]
         
-        if upload_type == "sprite_sheet":
+        if upload_type in ("sprite_sheet", "video_proxy_sample_scene_change"):
             # New behavior - folder with multiple files (search recursively)
             return base_source_path, find_folder_with_files(proxy_dir, base_name, upload_type, log_path)
         else:
@@ -356,15 +425,24 @@ def find_folder_with_files(proxy_dir, folder_name, upload_type, log_path):
                 debug_print(log_path, f"[FIND FOLDER] Found spreadsheet file: {file_path}")
 
     if upload_type == "video_proxy_sample_scene_change":
-        # Look for files inside a "scenes_images" subfolder
         scene_dir = proxy_folder / "scenes_images"
-        search_dir = scene_dir if scene_dir.exists() and scene_dir.is_dir() else proxy_folder
-        debug_print(log_path, f"[FIND FOLDER] Using search directory for azure frames: {search_dir}")
+        search_dir = scene_dir if scene_dir.exists() and scene_dir.is_dir() else None
 
-        for file_path in search_dir.iterdir():
-            if file_path.is_file() and file_path.suffix.lower() in {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}:
-                all_matching_files.append(str(file_path))
-                debug_print(log_path, f"[FIND FOLDER] Found vision frame: {file_path}")
+        # First attempt: search inside scenes_images
+        if search_dir:
+            debug_print(log_path, f"[FIND FOLDER] Trying scenes_images directory: {search_dir}")
+            for file_path in search_dir.iterdir():
+                if file_path.is_file() and file_path.suffix.lower() in {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}:
+                    all_matching_files.append(str(file_path))
+                    debug_print(log_path, f"[FIND FOLDER] Found vision frame in scenes_images: {file_path}")
+
+        # Fallback: if nothing found, search in proxy_folder itself
+        if not all_matching_files:
+            debug_print(log_path, f"[FIND FOLDER] scenes_images empty. Falling back to proxy folder: {proxy_folder}")
+            for file_path in proxy_folder.iterdir():
+                if file_path.is_file() and file_path.suffix.lower() in {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}:
+                    all_matching_files.append(str(file_path))
+                    debug_print(log_path, f"[FIND FOLDER] Found fallback vision frame: {file_path}")
     
     debug_print(log_path, f"[FIND FOLDER] Total matching files found: {len(all_matching_files)}")
     return all_matching_files if all_matching_files else None
@@ -629,29 +707,48 @@ def read_csv_records(csv_path, logging_path, extensions = [], file_size_limit = 
 def calculate_total_size(records, config, proxy_map=None):
     total_size = 0
     upload_type = config.get("upload_type", "video_proxy")
+
     for r in records:
+        # Resolve actual source path
         if "/./" in r[0]:
             src = r[0].split("/./")[-1]
             full_path = os.path.join(r[0].split("/./")[0], src)
         else:
             full_path = r[0]
 
+        # When in PROXY mode
         if config["mode"] == "proxy":
-            if upload_type == "sprite_sheet":
-                # New behavior - multiple files
-                proxy_files = proxy_map.get(full_path) if proxy_map else None
-                if proxy_files and isinstance(proxy_files, list):
-                    logging.debug(f"[SIZE CALC] Counting files for {full_path}: {proxy_files}")
-                    for file_path in proxy_files:
-                        if os.path.exists(file_path):
+            proxy = proxy_map.get(full_path) if proxy_map else None
+
+            # ----------------------------------------------------
+            # CASE 1: upload types that produce MULTIPLE FILES
+            # ----------------------------------------------------
+            if upload_type in ("sprite_sheet", "video_proxy_sample_scene_change"):
+                if proxy and isinstance(proxy, list):
+                    logging.debug(f"[SIZE CALC] Counting files for {full_path}: {proxy}")
+                    for file_path in proxy:
+                        if file_path and os.path.exists(file_path):
                             total_size += os.path.getsize(file_path)
-            else:
-                # Original behavior - single file
-                proxy = proxy_map.get(full_path) if proxy_map else None
-                if proxy and os.path.exists(proxy):
+                # If proxy missing → count 0 (silent)
+                continue
+
+            # ----------------------------------------------------
+            # CASE 2: Normal single-file proxy
+            # ----------------------------------------------------
+            if isinstance(proxy, list):
+                # Safety fallback: treat multiple as sum
+                for fp in proxy:
+                    if fp and os.path.exists(fp):
+                        total_size += os.path.getsize(fp)
+                continue
+
+            if proxy and isinstance(proxy, (str, bytes, os.PathLike)):
+                if os.path.exists(proxy):
                     total_size += os.path.getsize(proxy)
-                else:
-                    total_size += 0  # Missing proxy, count as 0
+
+        # --------------------------------------------------------
+        # CASE 3: Local file upload mode (non-proxy)
+        # --------------------------------------------------------
         elif os.path.exists(full_path):
             total_size += os.path.getsize(full_path)
 
@@ -944,7 +1041,7 @@ def process_ai_proxy_lookup(config):
     if not config.get("ai_proxy_lookup_only", False):
         exts = config.get("extensions", [])
         file_size_limit = config.get("original_file_size_limit") if config.get("mode") == "original" else None
-        current_records = read_csv_records(config["files_list"], logging_path, exts, file_size_limit)
+        current_records = read_csv_records(config["files_list"], logging_path)
 
     # Deduplicate by base source path (normalize /./)
     seen = set()
@@ -995,7 +1092,7 @@ def process_ai_proxy_lookup(config):
         proxy_path = proxy_map.get(base_source_path)
         if proxy_path and os.path.exists(proxy_path):
             try:
-                save_extended_metadata(config, catalog_clean, None, proxy_path, "fabric_proxy")
+                save_extended_metadata(config, catalog_clean, None, proxy_path, "Fabric AI-Proxy")
                 success_count += 1
                 debug_print(logging_path, f"[AI PROXY SUCCESS] {base_source_path} -> {proxy_path}")
             except Exception as e:
@@ -1083,22 +1180,31 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
             dir_path = ""
 
         # Compute resolved ID
-        if "upload_path" in config and config["upload_path"]:
-            base_path = config["upload_path"]
-            logical_base = base_path.split(":", 1)[-1] if ":" in base_path else base_path
-            normalized_folder_key = os.path.normpath(os.path.join(logical_base, dir_path))
-        else:
-            # If no upload_path, use "/" as the base and dir_path directly
-            logical_base = "/"
-            normalized_folder_key = os.path.join("/", dir_path) if dir_path else "/"
-
-        # Special handling for twelvelabs: always use root resolved ID
-        if config.get("provider") == "twelvelabs":
-            upload_path_id = resolved_ids.get(logical_base)
-        elif config["provider"] not in PROVIDERS_SUPPORTING_GET_BASE_TARGET:
+        if upload_type == "video_proxy_sample_scene_change":
             upload_path_id = None
+            normalized_folder_key = "/"
         else:
-            upload_path_id = resolved_ids.get(normalized_folder_key, list(resolved_ids.values())[0])
+            # Extract relative folder path for resolved_ids lookup
+            if "/./" in original_source_path:
+                _, sub_path = original_source_path.split("/./", 1)
+                dir_path = os.path.dirname(sub_path)
+            else:
+                dir_path = ""
+
+            if "upload_path" in config and config["upload_path"]:
+                base_path = config["upload_path"]
+                logical_base = base_path.split(":", 1)[-1] if ":" in base_path else base_path
+                normalized_folder_key = os.path.normpath(os.path.join(logical_base, dir_path))
+            else:
+                logical_base = "/"
+                normalized_folder_key = os.path.join("/", dir_path) if dir_path else "/"
+
+            if config.get("provider") == "twelvelabs":
+                upload_path_id = resolved_ids.get(logical_base)
+            elif config["provider"] not in PROVIDERS_SUPPORTING_GET_BASE_TARGET:
+                upload_path_id = None
+            else:
+                upload_path_id = resolved_ids.get(normalized_folder_key, list(resolved_ids.values())[0])
 
         debug_print(config['logging_path'], f"[PATH-MATCH] {normalized_folder_key} -> using ID {upload_path_id}")
 
@@ -1185,6 +1291,14 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
 
         elif upload_type == "video_proxy_sample_scene_change" and config["mode"] == "proxy":
             base_source_path = os.path.join(*original_source_path.split("/./")) if "/./" in original_source_path else original_source_path
+            advanced_config = get_advanced_ai_config(config.get('cloud_config_name'), config.get('provider'))
+            # Safely get thread count; default to 2 if missing or invalid
+            frame_extraction_thread_count = 2
+            if isinstance(advanced_config, dict):
+                proposed = advanced_config.get("frame_extraction_thread_count")
+                if isinstance(proposed, int) and proposed > 0:
+                    frame_extraction_thread_count = min(proposed, 16)  # cap to avoid overload
+
             proxy_files = proxy_map.get(base_source_path) if proxy_map else None
             if not proxy_files or not isinstance(proxy_files, list):
                 msg = f"[Scene Detection] No scene frames for {base_source_path}"
@@ -1205,12 +1319,13 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
                 meta_left, meta_right = metaxtend_base, ""
 
             meta_left = meta_left.rstrip("/")            
-            metadata_dir = os.path.join(meta_left, meta_right, repo_guid, catalog_path_clean, provider)
-            os.makedirs(metadata_dir, exist_ok=True)
+            # Build metadata directory as a Path
+            metadata_dir = Path(os.path.join(meta_left, meta_right, repo_guid, catalog_path_clean, provider))
+            metadata_dir.mkdir(parents=True, exist_ok=True)
             base = os.path.splitext(os.path.basename(base_source_path))[0]
-            # physical metadata filepaths
-            raw_json = os.path.join(metadata_dir, f"{base}_raw.json")
-            norm_json = os.path.join(metadata_dir, f"{base}_norm.json")
+            raw_json = metadata_dir / f"{base}_raw.json"
+            norm_json = metadata_dir / f"{base}_norm.json"
+
             # return paths for saving to mongo
             raw_return = os.path.join(meta_right, repo_guid, catalog_path_clean, provider, f"{base}_raw.json")
             norm_return = os.path.join(meta_right, repo_guid, catalog_path_clean, provider, f"{base}_norm.json")
@@ -1231,69 +1346,119 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
             max_retries = config.get("max_frame_retries", 3)
             timeout = config.get("vision_timeout", 120)
 
+            # --- Begin multithreaded frame processing per scene ---
             for scene_no in sorted(scene_groups):
                 frames = []
-                # unpack subscene_no now as part of the tuple
-                for ts, subscene_no, fp in sorted(scene_groups[scene_no]):
-                    if dry_run:
-                        frames.append({
-                            "timestamp": ts,
-                            "subscene_no": subscene_no,
-                            "analysis": {},
-                            "embedding": [],
-                            "embedding_length": 0,
-                            "source_file": Path(fp).name
-                        })
-                        processed += 1
-                        continue
+                frame_tasks = [(ts, subscene_no, fp) for ts, subscene_no, fp in sorted(scene_groups[scene_no])]
 
-                    temp_out = metadata_dir / f"temp_{scene_no}_{ts}.json"
+                # Local worker function (required for ThreadPoolExecutor clarity and correctness)
+                def _process_frame_task(args):
+                    ts, subscene_no, fp = args
+                    if dry_run:
+                        return {
+                            "success": True,
+                            "data": {
+                                "timestamp": ts,
+                                "subscene_no": subscene_no,
+                                "analysis": {},
+                                "embedding": [],
+                                "embedding_length": 0,
+                                "source_file": Path(fp).name
+                            },
+                            "key": (ts, subscene_no),
+                            "fp": fp
+                        }
+
+                    temp_out = metadata_dir / f"temp_{scene_no}_{ts}_{subscene_no}.json"
                     success = False
+                    result_data = None
+
                     for attempt in range(max_retries):
                         try:
-                            cmd = ["python", config["script_path"], "-m", "analyze_and_embed", "-c", config["cloud_config_name"], "-sp", fp.replace("\\", "/"), "-o", str(temp_out), "--log-level", "debug", "--export-ai-metadata", "True"]
+                            cmd = ["python3", config["script_path"], "-m", "analyze_and_embed",
+                                   "-c", config["cloud_config_name"],
+                                   "-sp", fp.replace("\\", "/"),
+                                   "-o", str(temp_out),
+                                   "--log-level", "debug",
+                                   "--export-ai-metadata", "True"]
                             if config.get("provider") in PATH_BASED_PROVIDERS:
                                 cmd += ["--bucket-name", config["bucket"]]
                                 cmd += ["--upload-path", fp.replace("\\", "/")]
-                            debug_print(config["logging_path"], f"[VISION CMD] Attempt {attempt+1} for {fp}: {' '.join(cmd)}")
+
                             result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
                             debug_print(config["logging_path"], f" [return_code] {result.returncode} [VISION CMD OUTPUT] {result.stdout.strip()}")
                             if result.returncode == 0 and temp_out.exists() and temp_out.stat().st_size > 0:
                                 try:
                                     with open(temp_out, 'r', encoding='utf-8') as f:
                                         data = json.load(f)
-                                    if config.get("provider") == "azure_vision":
-                                        frames.append({
+                                    if config.get("provider") in ("google_vision", "azure_vision"):
+                                        result_data = {
                                             "timestamp": ts,
                                             "subscene_no": subscene_no,
                                             "analysis": data.get("analysis"),
                                             "embedding": data.get("embedding"),
                                             "embedding_length": data.get("embedding_length", 0),
                                             "source_file": Path(fp).name
-                                        })
-                                        success, processed = True, processed + 1
-                                        break
+                                        }
                                     else:
-                                        frames.append({
+                                        result_data = {
                                             "timestamp": ts,
                                             "subscene_no": subscene_no,
                                             "analysis": data,
                                             "source_file": Path(fp).name
-                                        })
-                                        success, processed = True, processed + 1
-                                        break
+                                        }
+                                    success = True
+                                    break
                                 except (UnicodeDecodeError, json.JSONDecodeError) as e:
                                     debug_print(config["logging_path"], f"[JSON/UTF8 ERROR] {temp_out}: {e}")
-                        except (subprocess.TimeoutExpired, Exception):
-                            pass
+                            else:
+                                debug_print(config["logging_path"], f"[VISION ERROR] Cmd failed with code {result.returncode} for {fp}: {result.stderr.strip()} with command {' '.join(cmd)}")
+                        except (subprocess.TimeoutExpired, Exception) as e:
+                            debug_print(config["logging_path"], f"[EXCEPTION] Frame task failed: {e}")
                         if attempt < max_retries - 1:
                             time.sleep(5 + attempt * 2)
-                    if not success:
-                        failed.append({"scene": scene_no, "subscene": subscene_no, "timestamp": ts, "file": fp})
                     temp_out.unlink(missing_ok=True)
+                    file_size = 0
+                    if success:
+                        try:
+                            file_size = os.path.getsize(fp)
+                        except (OSError, FileNotFoundError):
+                            file_size = 0
+                    return {
+                        "success": success,
+                        "data": result_data,
+                        "key": (ts, subscene_no),
+                        "fp": fp,
+                        "file_size": file_size
+                    }
+
+                # Execute tasks in thread pool
+
+                frame_results = []
+                with ThreadPoolExecutor(max_workers=frame_extraction_thread_count) as executor:
+                    futures = [executor.submit(_process_frame_task, task) for task in frame_tasks]
+                    for future in as_completed(futures):
+                        frame_results.append(future.result())
+                processedBytes = 0
+                # Restore original order
+                frame_results.sort(key=lambda r: r["key"])
+                for res in frame_results:
+                    if res["success"]:
+                        frames.append(res["data"])
+                        processed += 1
+                        processedBytes += res["file_size"]
+                    else:
+                        failed.append({
+                            "scene": scene_no,
+                            "subscene": res["key"][1],
+                            "timestamp": res["key"][0],
+                            "file": res["fp"]
+                        })
 
                 if frames:
                     all_scenes.append({"scene_no": scene_no, "frame_count": len(frames), "frames": frames})
+
+            # --- End multithreaded block ---
 
             if not dry_run:
                 output_data = {
@@ -1311,7 +1476,7 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
                     try:
                         # RAW write
                         with open(raw_json, "w", encoding="utf-8") as f:
-                            json.dump(output_data, f, ensure_ascii=False, indent=4)
+                            json.dump(output_data, f, ensure_ascii=False, indent=2)
                         raw_success = True
 
                         # NORMALIZED write
@@ -1338,13 +1503,17 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
                 debug_print(config["logging_path"], f"[DRY RUN] Would write to {raw_json} and {norm_json}")
 
             progressDetails["processedFiles"] += 1
+            progressDetails["processedBytes"] += processedBytes
             send_progress(progressDetails, config["repo_guid"])
 
             if processed == 0:
+                debug_print(config["logging_path"], f"[SCENE BASED EXTRACTION FAILURE] {base_source_path} | No frames succeeded")
                 return {"status": "failure", "file": base_source_path, "error": "No frames succeeded", "record": record}
             elif failed:
+                debug_print(config["logging_path"], f"[SCENE BASED EXTRACTION PARTIAL SUCCESS] {base_source_path} | Failed frames: {len(failed)}")
                 return {"status": "partial_success", "file": base_source_path, "output": str(raw_json), "processed": processed, "failed": len(failed), "record": record}
             else:
+                debug_print(config["logging_path"], f"[SCENE BASED EXTRACTION SUCCESS] {base_source_path}")
                 return {"status": "success", "file": base_source_path, "output": str(raw_json), "processed": processed, "record": record}
 
         else:
@@ -1527,7 +1696,7 @@ def process_csv_and_upload(config, dry_run=False):
         pc.update_run(10,"AI Proxy Lookup phase completed.", "Processing")
 
     # Early exit if ONLY proxy lookup is requested
-    if config.get("ai_proxy_store_enabled") is True and not config.get("provider"):
+    if config.get("ai_proxy_store_enabled") == True and config.get("provider") == "":
         debug_print(logging_path, "[AI PROXY ONLY MODE] Skipping upload and metadata stages.")
         progressDetails["status"] = "Complete"
         send_progress(progressDetails, repo_guid)
@@ -1629,7 +1798,6 @@ def process_csv_and_upload(config, dry_run=False):
                 )
                 for record in combined_records
             ]
-
             completed = 0
 
             for future in futures:
@@ -1741,6 +1909,8 @@ if __name__ == '__main__':
     export_ai_metadata = request_data.get("export_ai_metadata")
     if export_ai_metadata and str(export_ai_metadata).lower() in ("1","true","yes"):
         request_data["export"] = True
+        
+    request_data["ai_proxy_store_enabled"] = True if str(request_data.get("ai_proxy_store_enabled","")).lower() in ("1","true","yes") else False
 
     if mode in ("original"):
         optional_keys.append("original_file_size_limit")
@@ -1776,10 +1946,8 @@ if __name__ == '__main__':
         print(f"No script path found for provider: {provider}")
         sys.exit(1)
 
-    full_script_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), script_path
-    )
-    request_data["script_path"] = full_script_path
+    
+    request_data["script_path"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), script_path) if provider and str(provider).strip() else ""
     
     # crete process reporter instance
     pc.create_config(
