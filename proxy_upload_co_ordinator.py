@@ -1164,6 +1164,51 @@ def save_extended_metadata(config, file_path, rawMetadataFilePath, normMetadataF
             time.sleep(delay)
     return False  
 
+def transform_normlized_to_enriched(norm_metadata_file_path):
+    try:
+        with open(norm_metadata_file_path, "r") as f:
+            data = json.load(f)
+        result = []
+        for event_type, detections in data.items():
+            for detection in detections:
+                event_obj = {
+                    "eventType": event_type,
+                    "eventValue": detection.get("value", ""),
+                    "totalOccurrences": len(detection.get("occurrences", [])),
+                    "eventOccurence": detection.get("occurrences", [])
+                }
+                result.append(event_obj)
+       
+        return result, True
+    except Exception as e:
+        return f"Error during transformation: {e}", False
+
+def send_ai_enriched_metadata(config, repo_guid, file_path, enrichedMetadata, max_attempts=3):
+    url = "http://127.0.0.1:5080/catalogs/aiEnrichedMetadata"
+    node_api_key = get_node_api_key()
+    headers = {"apikey": node_api_key, "Content-Type": "application/json"}
+    payload = {
+        "repoGuid": repo_guid,
+        "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
+        "fileName": os.path.basename(file_path),
+        "providerName": config.get("provider"),
+        "normalizedMetadata": enrichedMetadata
+    }
+
+    for attempt in range(max_attempts):
+        try:
+            r = make_request_with_retries("POST", url, headers=headers, json=payload)
+            if r and r.status_code in (200, 201):
+                return True
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to send metadata after 3 attempts: {e}")
+                raise
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return False
+
 def upload_worker(record, config, resolved_ids, progressDetails, transferred_log, issues_log, client_log, proxy_map=None):
     try:
         debug_print(config['logging_path'], f"[STEP] Processing record: {record}")
@@ -1293,11 +1338,18 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
             base_source_path = os.path.join(*original_source_path.split("/./")) if "/./" in original_source_path else original_source_path
             advanced_config = get_advanced_ai_config(config.get('cloud_config_name'), config.get('provider'))
             # Safely get thread count; default to 2 if missing or invalid
+            # total_logical_cpus = os.cpu_count() or 4
+            # upload_threads = config.get("thread_count", 2)
+            # safe_frame_threads = max(1, (total_logical_cpus - 1) // upload_threads)
+            # frame_extraction_thread_count = min(
+            #     advanced_config.get("frame_extraction_thread_count", 2) if isinstance(advanced_config, dict) else 2,
+            #     safe_frame_threads
+            # )
             frame_extraction_thread_count = 2
             if isinstance(advanced_config, dict):
                 proposed = advanced_config.get("frame_extraction_thread_count")
                 if isinstance(proposed, int) and proposed > 0:
-                    frame_extraction_thread_count = min(proposed, 16)  # cap to avoid overload
+                    frame_extraction_thread_count = min(proposed, os.cpu_count() *2) 
 
             proxy_files = proxy_map.get(base_source_path) if proxy_map else None
             if not proxy_files or not isinstance(proxy_files, list):
@@ -1347,6 +1399,7 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
             timeout = config.get("vision_timeout", 120)
 
             # --- Begin multithreaded frame processing per scene ---
+            total_processed_bytes = 0
             for scene_no in sorted(scene_groups):
                 frames = []
                 frame_tasks = [(ts, subscene_no, fp) for ts, subscene_no, fp in sorted(scene_groups[scene_no])]
@@ -1419,11 +1472,10 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
                             time.sleep(5 + attempt * 2)
                     temp_out.unlink(missing_ok=True)
                     file_size = 0
-                    if success:
-                        try:
-                            file_size = os.path.getsize(fp)
-                        except (OSError, FileNotFoundError):
-                            file_size = 0
+                    try:
+                        file_size = os.path.getsize(fp)
+                    except (OSError, FileNotFoundError):
+                        file_size = 0
                     return {
                         "success": success,
                         "data": result_data,
@@ -1439,14 +1491,14 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
                     futures = [executor.submit(_process_frame_task, task) for task in frame_tasks]
                     for future in as_completed(futures):
                         frame_results.append(future.result())
-                processedBytes = 0
+                scene_processed_bytes = 0
                 # Restore original order
                 frame_results.sort(key=lambda r: r["key"])
                 for res in frame_results:
                     if res["success"]:
                         frames.append(res["data"])
                         processed += 1
-                        processedBytes += res["file_size"]
+                        scene_processed_bytes += res.get("file_size", 0)
                     else:
                         failed.append({
                             "scene": scene_no,
@@ -1457,7 +1509,7 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
 
                 if frames:
                     all_scenes.append({"scene_no": scene_no, "frame_count": len(frames), "frames": frames})
-
+                total_processed_bytes += scene_processed_bytes
             # --- End multithreaded block ---
 
             if not dry_run:
@@ -1497,13 +1549,26 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
                 if raw_success or norm_success:
                     try:
                         save_extended_metadata(config,catalog_path_clean,raw_return if raw_success else None,norm_return if norm_success else None)
+                        
+                        if norm_success:
+                            try:
+                                enriched, enrich_success = transform_normlized_to_enriched(norm_json)
+                                if enrich_success and send_ai_enriched_metadata(config ,args.repo_guid, catalog_path_clean, enriched):
+                                    logging.info("AI enriched metadata sent successfully.")
+                                else:
+                                    logging.error("AI enriched metadata send failed — skipping.")
+                            except Exception:
+                                logging.warning("AI enriched metadata transform failed — skipping.")
+                        else:
+                            logging.info("Normalized metadata not present — skipping AI enrichment.")                        
+                        
                     except Exception as e:
                         logging.error(f"Failed to save extended metadata for {base_source_path}: {e}")
             else:
                 debug_print(config["logging_path"], f"[DRY RUN] Would write to {raw_json} and {norm_json}")
 
             progressDetails["processedFiles"] += 1
-            progressDetails["processedBytes"] += processedBytes
+            progressDetails["processedBytes"] += total_processed_bytes
             send_progress(progressDetails, config["repo_guid"])
 
             if processed == 0:

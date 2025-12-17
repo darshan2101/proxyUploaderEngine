@@ -11,20 +11,21 @@ import xml.etree.ElementTree as ET
 from configparser import ConfigParser
 import random
 import time
-from action_functions import flatten_dict
+import subprocess
 from requests.adapters import HTTPAdapter
 from requests.exceptions import RequestException, SSLError, ConnectionError, Timeout
 
 # Constants
 VALID_MODES = ["proxy", "original", "get_base_target", "send_extracted_metadata"]
 CHUNK_SIZE = 5 * 1024 * 1024
-LINUX_CONFIG_PATH = r"D:\Dev\(python +node) Wrappers\proxyUploaderEngine\DNAClientServices.conf"
+LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
 RUBICX_BASE_URL = "https://api.rubicx.ai"
+NORMALIZER_SCRIPT_PATH = "/opt/sdna/bin/rubicx_metadata_normalizer.py"
 
 # Detect platform
-IS_LINUX = True
+IS_LINUX = os.path.isdir("/opt/sdna/bin")
 DNA_CLIENT_SERVICES = LINUX_CONFIG_PATH if IS_LINUX else MAC_CONFIG_PATH
 
 logger = logging.getLogger()
@@ -92,6 +93,126 @@ def get_link_address_and_port():
         sys.exit(5)
     logging.info(f"Server connection details - Address: {ip}, Port: {port}")
     return ip, port
+
+def get_store_paths():
+    metadata_store_path, proxy_store_path = "", ""
+    try:
+        config_path = "/opt/sdna/nginx/ai-config.json"
+        if not os.path.exists(config_path):
+            logger.error(f"AI config file not found: {config_path}")
+            exit(5)
+        with open(config_path, 'r') as f:
+            config_data = json.load(f)
+            metadata_store_path = config_data.get("ai_export_shared_drive_path", "")
+            proxy_store_path = config_data.get("ai_proxy_shared_drive_path", "")
+            logging.info(f"Metadata Store Path: {metadata_store_path}, Proxy Store Path: {proxy_store_path}")
+        
+    except Exception as e:
+        logging.error(f"Error reading Metadata Store or Proxy Store settings: {e}")
+        sys.exit(5)
+
+    if not metadata_store_path or not proxy_store_path:
+        logging.info("Store settings not found.")
+        sys.exit(5)
+
+    return metadata_store_path, proxy_store_path
+
+def get_rubicx_normalized_metadata(raw_metadata_file_path, norm_metadata_file_path):
+
+    if not os.path.exists(NORMALIZER_SCRIPT_PATH):
+        logging.error(f"Normalizer script not found: {NORMALIZER_SCRIPT_PATH}")
+        return False
+    
+    try:
+        process = subprocess.run(
+            ["python3", NORMALIZER_SCRIPT_PATH, "-i", raw_metadata_file_path, "-o", norm_metadata_file_path],
+            check=True
+        )
+        if process.returncode == 0:
+            return True
+        else:
+            logging.error(f"Normalizer script failed with return code: {process.returncode}")
+            return False
+    except Exception as e:
+        logging.error(f"Error normalizing metadata: {e}")
+        return False
+
+
+def get_admin_dropbox_path():
+    try:
+        if IS_LINUX:
+            parser = ConfigParser()
+            parser.read(DNA_CLIENT_SERVICES)
+            log_path = parser.get('General', 'LogPath', fallback='').strip()
+        else:
+            with open(DNA_CLIENT_SERVICES, 'rb') as fp:
+                cfg = plistlib.load(fp) or {}
+                log_path = str(cfg.get("LogPath", "")).strip()
+        
+        if log_path:
+            logging.info(f"Admin dropbox path from LogPath: {log_path}")
+            return log_path
+        else:
+            logging.warning("LogPath not found in DNAClientServices config")
+            return None
+    except Exception as e:
+        logging.error(f"Error reading admin dropbox path: {e}")
+        return None
+
+def get_advanced_ai_config(config_name):
+    admin_dropbox = get_admin_dropbox_path()
+    if not admin_dropbox:
+        logging.debug("Admin dropbox path not available, skipping advanced AI config check")
+        return None
+    config_file_path = os.path.join(admin_dropbox, "AdvancedAiExport", "Configs", f"{config_name}.json")
+    logging.debug(f"Checking for advanced AI config at: {config_file_path}")
+    
+    if not os.path.exists(config_file_path):
+        logging.debug(f"Advanced AI config file not found: {config_file_path}")
+        return None
+    
+    try:
+        with open(config_file_path, 'r') as f:
+            config_data = json.load(f)
+        
+        # Validate that config_data is a dictionary
+        if not isinstance(config_data, dict):
+            logging.error(f"Invalid JSON format in {config_file_path}: expected object/dict, got {type(config_data).__name__}")
+            return None
+        
+        nth_frame_enabled = config_data.get("nth_frame_extraction_enabled", False)
+        nth_frame = config_data.get("nth_frame")
+        
+        # Validate nth_frame is a positive integer if provided
+        if nth_frame is not None:
+            try:
+                nth_frame = int(nth_frame)
+                if nth_frame <= 0:
+                    logging.error(f"Invalid nth_frame value in {config_file_path}: must be positive integer, got {nth_frame}")
+                    return None
+            except (ValueError, TypeError):
+                logging.error(f"Invalid nth_frame value in {config_file_path}: must be integer, got {nth_frame}")
+                return None
+        
+        if nth_frame_enabled and nth_frame:
+            logging.info(f"Advanced AI config found: nth_frame_extraction_enabled=True, nth_frame={nth_frame}")
+            return {
+                "nth_frame_extraction_enabled": nth_frame_enabled,
+                "nth_frame": nth_frame
+            }
+        else:
+            logging.debug(f"Advanced AI config exists but nth_frame_extraction_enabled={nth_frame_enabled}, nth_frame={nth_frame}")
+            return None
+    
+    except json.JSONDecodeError as e:
+        logging.error(f"Invalid JSON in advanced AI config file {config_file_path}: {e}")
+        return None
+    except IOError as e:
+        logging.error(f"Error reading advanced AI config file {config_file_path}: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"Unexpected error processing advanced AI config file {config_file_path}: {e}")
+        return None
 
 def get_cloud_config_path():
     if IS_LINUX:
@@ -230,27 +351,106 @@ def update_catalog(repo_guid, file_path, media_id, max_attempts=3):
     logging.error("Catalog update failed after retries.")
     return False
 
-def send_extracted_metadata(repo_guid, file_path, metadata, max_attempts=3):
+def store_metadata_file(config, repo_guid, file_path, metadata, max_attempts=3):
+    meta_path, proxy_path = get_store_paths()
+    if not meta_path:
+        logging.error("Metadata Store settings not found.")
+        return None, None
+
+    provider = config.get("provider", "rubicx")
+    base = os.path.splitext(os.path.basename(file_path))[0]
+    repo_guid_str = str(repo_guid)
+
+    # -----------------------------------------
+    # 1. Split meta_path at /./
+    # -----------------------------------------
+    if "/./" in meta_path:
+        meta_left, meta_right = meta_path.split("/./", 1)
+    else:
+        meta_left, meta_right = meta_path, ""
+
+    meta_left = meta_left.rstrip("/")
+
+    # -----------------------------------------
+    # 2. Build PHYSICAL PATH (local disk path) meta_left/meta_right/repo_guid/file_path/provider
+    # -----------------------------------------
+    metadata_dir = os.path.join(meta_left, meta_right, repo_guid_str, file_path, provider)
+    os.makedirs(metadata_dir, exist_ok=True)
+
+    # Full local physical paths
+    raw_json = os.path.join(metadata_dir, f"{base}_raw.json")
+    norm_json = os.path.join(metadata_dir, f"{base}_norm.json")
+
+    # -----------------------------------------
+    # 3. Returned paths (AFTER /./) meta_right/repo_guid/file_path/provider/file.json
+    # -----------------------------------------
+    raw_return = os.path.join(meta_right, repo_guid_str, file_path, provider, f"{base}_raw.json")
+    norm_return = os.path.join(meta_right, repo_guid_str, file_path, provider, f"{base}_norm.json")
+
+    raw_success = False
+    norm_success = False
+
+    # -----------------------------------------
+    # 4. Write metadata with retry
+    # -----------------------------------------
+    for attempt in range(max_attempts):
+        try:
+            # RAW write
+            with open(raw_json, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=4)
+            raw_success = True
+
+            # NORMALIZED write
+            if not get_rubicx_normalized_metadata(raw_json, norm_json):
+                logging.error("Normalization failed.")
+                norm_success = False
+            else:
+                norm_success = True
+
+            break  # No need for more retries
+
+        except Exception as e:
+            logging.warning(f"Metadata write failed (Attempt {attempt+1}): {e}")
+            if attempt < max_attempts - 1:
+                time.sleep([1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt]))
+
+    # -----------------------------------------
+    # 5. Return results
+    # -----------------------------------------
+    return (
+        raw_return if raw_success else None,
+        norm_return if norm_success else None
+    )
+
+def send_extracted_metadata(config, repo_guid, file_path, rawMetadataFilePath, normMetadataFilePath=None, max_attempts=3):
     url = "http://127.0.0.1:5080/catalogs/extendedMetadata"
     node_api_key = get_node_api_key()
     headers = {"apikey": node_api_key, "Content-Type": "application/json"}
     payload = {
         "repoGuid": repo_guid,
-        "providerName": "rubicx",
+        "providerName": config.get("provider", "rubicx"),
         "extendedMetadata": [{
             "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
-            "fileName": os.path.basename(file_path),
-            "metadata": flatten_dict(metadata)
+            "fileName": os.path.basename(file_path)
         }]
     }
-    for _ in range(max_attempts):
+    if rawMetadataFilePath is not None:
+        payload["extendedMetadata"][0]["metadataRawJsonFilePath"] = rawMetadataFilePath
+    if normMetadataFilePath is not None:
+        payload["extendedMetadata"][0]["metadataFilePath"] = normMetadataFilePath
+    for attempt in range(max_attempts):
         try:
             r = make_request_with_retries("POST", url, headers=headers, json=payload)
             if r and r.status_code in (200, 201):
                 return True
         except Exception as e:
-            logging.warning(f"Metadata send error: {e}")
-    return False
+            if attempt == 2:
+                logging.critical(f"Failed to send metadata after 3 attempts: {e}")
+                raise
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return False 
 
 # --- Rubicx-specific functions with retry logic ---
 def upload_asset(api_key, file_path, max_attempts=3):
@@ -334,48 +534,54 @@ def start_analysis(api_key, video_id, max_attempts=3):
             else:
                 raise
 
-def poll_analysis_progress(api_key, video_id, max_wait=3600, interval=5, max_attempts=3):
+def poll_analysis_progress(api_key, video_id, max_wait=1200, interval=5, max_attempts=3):
     headers = {"X-API-Key": api_key}
     params = {"api_key": api_key}
-    deadline = time.time() + max_wait
     progress_url = f"{RUBICX_BASE_URL}/api/videos/{video_id}/analysis/progress"
+
     logging.info("Step 3: Polling analysis progress (20-min timeout)...")
 
     for outer_attempt in range(max_attempts):
+        deadline = time.time() + max_wait
         try:
             while time.time() < deadline:
-                try:
-                    resp = make_request_with_retries("GET", progress_url, headers=headers, params=params, timeout=(10, 30))
-                    if resp and resp.status_code == 200:
-                        data = resp.json()
-                        status = data.get("status")
-                        progress_pct = data.get("progress", 0)
-                        error_msg = data.get("error")
+                resp = make_request_with_retries("GET", progress_url, headers=headers, params=params, timeout=(10, 30))
 
-                        logging.info(f"Analysis progress: {status} ({progress_pct}%)")
-                        if error_msg:
-                            logging.error(f"Analysis failed with error: {error_msg}")
+                if not resp or resp.status_code != 200:
+                    logging.warning("Invalid progress response, retrying...")
+                    time.sleep(interval)
+                    continue
 
-                        if status == "completed":
-                            logging.info("Step 3: Analysis progress completed.")
-                            return True
-                        elif status == "failed":
-                            logging.critical("Analysis permanently failed. Aborting.")
-                            return False
-                except Exception as e:
-                    logging.debug(f"Progress polling error: {e}")
+                data = resp.json()
+                status = data.get("status")
+                progress_pct = data.get("progress", 0)
+                error_msg = data.get("error")
+
+                logging.info(f"Analysis progress: {status} ({progress_pct}%)")
+
+                if error_msg:
+                    logging.error(f"Analysis error: {error_msg}")
+
+                if status == "completed":
+                    logging.info("Analysis completed successfully.")
+                    return True
+
+                if status == "failed":
+                    logging.critical("Analysis permanently failed.")
+                    return False
 
                 time.sleep(interval)
-            else:
-                raise TimeoutError("Analysis progress timeout (20 min)")
 
-        except (TimeoutError, Exception) as e:
-            logging.warning(f"Polling outer attempt {outer_attempt + 1} failed: {e}")
+            logging.error("Analysis progress timed out.")
+            return False
+
+        except Exception as e:
+            logging.warning(f"Polling attempt {outer_attempt + 1} failed: {e}")
             if outer_attempt < max_attempts - 1:
                 backoff = [5, 15, 30][outer_attempt] + random.uniform(0, 2)
                 time.sleep(backoff)
             else:
-                raise
+                return False
 
 def fetch_batch_results(api_key, video_id, max_attempts=7, base_interval=60, max_allowed_eta_seconds=3600):
     url = f"{RUBICX_BASE_URL}/api/videos/{video_id}/batch-results"
@@ -434,25 +640,53 @@ def fetch_batch_results(api_key, video_id, max_attempts=7, base_interval=60, max
     logging.error("Batch results did not complete within retry window.")
     return False
 
-def fetch_metadata(api_key, video_id, max_attempts=3):
+def fetch_metadata(api_key, video_id, n_th_frame=None, max_attempts=3, page_limit=1000):
     url = f"{RUBICX_BASE_URL}/api/videos/{video_id}/metadata"
     headers = {"X-API-Key": api_key}
-    params = {"api_key": api_key}
 
-    for attempt in range(max_attempts):
-        try:
-            response = make_request_with_retries("GET", url, headers=headers, params=params, timeout=(10, 30))
-            if response and response.status_code == 200:
-                return response.json()
-            else:
-                raise RuntimeError(f"Metadata fetch failed: {response.status_code if response else 'No response'}")
-        except Exception as e:
-            logging.warning(f"Fetch metadata attempt {attempt + 1} failed: {e}")
-            if attempt < max_attempts - 1:
-                delay = [1, 3, 10][attempt] + random.uniform(0, 1)
-                time.sleep(delay)
-            else:
-                raise
+    def req(offset):
+        params = {
+            "api_key": api_key,
+            "include_frames": "true",
+            "limit": page_limit,
+            "offset": offset
+        }
+        for i in range(max_attempts):
+            try:
+                r = make_request_with_retries("GET", url, headers=headers, params=params, timeout=(10,30))
+                if r and r.status_code == 200: return r.json()
+                raise RuntimeError(f"HTTP {r.status_code if r else 'None'}")
+            except Exception:
+                if i == max_attempts - 1: raise
+                time.sleep([1,3,10][min(i,2)] + random.random())
+
+    # first page
+    first = req(0)
+    meta = {k:v for k,v in first.items() if k!="frames"}
+    total = first.get("total_frames") or len(first.get("frames") or [])
+    frames = first.get("frames") or []
+
+    # sampling function
+    filt = (lambda f: f.get("frame_number",0) % n_th_frame == 0) if n_th_frame else (lambda f: True)
+
+    sampled = [f for f in frames if filt(f)]
+
+    if len(frames) < page_limit:  # no pagination needed
+        meta["frames"] = sampled
+        meta["total_frames"] = total
+        return meta
+
+    # paginate
+    offset = page_limit
+    while offset < total:
+        chunk = req(offset).get("frames") or []
+        sampled.extend(f for f in chunk if filt(f))
+        if len(chunk) < page_limit: break
+        offset += page_limit
+
+    meta["frames"] = sampled
+    meta["total_frames"] = total
+    return meta
 
 def add_custom_metadata(api_key, asset_id, metadata, max_attempts=3):
     url = f"{RUBICX_BASE_URL}/v2/metadata/upload?video_id={asset_id}"
@@ -533,6 +767,15 @@ if __name__ == '__main__':
         logging.error("API key not found in config.")
         sys.exit(1)
 
+    # Check for advanced AI export configuration
+    advanced_ai_config = get_advanced_ai_config(args.config_name)
+    nth_frame_param = None
+    if advanced_ai_config and advanced_ai_config.get("nth_frame_extraction_enabled"):
+        nth_frame_param = advanced_ai_config.get("nth_frame")
+        logging.info(f"Using nth_frame extraction with value: {nth_frame_param}")
+    else:
+        logging.debug("Using full frame extraction (no nth_frame filtering)")
+
     if args.mode == "send_extracted_metadata":
         if not (args.asset_id and args.repo_guid and args.catalog_path):
             logging.error("Asset ID, Repo GUID, and Catalog path required for send_extracted_metadata mode.")
@@ -542,14 +785,16 @@ if __name__ == '__main__':
             logging.error("Batch processing not completed. Cannot fetch metadata.")
             print(f"Metadata extraction failed for asset: {args.asset_id}")
             sys.exit(7)
-        metadata = fetch_metadata(api_key, args.asset_id)
+        ai_metadata = fetch_metadata(api_key, args.asset_id, n_th_frame=nth_frame_param)
         clean_path = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
-        if send_extracted_metadata(args.repo_guid, clean_path, metadata):
-            logging.info("Extracted metadata sent successfully.")
-            sys.exit(0)
-        else:
-            logging.error("Failed to send extracted metadata.")
-            sys.exit(1)
+        if ai_metadata:
+            raw_metadata_path, norm_metadata_path = store_metadata_file(cloud_config_data, args.repo_guid, clean_path, ai_metadata)
+            if send_extracted_metadata(cloud_config_data, args.repo_guid, clean_path, raw_metadata_path, norm_metadata_path):
+                logging.info("Extracted metadata sent successfully.")
+                sys.exit(0)
+            else:
+                logging.error("Failed to send extracted metadata.")
+                sys.exit(7)
 
     matched_file = args.source_path
     if not matched_file or not os.path.exists(matched_file):
@@ -566,24 +811,24 @@ if __name__ == '__main__':
         except ValueError:
             logging.warning(f"Invalid size limit: {args.size_limit}")
 
-    # catalog_path = args.catalog_path or matched_file
-    # file_name_for_url = extract_file_name(matched_file) if args.mode == "original" else extract_file_name(catalog_path)
-    # rel_path = remove_file_name_from_path(catalog_path).replace("\\", "/")
-    # rel_path = rel_path.split("/1/", 1)[-1] if "/1/" in rel_path else rel_path
-    # catalog_url = urllib.parse.quote(rel_path)
-    # filename_enc = urllib.parse.quote(file_name_for_url)
-    # job_guid = args.job_guid or ""
+    catalog_path = args.catalog_path or matched_file
+    file_name_for_url = extract_file_name(matched_file) if args.mode == "original" else extract_file_name(catalog_path)
+    rel_path = remove_file_name_from_path(catalog_path).replace("\\", "/")
+    rel_path = rel_path.split("/1/", 1)[-1] if "/1/" in rel_path else rel_path
+    catalog_url = urllib.parse.quote(rel_path)
+    filename_enc = urllib.parse.quote(file_name_for_url)
+    job_guid = args.job_guid or ""
 
-    # if args.controller_address and ":" in args.controller_address:
-    #     client_ip, _ = args.controller_address.split(":", 1)
-    # else:
-    #     ip, _ = get_link_address_and_port()
-    #     client_ip = ip
+    if args.controller_address and ":" in args.controller_address:
+        client_ip, _ = args.controller_address.split(":", 1)
+    else:
+        ip, _ = get_link_address_and_port()
+        client_ip = ip
 
-    # backlink_url = f"{client_ip}/dashboard/projects/{job_guid}/browse&search?path={catalog_url}&filename={filename_enc}"
-    # logging.debug(f"Generated backlink URL: {backlink_url}")
+    backlink_url = f"{client_ip}/dashboard/projects/{job_guid}/browse&search?path={catalog_url}&filename={filename_enc}"
+    logging.debug(f"Generated backlink URL: {backlink_url}")
 
-    # clean_catalog_path = catalog_path.replace("\\", "/").split("/1/", 1)[-1]
+    clean_catalog_path = catalog_path.replace("\\", "/").split("/1/", 1)[-1]
 
     if args.dry_run:
         logging.info("[DRY RUN] Upload and analysis skipped.")
@@ -594,7 +839,7 @@ if __name__ == '__main__':
         try:
             video_id = upload_asset(api_key, matched_file)
             logging.info(f"Upload successful. Video ID: {video_id}")
-            # update_catalog(args.repo_guid, clean_catalog_path, video_id)
+            update_catalog(args.repo_guid, clean_catalog_path, video_id)
         except Exception as e:
             logging.critical(f"Upload failed: {e}")
             sys.exit(1)
@@ -602,42 +847,40 @@ if __name__ == '__main__':
         start_analysis(api_key, video_id)
         logging.info("Analysis started.")
         
-        # try:
-        #     meta_response = add_custom_metadata(
-        #         api_key,
-        #         video_id,
-        #         parse_metadata_file(args.metadata_file)
-        #     )
-        #     if meta_response.get("status_code") in (200, 201):
-        #         logging.info("Metadata uploaded successfully.")
-        #     else:
-        #         logging.error(f"Metadata upload failed: {meta_response.get('detail')}")
-        #         print("File uploaded, but metadata failed.")
-        # except Exception as e:
-        #     logging.warning(f"Metadata upload encountered error: {e}")        
+        try:
+            meta_response = add_custom_metadata(
+                api_key,
+                video_id,
+                parse_metadata_file(args.metadata_file)
+            )
+            if meta_response.get("status_code") in (200, 201):
+                logging.info("Metadata uploaded successfully.")
+            else:
+                logging.error(f"Metadata upload failed: {meta_response.get('detail')}")
+                print("File uploaded, but metadata failed.")
+        except Exception as e:
+            logging.warning(f"Metadata upload encountered error: {e}")        
 
         analysis_success = poll_analysis_progress(api_key, video_id)
         if not analysis_success:
             logging.error("Analysis failed permanently during processing.")
-            sys.exit(1)
+            print(f"Metadata extraction failed for asset: {video_id}")
+            sys.exit(7)
 
         if not fetch_batch_results(api_key, video_id):
             logging.error("Batch processing did not complete successfully.")
             print(f"Metadata extraction failed for asset: {video_id}")
             sys.exit(7)
+        ai_metadata = fetch_metadata(api_key, video_id, n_th_frame=nth_frame_param)
 
-        metadata = fetch_metadata(api_key, video_id)
-
-        if metadata:
-            output_file = "D:\\Dev\\(python +node) Wrappers\\proxyUploaderEngine\\switzerland_samples\\rubicx.json"
-            with open(output_file, "w", encoding="utf-8") as f:
-                json.dump(flatten_dict(metadata), f, ensure_ascii=False, indent=2)
-            logging.info("Rubicx metadata sent successfully.")
-            sys.exit(0)
-        else:
-            logging.error("Failed to send metadata to controller.")
-            print(f"Metadata send failed for asset: {video_id}")
-            sys.exit(7)
+        if ai_metadata:
+            raw_metadata_path, norm_metadata_path = store_metadata_file(cloud_config_data,args.repo_guid, clean_path, ai_metadata)
+            if send_extracted_metadata(cloud_config_data, args.repo_guid, clean_catalog_path, raw_metadata_path, norm_metadata_path):
+                logging.info("Extracted metadata sent successfully.")
+                sys.exit(0)
+            else:
+                logging.error("Failed to send extracted metadata.")
+                sys.exit(7)
 
     except Exception as e:
         logging.critical(f"Rubicx processing failed: {e}")

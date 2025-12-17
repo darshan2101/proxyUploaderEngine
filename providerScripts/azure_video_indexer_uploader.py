@@ -15,7 +15,7 @@ from configparser import ConfigParser
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, Tuple
-from action_functions import flatten_dict
+import subprocess
 
 # =============================
 # Constants
@@ -32,6 +32,7 @@ MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
 CONFLICT_RESOLUTION_MODES = ["skip", "overwrite", "reindex"]
 DEFAULT_CONFLICT_RESOLUTION = "skip"
+NORMALIZER_SCRIPT_PATH = "/opt/sdna/bin/azurevi_metadata_normalizer.py"
 
 # Detect platform
 IS_LINUX = os.path.isdir("/opt/sdna/bin")
@@ -54,6 +55,11 @@ def extract_file_name(path):
 
 def remove_file_name_from_path(path):
     return os.path.dirname(path)
+
+def fail(msg, code=7):
+    logger.error(msg)
+    print(f"Metadata extraction failed for asset: {args.asset_id}")
+    sys.exit(code)
 
 def get_link_address_and_port():
     """Read link_address and link_port from Servers.conf or plist"""
@@ -100,6 +106,50 @@ def get_cloud_config_path():
     logger.info(f"Using cloud config path: {path}")
     return path
 
+def get_admin_dropbox_path():
+    """Get LogPath from DNAClientServices config (used as admin dropbox root)"""
+    try:
+        if IS_LINUX:
+            parser = ConfigParser()
+            parser.read(DNA_CLIENT_SERVICES)
+            log_path = parser.get('General', 'LogPath', fallback='').strip()
+        else:
+            with open(DNA_CLIENT_SERVICES, 'rb') as fp:
+                cfg = plistlib.load(fp) or {}
+                log_path = str(cfg.get("LogPath", "")).strip()
+        return log_path or None
+    except Exception as e:
+        logging.error(f"Error reading admin dropbox path: {e}")
+        return None
+
+def get_advanced_ai_config(config_name, provider_name="azurevi"):
+    """Load Advanced AI config from admin dropbox or fallback to sample"""
+    admin_dropbox = get_admin_dropbox_path()
+    if not admin_dropbox:
+        return None
+
+    config_file = os.path.join(admin_dropbox, "AdvancedAiExport", "Configs", f"{config_name}.json")
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+                if isinstance(cfg, dict):
+                    return cfg
+        except Exception as e:
+            logging.error(f"Failed to load Advanced AI config: {e}")
+
+    sample_file = os.path.join(admin_dropbox, "AdvancedAiExport", "Samples", f"{provider_name}.json")
+    if os.path.exists(sample_file):
+        try:
+            with open(sample_file, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+                if isinstance(cfg, dict):
+                    return cfg
+        except Exception as e:
+            logging.error(f"Failed to load Advanced AI sample config: {e}")
+
+    return None
+
 def parse_metadata_file(properties_file):
     """Parse metadata from .json, .xml, or .csv/.txt (key,value) file"""
     props = {}
@@ -143,6 +193,26 @@ def parse_metadata_file(properties_file):
         return {}
 
     return props
+
+def get_store_paths():
+    metadata_store_path, proxy_store_path = "", ""
+    try:
+        config_path = "/opt/sdna/nginx/ai-config.json" if IS_LINUX else "/Library/Application Support/StorageDNA/nginx/ai-config.json"
+        with open(config_path, 'r') as f:
+            config_data = json.load(f)
+            metadata_store_path = config_data.get("ai_export_shared_drive_path", "")
+            proxy_store_path = config_data.get("ai_proxy_shared_drive_path", "")
+            logging.info(f"Metadata Store Path: {metadata_store_path}, Proxy Store Path: {proxy_store_path}")
+        
+    except Exception as e:
+        logging.error(f"Error reading Metadata Store or Proxy Store settings: {e}")
+        sys.exit(5)
+
+    if not metadata_store_path or not proxy_store_path:
+        logging.info("Store settings not found.")
+        sys.exit(5)
+
+    return metadata_store_path, proxy_store_path
 
 def get_retry_session(retries=3, backoff_factor_range=(1.0, 2.0)):
     session = requests.Session()
@@ -202,6 +272,46 @@ def get_node_api_key():
 
     logging.info("Successfully retrieved Node API key.")
     return api_key
+
+def get_azurevi_normalized_metadata(raw_metadata_file_path, norm_metadata_file_path):
+
+    if not os.path.exists(NORMALIZER_SCRIPT_PATH):
+        logging.error(f"Normalizer script not found: {NORMALIZER_SCRIPT_PATH}")
+        return False
+    
+    try:
+        process = subprocess.run(
+            ["python3", NORMALIZER_SCRIPT_PATH, "-i", raw_metadata_file_path, "-o", norm_metadata_file_path],
+            check=True
+        )
+        if process.returncode == 0:
+            return True
+        else:
+            logging.error(f"Normalizer script failed with return code: {process.returncode}")
+            return False
+    except Exception as e:
+        logging.error(f"Error normalizing metadata: {e}")
+        return False
+
+def transform_normlized_to_enriched(norm_metadata_file_path):
+    try:
+        with open(norm_metadata_file_path, "r") as f:
+            data = json.load(f)
+        result = []
+        for event_type, detections in data.items():
+            for detection in detections:
+                event_obj = {
+                    "eventType": event_type,
+                    "eventValue": detection.get("value", ""),
+                    "totalOccurrences": len(detection.get("occurrences", [])),
+                    "eventOccurence": detection.get("occurrences", [])
+                }
+                result.append(event_obj)
+       
+        return result, True
+    except Exception as e:
+        return f"Error during transformation: {e}", False
+
 
 # =============================
 # Dataclass: Consts
@@ -472,27 +582,31 @@ class VideoIndexerClient:
         privacy: str = "Private",
         partition: str = "",
         excluded_ai: Optional[list] = None,
-        metadata: Optional[dict] = None
+        metadata: Optional[dict] = None,
+        indexing_preset: Optional[str] = None,
+        language: Optional[str] = None,
+        retention_period: Optional[int] = None,
+        is_searchable: Optional[bool] = None,
+        brands_categories: Optional[str] = None,
+        custom_languages: Optional[str] = None,
+        prevent_duplicates: Optional[bool] = None
     ) -> str:
         if excluded_ai is None:
             excluded_ai = []
         if metadata is None:
             metadata = {}
-
         if not os.path.exists(media_path):
             raise FileNotFoundError(f"Media file not found: {media_path}")
-
         if video_name is None:
             video_name = os.path.splitext(os.path.basename(media_path))[0]
 
         self.get_account()
-
         url = (
             f"{API_ENDPOINT}/{self.account['location']}/"
             f"Accounts/{self.account['properties']['accountId']}/Videos"
         )
 
-        # query parameters
+        # Build query parameters
         params = {
             "accessToken": self.vi_access_token,
             "name": video_name[:80],
@@ -501,22 +615,35 @@ class VideoIndexerClient:
             "partition": partition
         }
 
+        # Optional params
         if excluded_ai:
             params["excludedAI"] = ",".join(excluded_ai)
-
         if metadata:
             params["metadata"] = json.dumps(metadata, ensure_ascii=False)
+        if indexing_preset:
+            params["indexingPreset"] = indexing_preset
+        if language:
+            params["language"] = language
+        if retention_period is not None:
+            params["retentionPeriod"] = retention_period
+        if is_searchable is not None:
+            params["isSearchable"] = "true" if is_searchable else "false"
+        if brands_categories:
+            params["brandsCategories"] = brands_categories
+        if custom_languages:
+            params["customLanguages"] = custom_languages
+        if prevent_duplicates is not None:
+            params["preventDuplicates"] = "true" if prevent_duplicates else "false"
 
         logger.info(f"Uploading '{video_name}'...")
-        logger.debug(f"URL :------------------------------------------->  {url}")
-        logger.debug(f"Query params -------------------------> {params}")
+        logger.debug(f"URL: {url}")
+        logger.debug(f"Query params: {params}")
 
         for attempt in range(3):
             try:
                 with open(media_path, 'rb') as f:
                     files = {'file': (video_name, f, 'video/mp4')}
                     response = requests.post(url, params=params, files=files)
-
                 if response.status_code in (200, 201):
                     video_id = response.json().get("id")
                     logger.info(f"✅ Upload successful. Video ID: {video_id}")
@@ -529,23 +656,18 @@ class VideoIndexerClient:
                     logger.warning(f"Server error {response.status_code}: {response.text}")
                     if attempt == 2:
                         raise RuntimeError(f"Upload failed after 3 attempts: {response.text}")
-
             except (ConnectionError, Timeout, requests.exceptions.ChunkedEncodingError, OSError) as e:
                 logger.warning(f"Network error on attempt {attempt + 1}: {e}")
             except Exception as e:
                 if "Client error" in str(e):
                     raise
                 logger.warning(f"Transient error on attempt {attempt + 1}: {e}")
-
             if attempt < 2:
                 base_delay = [1, 3, 10][attempt]
                 delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
                 time.sleep(delay)
-            else:
-                logger.critical(f"Upload failed after 3 attempts: {video_name}")
-                raise RuntimeError("Upload failed after retries.")
-
-        raise RuntimeError("file_upload_async failed")
+        logger.critical(f"Upload failed after 3 attempts: {video_name}")
+        raise RuntimeError("Upload failed after retries.")
 
     def wait_for_index_async(self, video_id: str, timeout_sec: int = 14400) -> str:
         self.get_account()
@@ -587,9 +709,11 @@ class VideoIndexerClient:
                     logger.info(f"✅ Video indexed successfully: {video_id}")
                     return "Processed"
                 elif state == "Failed":
-                    error = result.get("error", "No error message")
-                    logger.error(f"❌ Indexing failed: {error}")
-                    return "Failed"
+                    errorCode = video_data.get("failureCode", "Unknown")
+                    errorMessage = video_data.get("failureMessage", "No failure message")
+                    logger.debug(f"❌ Indexing failed for video {video_id}. Code: {errorCode}, Message: {errorMessage}")
+                    print(f"Metadata extraction failed for asset: {video_id}")
+                    sys.exit(7)
 
                 logger.info(f"🟡 Indexing... State: {state}, progress: {progress}")
                 time.sleep(10)
@@ -612,60 +736,40 @@ class VideoIndexerClient:
         video_name: Optional[str] = None,
         **upload_kwargs
     ) -> Tuple[str, bool]:
-
         if conflict_mode not in CONFLICT_RESOLUTION_MODES:
             raise ValueError(f"Invalid conflict_mode: {conflict_mode}. Use: {CONFLICT_RESOLUTION_MODES}")
-
         file_name = extract_file_name(media_path)
         file_size = os.path.getsize(media_path)
-        
         metadata = upload_kwargs.get("metadata", {})
         partition = metadata.get("repoGuid")
         if not partition:
             logger.warning("No 'repoGuid' found in metadata. Falling back to unfiltered search.")
-
         videos = self.list_videos(partition=partition)
         matching_video = next(
-            (
-                v
-                for v in videos
-                if v.get("name") == file_name
-                and (
-                    (lambda m: m and int(json.loads(m).get("fabric_size", -1)) == file_size)(
-                        v.get("metadata")
-                    )
-                )
-            ),
-            None,
+            (v for v in videos if v["name"] == file_name),
+            None
         )
-
         if not matching_video:
             video_id = self.file_upload_async(media_path, video_name=video_name, **upload_kwargs)
             return video_id, True
-
         video_id = matching_video["id"]
         logger.info(f"Found matching video: ID={video_id}, Name='{file_name}', Size={file_size}")
-
         if conflict_mode == "skip":
-            self.update_catalog(repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], video_id)
+            self.update_catalog(partition, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], video_id)
             logger.info("Conflict mode 'skip'. Skipping upload.")
             return video_id, False
-
         elif conflict_mode == "overwrite":
             logger.info("Conflict mode 'overwrite'. Deleting and re-uploading.")
             if not self.delete_video(video_id):
                 raise RuntimeError("Failed to delete existing video for overwrite.")
             video_id = self.file_upload_async(media_path, video_name=video_name, **upload_kwargs)
             return video_id, True
-
         elif conflict_mode == "reindex":
             logger.info("Conflict mode 'reindex'. Triggering reindex.")
             if self.reindex_video(video_id):
                 return video_id, False
             else:
                 raise RuntimeError("Reindex failed.")
-
-        # Should not reach
         raise RuntimeError(f"Unhandled conflict mode: {conflict_mode}")
     
     def update_catalog(self, repo_guid, file_path, video_id, max_attempts=5):
@@ -680,7 +784,7 @@ class VideoIndexerClient:
             "repoGuid": repo_guid,
             "fileName": os.path.basename(file_path),
             "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
-            "providerName": section.get("provider", "azure_video_indexer"),
+            "providerName": section.get("provider", "AZUREVI"),
             "providerData": {
                 "assetId": video_id,
                 "accountId": self.account['properties']['accountId'],
@@ -761,20 +865,94 @@ class VideoIndexerClient:
             if attempt < max_attempts - 1:
                 time.sleep(2 ** attempt)
         return None
+    
+    def store_metadata_file(self, repo_guid, file_path, metadata, max_attempts=3):
+        meta_path, proxy_path = get_store_paths()
+        if not meta_path:
+            logging.error("Metadata Store settings not found.")
+            return None, None
 
-    def send_extracted_metadata(self, repo_guid, file_path, metadata, max_attempts=3):
+        provider = section.get("provider", "AZUREVI")
+        base = os.path.splitext(os.path.basename(file_path))[0]
+        repo_guid_str = str(repo_guid)
+
+        # -----------------------------------------
+        # 1. Split meta_path at /./
+        # -----------------------------------------
+        if "/./" in meta_path:
+            meta_left, meta_right = meta_path.split("/./", 1)
+        else:
+            meta_left, meta_right = meta_path, ""
+
+        meta_left = meta_left.rstrip("/")
+
+        # -----------------------------------------
+        # 2. Build PHYSICAL PATH (local disk path) meta_left/meta_right/repo_guid/file_path/provider
+        # -----------------------------------------
+        metadata_dir = os.path.join(meta_left, meta_right, repo_guid_str, file_path, provider)
+        os.makedirs(metadata_dir, exist_ok=True)
+
+        # Full local physical paths
+        raw_json = os.path.join(metadata_dir, f"{base}_raw.json")
+        norm_json = os.path.join(metadata_dir, f"{base}_norm.json")
+
+        # -----------------------------------------
+        # 3. Returned paths (AFTER /./) meta_right/repo_guid/file_path/provider/file.json
+        # -----------------------------------------
+        raw_return = os.path.join(meta_right, repo_guid_str, file_path, provider, f"{base}_raw.json")
+        norm_return = os.path.join(meta_right, repo_guid_str, file_path, provider, f"{base}_norm.json")
+
+        raw_success = False
+        norm_success = False
+
+        # -----------------------------------------
+        # 4. Write metadata with retry
+        # -----------------------------------------
+        for attempt in range(max_attempts):
+            try:
+                # RAW write
+                with open(raw_json, "w", encoding="utf-8") as f:
+                    json.dump(metadata, f, ensure_ascii=False, indent=4)
+                raw_success = True
+
+                # NORMALIZED write
+                if not get_azurevi_normalized_metadata(raw_json, norm_json):
+                    logging.error("Normalization failed.")
+                    norm_success = False
+                else:
+                    norm_success = True
+
+                break  # No need for more retries
+
+            except Exception as e:
+                logging.warning(f"Metadata write failed (Attempt {attempt+1}): {e}")
+                if attempt < max_attempts - 1:
+                    time.sleep([1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt]))
+
+        # -----------------------------------------
+        # 5. Return results
+        # -----------------------------------------
+        return (
+            raw_return if raw_success else None,
+            norm_return if norm_success else None
+        )
+
+    def send_extracted_metadata(self, repo_guid, file_path, rawMetadataFilePath, normMetadataFilePath=None, max_attempts=3):
         url = "http://127.0.0.1:5080/catalogs/extendedMetadata"
         node_api_key = get_node_api_key()
         headers = {"apikey": node_api_key, "Content-Type": "application/json"}
         payload = {
             "repoGuid": repo_guid,
-            "providerName": section.get("provider", "azure_video_indexer"),
+            "providerName": section.get("provider", "AZUREVI"),
             "extendedMetadata": [{
                 "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
-                "fileName": os.path.basename(file_path),
-                "metadata": flatten_dict(metadata)
+                "fileName": os.path.basename(file_path)
             }]
         }
+        if rawMetadataFilePath is not None:
+            payload["extendedMetadata"][0]["metadataRawJsonFilePath"] = rawMetadataFilePath
+        if normMetadataFilePath is not None:
+            payload["extendedMetadata"][0]["metadataFilePath"] = normMetadataFilePath
         for attempt in range(max_attempts):
             try:
                 r = make_request_with_retries("POST", url, headers=headers, json=payload)
@@ -787,7 +965,33 @@ class VideoIndexerClient:
                 base_delay = [1, 3, 10][attempt]
                 delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
                 time.sleep(delay)
-        return False    
+        return False
+
+    def send_ai_enriched_metadata(self, repo_guid, file_path, enrichedMetadata, max_attempts=3):
+        url = "http://127.0.0.1:5080/catalogs/aiEnrichedMetadata"
+        node_api_key = get_node_api_key()
+        headers = {"apikey": node_api_key, "Content-Type": "application/json"}
+        payload = {
+            "repoGuid": repo_guid,
+            "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
+            "fileName": os.path.basename(file_path),
+            "providerName": section.get("provider", "AZUREVI"),
+            "normalizedMetadata": enrichedMetadata
+        }
+
+        for attempt in range(max_attempts):
+            try:
+                r = make_request_with_retries("POST", url, headers=headers, json=payload)
+                if r and r.status_code in (200, 201):
+                    return True
+            except Exception as e:
+                if attempt == 2:
+                    logging.critical(f"Failed to send metadata after 3 attempts: {e}")
+                    raise
+                base_delay = [1, 3, 10][attempt]
+                delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+                time.sleep(delay)
+        return False
 
 # =============================
 # Main Execution
@@ -852,23 +1056,36 @@ if __name__ == "__main__":
         sys.exit(1)
 
     if args.mode == "send_extracted_metadata":
-        if not (args.asset_id and args.repo_guid and args.catalog_path):
-            logging.error("Asset ID, Repo GUID, and Catalog path required.")
-            sys.exit(1)
+        if not all([args.asset_id, args.repo_guid, args.catalog_path]):
+            fail("Asset ID, Repo GUID, and Catalog path required.", 1)
+
         client = VideoIndexerClient(consts)
         client.authenticate()
         ai_metadata = client.get_ai_metadata(args.asset_id)
+        if not ai_metadata:
+            fail("No AI metadata returned.")
+
         catalog_path_clean = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
-        if ai_metadata:
-            if client.send_extracted_metadata(args.repo_guid, catalog_path_clean, ai_metadata):
-                logger.info("Extracted metadata sent successfully.")
-                sys.exit(0)
-            else:
-                logger.error("Failed to send extracted metadata.")
-                sys.exit(7)
+        raw_path, norm_path = client.store_metadata_file(args.repo_guid, catalog_path_clean, ai_metadata)
+
+        if not client.send_extracted_metadata(args.repo_guid, catalog_path_clean, raw_path, norm_path):
+            fail("Failed to send extracted metadata.")
+
+        logger.info("Extracted metadata sent successfully.")
+
+        if norm_path:
+            try:
+                enriched, success = transform_normlized_to_enriched(norm_path)
+                if success and client.send_ai_enriched_metadata(args.repo_guid, catalog_path_clean, enriched):
+                    logger.info("AI enriched metadata sent successfully.")
+                else:
+                    logger.warning("AI enriched metadata send failed — skipping.")
+            except Exception:
+                logger.exception("AI enriched metadata transform failed — skipping.")
         else:
-            print(f"Metadata extraction failed for asset: {args.asset_id}")
-            sys.exit(7)
+            logger.info("Normalized metadata not present — skipping AI enrichment.")
+
+        sys.exit(0)
 
     matched_file = args.source_path
     if not matched_file or not os.path.exists(matched_file):
@@ -884,6 +1101,115 @@ if __name__ == "__main__":
                 sys.exit(4)
         except ValueError:
             logger.warning(f"Invalid size limit: {args.size_limit}")
+
+    # Load Advanced AI Configuration
+    advanced_ai_config = get_advanced_ai_config(args.config_name, "azurevi") or {}
+
+    # Default Azure VI parameters
+    indexing_preset = "Default"
+    language = "auto"
+    excluded_ai = []
+    retention_period = None
+    is_searchable = True
+    brands_categories = None
+    custom_languages = None
+    prevent_duplicates = False
+
+    # Parse advanced config if available
+    if advanced_ai_config and isinstance(advanced_ai_config, dict):
+        # --- Feature-based exclusion ---
+        requested_features = advanced_ai_config.get("features", [])
+        if requested_features:
+            AZURE_EXCLUDABLE = {
+                "Faces", "ObservedPeople", "Emotions", "Labels", "DetectedObjects",
+                "Celebrities", "KnownPeople", "OCR", "Clapperboard", "Logos",
+                "Speakers", "Topics", "Keywords", "Entities", "ShotType"
+            }
+            FEATURE_TO_AZURE = {
+                "Faces": "Faces",
+                "ObservedPeople": "ObservedPeople",
+                "Emotions": "Emotions",
+                "Labels": "Labels",
+                "DetectedObjects": "DetectedObjects",
+                "Ocr": "OCR",
+                "Clapperboards": "Clapperboard",
+                "Logos": "Logos",
+                "Speakers": "Speakers",
+                "Topics": "Topics",
+                "Keywords": "Keywords",
+                "NamedLocations": "Entities",
+                "NamedPeople": "KnownPeople",
+                "Shots": "ShotType"
+            }
+            requested_azure = {
+                FEATURE_TO_AZURE[f] for f in requested_features
+                if f in FEATURE_TO_AZURE
+            }
+            excluded_ai = list(AZURE_EXCLUDABLE - requested_azure)
+
+        # --- Other parameters ---
+        indexing_preset = advanced_ai_config.get("indexingPreset", indexing_preset)
+        language = advanced_ai_config.get("language", language)
+        retention_period = advanced_ai_config.get("retentionPeriod")
+        
+        # New: isSearchable (bool)
+        is_searchable_raw = advanced_ai_config.get("isSearchable")
+        if is_searchable_raw is not None:
+            is_searchable = bool(is_searchable_raw)
+
+        # New: brandsCategories (string, comma-separated)
+        brands_categories = advanced_ai_config.get("brandsCategories")
+        if brands_categories and isinstance(brands_categories, list):
+            brands_categories = ",".join(brands_categories)
+        elif brands_categories and not isinstance(brands_categories, str):
+            brands_categories = None
+
+        # New: customLanguages (string or list)
+        custom_languages = advanced_ai_config.get("customLanguages")
+        if custom_languages:
+            if isinstance(custom_languages, list):
+                if len(custom_languages) < 2 or len(custom_languages) > 10:
+                    logger.warning("customLanguages must have 2–10 languages. Ignoring.")
+                    custom_languages = None
+                else:
+                    custom_languages = ",".join(custom_languages)
+            elif isinstance(custom_languages, str):
+                parts = [x.strip() for x in custom_languages.split(",")]
+                if len(parts) < 2 or len(parts) > 10:
+                    logger.warning("customLanguages must have 2–10 languages. Ignoring.")
+                    custom_languages = None
+                else:
+                    custom_languages = ",".join(parts)
+            else:
+                custom_languages = None
+
+        # New: preventDuplicates (bool)
+        prevent_duplicates_raw = advanced_ai_config.get("preventDuplicates")
+        if prevent_duplicates_raw is not None:
+            prevent_duplicates = bool(prevent_duplicates_raw)
+
+    # Paths and backlink
+    file_name_for_url = extract_file_name(args.catalog_path)
+    catalog_dir = remove_file_name_from_path(args.catalog_path or matched_file)
+    normalized_path = catalog_dir.replace("\\", "/")
+    relative_path = normalized_path.split("/1/", 1)[-1] if "/1/" in normalized_path else normalized_path
+    repo_guid = args.repo_guid or (normalized_path.split("/1/")[0].split("/")[-1] if "/1/" in normalized_path else "")
+
+    client_ip, _ = (args.controller_address.split(":", 1) if args.controller_address and ":" in args.controller_address
+                    else get_link_address_and_port())
+    backlink_url = (
+        f"https://{client_ip}/dashboard/projects/{args.job_guid or ''}"
+        f"/browse&search?path={urllib.parse.quote(relative_path)}"
+        f"&filename={urllib.parse.quote(file_name_for_url)}"
+    )
+
+    metadata = {
+        "relativePath": "/" + relative_path if not relative_path.startswith("/") else relative_path,
+        "repoGuid": repo_guid,
+        "fileName": file_name_for_url,
+        "fabric_size": os.path.getsize(matched_file),
+        "fabric-URL": backlink_url
+    }
 
     # Paths and backlink
     file_name_for_url = extract_file_name(args.catalog_path)
@@ -952,9 +1278,17 @@ if __name__ == "__main__":
             description=description,
             privacy="Private",
             partition=partition,
-            metadata=metadata
+            metadata=metadata,
+            excluded_ai=excluded_ai,
+            indexing_preset=indexing_preset,
+            language=language,
+            retention_period=retention_period,
+            is_searchable=is_searchable,
+            brands_categories=brands_categories,
+            custom_languages=custom_languages,
+            prevent_duplicates=prevent_duplicates
         )
-
+        status = "Processed" if conflict_mode == "skip" else "Unknown"
         # Only poll if it's a new upload or reindex was not enough
         if conflict_mode != "skip" or is_new == True:
             status = client.wait_for_index_async(video_id, timeout_sec=3600)
@@ -965,22 +1299,35 @@ if __name__ == "__main__":
         print(f"VideoID={video_id}")
 
         catalog_path_clean = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
-
-        if section.get("export_ai_metadata") == "true" and status == "Processed":
+        print(f"export_ai_metadata={section.get('export_ai_metadata', 'false')}")
+        if section.get("export_ai_metadata") == "true" and status == "Processed" and is_new == True:
             try:
                 ai_metadata = client.get_ai_metadata(video_id)
-                if ai_metadata:
-                    if client.send_extracted_metadata(repo_guid, catalog_path_clean, ai_metadata):
-                        logger.info("Extracted metadata sent successfully.")
-                    else:
-                        logger.error("Failed to send extracted metadata.")
-                        sys.exit(7)
+                if not ai_metadata:
+                    fail("No AI metadata returned.")
+
+                catalog_path_clean = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
+                raw_path, norm_path = client.store_metadata_file(args.repo_guid, catalog_path_clean, ai_metadata)
+
+                if not client.send_extracted_metadata(args.repo_guid, catalog_path_clean, raw_path, norm_path):
+                    fail("Failed to send extracted metadata.")
+
+                logger.info("Extracted metadata sent successfully.")
+
+                if norm_path:
+                    try:
+                        enriched, enrich_success = transform_normlized_to_enriched(norm_path)
+                        if enrich_success and client.send_ai_enriched_metadata(args.repo_guid, catalog_path_clean, enriched):
+                            logger.info("AI enriched metadata sent successfully.")
+                        else:
+                            logger.warning("AI enriched metadata send failed — skipping.")
+                    except Exception:
+                        logger.exception("AI enriched metadata transform failed — skipping.")
                 else:
-                    print(f"Metadata extraction failed for asset: {video_id}")
-                    sys.exit(7)
+                    logger.info("Normalized metadata not present — skipping AI enrichment.")
+
             except Exception as e:
-                logger.error(f"Error extracting/sending AI metadata: {e}")
-                sys.exit(7)
+                fail(f"Error extracting/sending AI metadata: {e}")
 
         sys.exit(0)
 
