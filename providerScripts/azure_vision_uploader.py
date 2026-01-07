@@ -6,35 +6,41 @@ import logging
 import random
 import time
 import requests
-from azure.ai.vision.imageanalysis import ImageAnalysisClient
-from azure.ai.vision.imageanalysis.models import VisualFeatures
-from azure.core.credentials import AzureKeyCredential
 from configparser import ConfigParser
 import plistlib
 from threading import Lock
 
-# Constants (used as fallbacks and safety nets)
-VISION_API_VERSION = "2024-02-01"
-EMBEDDING_MODEL_VERSION = "2023-04-15"
-DEFAULT_VISUAL_FEATURES = ["TAGS", "CAPTION", "DENSE_CAPTIONS", "OBJECTS", "READ", "SMART_CROPS", "PEOPLE"]
+# Constants
+SUPPORTED_API_VERSIONS = ["3.2", "4.0"]
+DEFAULT_API_VERSION = "4.0"
+VISION_API_VERSION_V4 = "2024-02-01"
+EMBEDDING_MODEL_VERSION_DEFAULT = "2023-04-15"
+DEFAULT_VISUAL_FEATURES_V4 = ["TAGS", "CAPTION", "DENSE_CAPTIONS", "OBJECTS", "READ", "SMART_CROPS", "PEOPLE"]
 DEFAULT_SMART_CROPS_RATIOS = [0.9, 1.33]
 DEFAULT_LANGUAGE = "en"
 DEFAULT_GENDER_NEUTRAL = False
-DEFAULT_ANALYSIS_MODEL_VERSION = "2024-02-01"
+DEFAULT_ANALYSIS_MODEL_VERSION_V4 = "latest"
+DEFAULT_VISUAL_FEATURES_V32 = ["Tags", "Description", "Objects"]
+DEFAULT_DETAILS_V32 = ["Celebrities", "Landmarks"]
 
-# Detect platform
+# Platform
+VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet", "analyze_and_embed"]
+IS_LINUX = os.path.isdir("/opt/sdna/bin")
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
-IS_LINUX = os.path.isdir("/opt/sdna/bin")
 DNA_CLIENT_SERVICES = LINUX_CONFIG_PATH if IS_LINUX else MAC_CONFIG_PATH
+NORMALIZER_SCRIPT_PATH = "/opt/sdna/bin/azure_vision_metadata_normalizer.py"
 
 # Rate limiting
-RATE_LIMIT_DELAY = 3.5
+RATE_LIMIT_DELAY = 0.5
 last_request_time = 0
 rate_limit_lock = Lock()
 
+logger = logging.getLogger()
+
 def setup_logging(level):
-    logging.basicConfig(level=getattr(logging, level.upper()), format='%(asctime)s %(levelname)s: %(message)s')
+    numeric_level = getattr(logging, level.upper(), logging.DEBUG)
+    logging.basicConfig(level=numeric_level, format='%(asctime)s %(levelname)s: %(message)s')
 
 def wait_for_rate_limit():
     global last_request_time
@@ -42,9 +48,7 @@ def wait_for_rate_limit():
         now = time.time()
         elapsed = now - last_request_time
         if elapsed < RATE_LIMIT_DELAY:
-            sleep_time = RATE_LIMIT_DELAY - elapsed
-            logging.debug(f"Rate limit: waiting {sleep_time:.2f}s")
-            time.sleep(sleep_time)
+            time.sleep(RATE_LIMIT_DELAY - elapsed)
         last_request_time = time.time()
 
 def get_retry_session():
@@ -62,19 +66,17 @@ def make_request_with_retries(method, url, max_retries=3, **kwargs):
             response = session.request(method, url, timeout=(10, 30), **kwargs)
             if response.status_code == 429:
                 retry_after = int(response.headers.get('Retry-After', 60))
-                wait_time = retry_after + 5
-                logging.warning(f"[429] Rate limited. Waiting {wait_time}s")
-                time.sleep(wait_time)
+                time.sleep(retry_after + 5)
                 continue
             if response.status_code < 500:
                 return response
-            logging.warning(f"[SERVER ERROR {response.status_code}] Retrying...")
-        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            if attempt == max_retries - 1:
+                return response
+            time.sleep(5)
+        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt == max_retries - 1:
                 raise
-            delay = [2, 5, 15][attempt] + random.uniform(0, 2)
-            logging.warning(f"[{type(e).__name__}] Retrying in {delay:.1f}s...")
-            time.sleep(delay)
+            time.sleep([2, 5, 15][attempt] + random.uniform(0, 2))
     return None
 
 def get_config_path():
@@ -112,57 +114,52 @@ def get_admin_dropbox_path():
 def get_advanced_ai_config(config_name, provider_name="azure_vision"):
     admin_dropbox = get_admin_dropbox_path()
     if not admin_dropbox:
-        logging.info("Admin dropbox not available; using defaults")
         return None
 
-    # Try config-specific file
     config_file = os.path.join(admin_dropbox, "AdvancedAiExport", "Configs", f"{config_name}.json")
     if os.path.exists(config_file):
         try:
             with open(config_file, 'r', encoding='utf-8') as f:
                 cfg = json.load(f)
                 if isinstance(cfg, dict):
-                    logging.info(f"Loaded advanced config: {config_file}")
+                    api_ver = str(cfg.get("api_version", DEFAULT_API_VERSION)).strip()
+                    if api_ver not in SUPPORTED_API_VERSIONS:
+                        cfg["api_version"] = DEFAULT_API_VERSION
                     return cfg
-                else:
-                    logging.error(f"Config file {config_file} is not a JSON object")
         except Exception as e:
             logging.error(f"Failed to load config file {config_file}: {e}")
 
-    # Fallback to provider sample
     sample_file = os.path.join(admin_dropbox, "AdvancedAiExport", "Samples", f"{provider_name}.json")
     if os.path.exists(sample_file):
         try:
             with open(sample_file, 'r', encoding='utf-8') as f:
                 cfg = json.load(f)
                 if isinstance(cfg, dict):
-                    logging.info(f"Loaded sample config: {sample_file}")
                     return cfg
         except Exception as e:
             logging.error(f"Failed to load sample file {sample_file}: {e}")
 
-    logging.info("No valid advanced config found; using defaults")
     return None
 
-def load_config(section_name, config_path):
-    if not os.path.isfile(config_path):
-        logging.error(f"Config not found: {config_path}")
-        sys.exit(1)
-    parser = ConfigParser()
-    parser.read(config_path)
-    if section_name not in parser:
-        logging.error(f"Section '{section_name}' not found")
-        sys.exit(1)
-    section = parser[section_name]
-    endpoint = section.get("vision_endpoint", "").strip().rstrip('/')
-    key = section.get("vision_key", "").strip()
-    if not endpoint or not key:
-        logging.error("Missing endpoint or key")
-        sys.exit(5)
-    return {"endpoint": endpoint, "key": key}
+# --- v4.0 functions ---
+def _get_v4_sdk():
+    from azure.ai.vision.imageanalysis import ImageAnalysisClient
+    from azure.ai.vision.imageanalysis.models import VisualFeatures
+    from azure.core.credentials import AzureKeyCredential
+    return ImageAnalysisClient, VisualFeatures, AzureKeyCredential
 
-def parse_visual_features(feature_list):
+def _parse_visual_features_v4(feature_list):
     valid_features = {
+        "TAGS": "TAGS",
+        "CAPTION": "CAPTION",
+        "DENSE_CAPTIONS": "DENSE_CAPTIONS",
+        "OBJECTS": "OBJECTS",
+        "READ": "READ",
+        "SMART_CROPS": "SMART_CROPS",
+        "PEOPLE": "PEOPLE"
+    }
+    ImageAnalysisClient, VisualFeatures, _ = _get_v4_sdk()
+    mapping = {
         "TAGS": VisualFeatures.TAGS,
         "CAPTION": VisualFeatures.CAPTION,
         "DENSE_CAPTIONS": VisualFeatures.DENSE_CAPTIONS,
@@ -173,14 +170,12 @@ def parse_visual_features(feature_list):
     }
     features = []
     for f in feature_list:
-        f = f.upper()
-        if f in valid_features:
-            features.append(valid_features[f])
-        else:
-            logging.warning(f"Ignoring invalid visual feature: {f}")
-    return features if features else [valid_features[f] for f in DEFAULT_VISUAL_FEATURES]
+        key = f.upper()
+        if key in mapping:
+            features.append(mapping[key])
+    return features if features else [mapping[f] for f in DEFAULT_VISUAL_FEATURES_V4]
 
-def serialize_result(result):
+def _serialize_v4_result(result):
     output = {}
     if hasattr(result, 'tags') and result.tags:
         output['tags'] = [{"name": t.name, "confidence": t.confidence} for t in result.tags.list]
@@ -219,19 +214,23 @@ def serialize_result(result):
         output['model_version'] = result.model_version
     return output
 
-def analyze_image(config, image_data, ai_config, max_retries=10):
-    # Resolve analysis parameters
-    visual_features_raw = ai_config.get("visual_features", DEFAULT_VISUAL_FEATURES)
-    visual_features = parse_visual_features(visual_features_raw)
+def analyze_image_v4(config, image_data, ai_config):
+    visual_features_raw = ai_config.get("visual_features", DEFAULT_VISUAL_FEATURES_V4)
+    visual_features = _parse_visual_features_v4(visual_features_raw)
     smart_crops = ai_config.get("smart_crops_aspect_ratios", DEFAULT_SMART_CROPS_RATIOS)
     language = ai_config.get("language", DEFAULT_LANGUAGE)
     gender_neutral = ai_config.get("gender_neutral_caption", DEFAULT_GENDER_NEUTRAL)
-    model_version = ai_config.get("analysis_model_version", DEFAULT_ANALYSIS_MODEL_VERSION)
-    
-    for attempt in range(max_retries):
+    model_version = ai_config.get("analysis_model_version", DEFAULT_ANALYSIS_MODEL_VERSION_V4)
+    max_image_size = 20*1024*1024 if model_version == "latest" else 4*1024*1024
+    if len(image_data) > max_image_size:
+        logger.error(f"Image size {len(image_data)} exceeds max for model {model_version} ({max_image_size})")
+        sys.exit(8)
+
+    ImageAnalysisClient, _, AzureKeyCredential = _get_v4_sdk()
+    for attempt in range(10):
         try:
             wait_for_rate_limit()
-            client = ImageAnalysisClient(endpoint=config["endpoint"], credential=AzureKeyCredential(config["key"]))
+            client = ImageAnalysisClient(endpoint=config.get("vision_endpoint"), credential=AzureKeyCredential(config["vision_key"]))
             result = client.analyze(
                 image_data=image_data,
                 visual_features=visual_features,
@@ -240,141 +239,218 @@ def analyze_image(config, image_data, ai_config, max_retries=10):
                 gender_neutral_caption=gender_neutral,
                 model_version=model_version
             )
-            logging.info("Image analysis completed")
-            return serialize_result(result)
+            return _serialize_v4_result(result)
         except Exception as e:
-            error_msg = str(e).lower()
-            if '429' in error_msg or 'rate limit' in error_msg:
-                wait_time = 60 + (attempt * 10)
-                logging.warning(f"[ANALYSIS 429] Attempt {attempt+1}, waiting {wait_time}s")
-                time.sleep(wait_time)
-                continue
-            if 'quota' in error_msg:
-                logging.warning(f"[ANALYSIS QUOTA] Waiting 120s")
+            err = str(e).lower()
+            if '429' in err or 'rate limit' in err:
+                time.sleep(60 + attempt * 10)
+            elif 'quota' in err:
                 time.sleep(120)
-                continue
-            if any(kw in error_msg for kw in ['timeout', 'connection', 'network', 'ssl']):
-                wait_time = 10 + (attempt * 5)
-                logging.warning(f"[ANALYSIS NETWORK] {type(e).__name__}, retry in {wait_time}s")
-                time.sleep(wait_time)
-                continue
-            logging.error(f"[ANALYSIS FAILED] {type(e).__name__}: {e}")
-            return None
-    logging.error("[ANALYSIS] All retries exhausted")
+            elif any(kw in err for kw in ['timeout', 'connection', 'network', 'ssl']):
+                time.sleep(10 + attempt * 5)
+            else:
+                if attempt == 9:
+                    return None
+                time.sleep(5)
     return None
 
-def get_embedding(config, image_data, ai_config, max_retries=10):
-    # Use constant fallback for embedding model version
-    emb_model = ai_config.get("embedding_model_version", EMBEDDING_MODEL_VERSION)
-    url = f"{config['endpoint']}/computervision/retrieval:vectorizeImage?api-version={VISION_API_VERSION}&model-version={emb_model}"
+def get_embedding_v4(config, image_data, ai_config):
+    emb_model = ai_config.get("embedding_model_version", EMBEDDING_MODEL_VERSION_DEFAULT)
+    url = f"{config['vision_endpoint']}/computervision/retrieval:vectorizeImage?api-version={VISION_API_VERSION_V4}&model-version={emb_model}"
     headers = {
         "Content-Type": "application/octet-stream",
-        "Ocp-Apim-Subscription-Key": config["key"]
+        "Ocp-Apim-Subscription-Key": config["vision_key"]
     }
-    for attempt in range(max_retries):
+    for attempt in range(10):
         try:
             response = make_request_with_retries("POST", url, data=image_data, headers=headers, max_retries=3)
             if not response:
-                if attempt < max_retries - 1:
-                    time.sleep(10 + attempt * 5)
-                    continue
-                return None
+                if attempt == 9:
+                    return None
+                time.sleep(10 + attempt * 5)
+                continue
             if response.status_code == 200:
                 vector = response.json().get("vector")
                 if vector:
-                    logging.info(f"Embedding generated (length: {len(vector)})")
                     return vector
-                logging.error("200 OK but no vector")
-                if attempt < max_retries - 1:
-                    time.sleep(5)
-                    continue
-                return None
+                if attempt == 9:
+                    return None
+                time.sleep(5)
+                continue
             elif response.status_code == 429:
                 retry_after = int(response.headers.get('Retry-After', 60))
-                wait_time = retry_after + 10
-                logging.warning(f"[EMBEDDING 429] Waiting {wait_time}s")
-                time.sleep(wait_time)
+                time.sleep(retry_after + 10)
                 continue
             elif response.status_code == 403 and 'quota' in response.text.lower():
-                logging.warning(f"[EMBEDDING QUOTA] Waiting 120s")
                 time.sleep(120)
                 continue
             elif response.status_code in (400, 401, 404):
-                logging.error(f"[EMBEDDING CLIENT ERROR {response.status_code}] {response.text[:200]}")
                 return None
             elif response.status_code >= 500:
-                if attempt < max_retries - 1:
-                    wait_time = 30 + (attempt * 10)
-                    logging.warning(f"[EMBEDDING SERVER ERROR {response.status_code}] Retrying in {wait_time}s")
-                    time.sleep(wait_time)
-                    continue
-                return None
+                if attempt == 9:
+                    return None
+                time.sleep(30 + attempt * 10)
+                continue
             else:
-                logging.warning(f"[EMBEDDING UNKNOWN {response.status_code}] Retrying...")
-                if attempt < max_retries - 1:
-                    time.sleep(20 + attempt * 5)
-                    continue
-                return None
-        except Exception as e:
-            logging.error(f"[EMBEDDING EXCEPTION] {type(e).__name__}: {e}")
-            if attempt == max_retries - 1:
+                if attempt == 9:
+                    return None
+                time.sleep(20 + attempt * 5)
+        except Exception:
+            if attempt == 9:
                 return None
             time.sleep(15 + attempt * 5)
     return None
 
-def main():
-    parser = argparse.ArgumentParser(description="Azure Vision - Analysis & Embeddings")
-    parser.add_argument("-m", "--mode", required=True, choices=["analyze_and_embed"])
+# --- v3.2 functions ---
+def _map_v4_to_v32_features(v4_features):
+    mapping = {
+        "TAGS": "Tags", "CAPTION": "Description", "DENSE_CAPTIONS": "Description",
+        "OBJECTS": "Objects", "PEOPLE": "Faces", "FACES": "Faces", "BRANDS": "Brands",
+        "IMAGETYPE": "ImageType", "COLOR": "Color", "ADULT": "Adult", "CATEGORIES": "Categories"
+    }
+    v32_set = set()
+    for f in v4_features:
+        key = f.upper()
+        if key in mapping and mapping[key]:
+            v32_set.add(mapping[key])
+        elif f in ["Categories", "Tags", "Description", "Faces", "ImageType", "Color", "Adult", "Brands", "Objects"]:
+            v32_set.add(f)
+    return list(v32_set) if v32_set else ["Tags", "Description", "Objects"]
+
+def _build_v32_analyze_url(endpoint, visual_features, details, language):
+    base = f"{endpoint}/vision/v3.2/analyze"
+    params = [f"visualFeatures={','.join(visual_features)}", f"language={language}"]
+    if details:
+        params.append(f"details={','.join(details)}")
+    return base + "?" + "&".join(params)
+
+def analyze_image_v32(config, image_data, ai_config):
+    visual_features_raw = ai_config.get("visual_features", DEFAULT_VISUAL_FEATURES_V32)
+    if isinstance(visual_features_raw[0], str) and visual_features_raw[0].isupper():
+        visual_features = _map_v4_to_v32_features(visual_features_raw)
+    else:
+        visual_features = visual_features_raw
+    details = ai_config.get("details", DEFAULT_DETAILS_V32)
+    language = ai_config.get("language", DEFAULT_LANGUAGE)
+    if len(image_data) > 4*1024*1024:
+        logger.error("Image size exceeds 4MB limit for v3.2")
+        sys.exit(8)
+
+    url = _build_v32_analyze_url(config["vision_endpoint"], visual_features, details, language)
+    headers = {
+        "Content-Type": "application/octet-stream",
+        "Ocp-Apim-Subscription-Key": config["vision_key"]
+    }
+
+    for attempt in range(10):
+        try:
+            response = make_request_with_retries("POST", url, data=image_data, headers=headers, max_retries=3)
+            if not response:
+                if attempt == 9:
+                    return None
+                time.sleep(10 + attempt * 5)
+                continue
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', 60))
+                time.sleep(retry_after + 10)
+            elif response.status_code == 403 and 'quota' in response.text.lower():
+                time.sleep(120)
+            elif response.status_code in (400, 401, 404):
+                return None
+            elif response.status_code >= 500:
+                if attempt == 9:
+                    return None
+                time.sleep(30 + attempt * 10)
+            else:
+                if attempt == 9:
+                    return None
+                time.sleep(20 + attempt * 5)
+        except Exception:
+            if attempt == 9:
+                return None
+            time.sleep(15 + attempt * 5)
+    return None
+
+# --- Main ---
+if __name__ == "__main__":
+    time.sleep(random.uniform(0.0, 0.5))
+
+    parser = argparse.ArgumentParser(description="Azure Vision - Unified v3.2 / v4.0")
+    parser.add_argument("-m", "--mode", required=True)
     parser.add_argument("-c", "--config-name", required=True)
-    parser.add_argument("-i", "--image-path", required=True)
-    parser.add_argument("-o", "--output-path", required=True)
-    parser.add_argument("--log-level", default="info", choices=['debug', 'info', 'warning', 'error'])
+    parser.add_argument("-sp", "--source-path", required=True)
+    parser.add_argument("-o", "--output-path", help="Temporary output path for analysis and embedding JSON")
+    parser.add_argument("--log-level", default="debug")
     parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
+
+    mode = args.mode
+    if mode not in VALID_MODES:
+        logging.error(f"Invalid mode: {mode}")
+        sys.exit(1)
 
     setup_logging(args.log_level)
     config_path = get_config_path()
-    config = load_config(args.config_name, config_path)
+    cloud_config = ConfigParser()
+    cloud_config.read(config_path)
+    if args.config_name not in cloud_config:
+        logging.error(f"Config '{args.config_name}' not found.")
+        sys.exit(1)
 
-    if not os.path.isfile(args.image_path):
-        logging.error(f"Image not found: {args.image_path}")
+    cloud_config_data = cloud_config[args.config_name]
+    if not os.path.isfile(args.source_path):
+        logging.error(f"Image not found: {args.source_path}")
         sys.exit(4)
 
-    with open(args.image_path, "rb") as f:
+    with open(args.source_path, "rb") as f:
         image_data = f.read()
 
-    logging.info(f"Loaded image: {args.image_path} ({len(image_data)} bytes)")
-
     if args.dry_run:
-        logging.info(f"[DRY RUN] Config: {args.config_name}, Endpoint: {config['endpoint']}")
+        logging.info(f"[DRY RUN] Config: {args.config_name}, Endpoint: {cloud_config_data['vision_endpoint']}")
         sys.exit(0)
 
-    # Load advanced AI config or use defaults
     ai_config = get_advanced_ai_config(args.config_name, "azure_vision") or {}
+    api_version = ai_config.get("api_version", DEFAULT_API_VERSION)
 
-    analysis = analyze_image(config, image_data, ai_config)
-    if not analysis:
-        logging.critical("Analysis failed")
-        sys.exit(10)
+    if mode == "analyze_and_embed" and api_version == "3.2":
+        logging.error("Embedding not supported in API v3.2")
+        sys.exit(13)
 
-    embedding = get_embedding(config, image_data, ai_config)
-    if not embedding:
-        logging.critical("Embedding failed")
-        sys.exit(12)
+    if api_version == "4.0":
+        analysis = analyze_image_v4(cloud_config_data, image_data, ai_config)
+        if not analysis:
+            logging.critical("v4.0 analysis failed")
+            sys.exit(10)
+        embedding = get_embedding_v4(cloud_config_data, image_data, ai_config) if mode == "analyze_and_embed" else None
+        if mode == "analyze_and_embed" and not embedding:
+            logging.critical("v4.0 embedding failed")
+            sys.exit(12)
+    else:
+        analysis = analyze_image_v32(cloud_config_data, image_data, ai_config)
+        if not analysis:
+            logging.critical("v3.2 analysis failed")
+            sys.exit(10)
+        embedding = None
 
     output = {
+        "api_version": api_version,
         "analysis": analysis,
-        "embedding": embedding,
-        "embedding_length": len(embedding),
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
     }
+    if embedding is not None:
+        output["embedding"] = embedding
+        output["embedding_length"] = len(embedding)
 
-    with open(args.output_path, "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2, ensure_ascii=False)
+    if args.output_path:
+        try:
+            with open(args.output_path, "w", encoding="utf-8") as f:
+                json.dump(output, f, indent=2, ensure_ascii=False)
+            logging.info(f"Output written to {args.output_path}")
+        except Exception as e:
+            logging.error(f"Failed to write output: {e}")
+            sys.exit(15)
 
-    logging.info(f"Output saved: {args.output_path}")
+    logging.info("Completed successfully")
     sys.exit(0)
-
-if __name__ == "__main__":
-    time.sleep(random.uniform(0.0, 0.5))
-    main()
