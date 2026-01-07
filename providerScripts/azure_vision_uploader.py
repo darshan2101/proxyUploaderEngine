@@ -21,7 +21,7 @@ DEFAULT_LANGUAGE = "en"
 DEFAULT_GENDER_NEUTRAL = False
 DEFAULT_ANALYSIS_MODEL_VERSION_V4 = "latest"
 DEFAULT_VISUAL_FEATURES_V32 = ["Tags", "Description", "Objects"]
-DEFAULT_DETAILS_V32 = ["Celebrities", "Landmarks"]
+DEFAULT_DETAILS_V32 = [ "Landmarks"]
 
 # Platform
 VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet", "analyze_and_embed"]
@@ -111,33 +111,72 @@ def get_admin_dropbox_path():
         logging.error(f"Error reading admin dropbox path: {e}")
         return None
 
-def get_advanced_ai_config(config_name, provider_name="azure_vision"):
+def _normalize_ai_config_keys(cfg, provider="azure_vision"):
+    # Map any key (prefixed or not) to canonical form
+    key_aliases = {}
+    for k in ["api_version", "visual_features", "smart_crops_aspect_ratios",
+              "language", "gender_neutral_caption", "analysis_model_version",
+              "embedding_model_version", "details"]:
+        key_aliases[k] = key_aliases[f"{provider}_{k}"] = k
+
+    # Build normalized config
+    out = {
+        key_aliases[k]: v for k, v in cfg.items()
+        if k in key_aliases
+    }
+
+    # Normalize list-like string fields
+    for field in ("visual_features", "details"):
+        if field in out:
+            items = out[field]
+            if isinstance(items, str):
+                items = [x.strip() for x in items.split(",") if x.strip()]
+            # Strip provider prefix and uppercase
+            out[field] = [
+                (x[len(provider)+1:].upper() if x.startswith(provider + "_") else x)
+                for x in items
+            ]
+
+    # Parse smart crops ratios
+    if "smart_crops_aspect_ratios" in out:
+        val = out["smart_crops_aspect_ratios"]
+        if isinstance(val, str):
+            try:
+                out["smart_crops_aspect_ratios"] = [float(x.strip()) for x in val.split(",") if x.strip()]
+            except ValueError:
+                del out["smart_crops_aspect_ratios"]  # fallback to default
+
+    # Normalize boolean
+    if "gender_neutral_caption" in out:
+        gnc = out["gender_neutral_caption"]
+        out["gender_neutral_caption"] = (
+            gnc if isinstance(gnc, bool) else str(gnc).lower() in ("true", "1", "yes", "on")
+        )
+
+    return out
+
+
+def get_advanced_ai_config(config_name, provider="azure_vision"):
     admin_dropbox = get_admin_dropbox_path()
     if not admin_dropbox:
         return None
 
-    config_file = os.path.join(admin_dropbox, "AdvancedAiExport", "Configs", f"{config_name}.json")
-    if os.path.exists(config_file):
-        try:
-            with open(config_file, 'r', encoding='utf-8') as f:
-                cfg = json.load(f)
-                if isinstance(cfg, dict):
-                    api_ver = str(cfg.get("api_version", DEFAULT_API_VERSION)).strip()
-                    if api_ver not in SUPPORTED_API_VERSIONS:
-                        cfg["api_version"] = DEFAULT_API_VERSION
-                    return cfg
-        except Exception as e:
-            logging.error(f"Failed to load config file {config_file}: {e}")
-
-    sample_file = os.path.join(admin_dropbox, "AdvancedAiExport", "Samples", f"{provider_name}.json")
-    if os.path.exists(sample_file):
-        try:
-            with open(sample_file, 'r', encoding='utf-8') as f:
-                cfg = json.load(f)
-                if isinstance(cfg, dict):
-                    return cfg
-        except Exception as e:
-            logging.error(f"Failed to load sample file {sample_file}: {e}")
+    for src in [
+        os.path.join(admin_dropbox, "AdvancedAiExport", "Configs", f"{config_name}.json"),
+        os.path.join(admin_dropbox, "AdvancedAiExport", "Samples", f"{provider}.json")
+    ]:
+        if os.path.exists(src):
+            try:
+                with open(src, 'r', encoding='utf-8') as f:
+                    cfg = json.load(f)
+                    if isinstance(cfg, dict):
+                        normalized = _normalize_ai_config_keys(cfg, provider)
+                        api_ver = str(normalized.get("api_version", DEFAULT_API_VERSION)).strip()
+                        if api_ver not in SUPPORTED_API_VERSIONS:
+                            normalized["api_version"] = DEFAULT_API_VERSION
+                        return normalized
+            except Exception as e:
+                logging.error(f"Failed to load {src}: {e}")
 
     return None
 
@@ -319,59 +358,95 @@ def _map_v4_to_v32_features(v4_features):
 
 def _build_v32_analyze_url(endpoint, visual_features, details, language):
     base = f"{endpoint}/vision/v3.2/analyze"
-    params = [f"visualFeatures={','.join(visual_features)}", f"language={language}"]
+    params = []
+    if visual_features:
+        params.append(f"visualFeatures={','.join(visual_features)}")
     if details:
         params.append(f"details={','.join(details)}")
+    params.append(f"language={language}")
     return base + "?" + "&".join(params)
 
 def analyze_image_v32(config, image_data, ai_config):
+    # Normalize inputs
     visual_features_raw = ai_config.get("visual_features", DEFAULT_VISUAL_FEATURES_V32)
-    if isinstance(visual_features_raw[0], str) and visual_features_raw[0].isupper():
+    
+    # Convert v4-style to v3.2 if needed
+    if isinstance(visual_features_raw, list) and visual_features_raw and isinstance(visual_features_raw[0], str) and visual_features_raw[0].isupper():
         visual_features = _map_v4_to_v32_features(visual_features_raw)
     else:
         visual_features = visual_features_raw
+
     details = ai_config.get("details", DEFAULT_DETAILS_V32)
     language = ai_config.get("language", DEFAULT_LANGUAGE)
-    if len(image_data) > 4*1024*1024:
+    
+    if len(image_data) > 4 * 1024 * 1024:
         logger.error("Image size exceeds 4MB limit for v3.2")
         sys.exit(8)
 
-    url = _build_v32_analyze_url(config["vision_endpoint"], visual_features, details, language)
-    headers = {
-        "Content-Type": "application/octet-stream",
-        "Ocp-Apim-Subscription-Key": config["vision_key"]
-    }
+    # Helper to build and execute request
+    def _try_analyze(vf_list, det_list):
+        # --- VALIDATE & SANITIZE ---
+        VALID_VF = {"Categories", "Tags", "Description", "Faces", "ImageType", "Color", "Adult", "Objects", "Brands"}
+        cleaned_vf = [f for f in vf_list if f in VALID_VF]
+        if not cleaned_vf:
+            cleaned_vf = ["Tags", "Description", "Objects"]
 
-    for attempt in range(10):
-        try:
-            response = make_request_with_retries("POST", url, data=image_data, headers=headers, max_retries=3)
-            if not response:
+        VALID_DETAILS = {"Celebrities", "Landmarks"}
+        cleaned_det = [d for d in det_list if d in VALID_DETAILS]
+
+        url = _build_v32_analyze_url(config["vision_endpoint"], cleaned_vf, cleaned_det, language)
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "Ocp-Apim-Subscription-Key": config["vision_key"]
+        }
+
+        for attempt in range(10):
+            try:
+                response = make_request_with_retries("POST", url, data=image_data, headers=headers, max_retries=3)
+                if response is not None and response.status_code == 200:
+                    return response.json(), None
+                elif response is not None and response.status_code == 403:
+                    logger.warning(f"Error Response ----------------------------> {response.text} ")
+                    if "celeb" in response.text.lower() or "access denied" in response.text.lower():
+                        return None, "celebrities_restricted"
+                    return None, f"forbidden_{response.status_code}"
+                elif response is not None and 400 <= response.status_code < 500:
+                    return None, f"client_error_{response.status_code}"
+                elif response is not None and response.status_code >= 500:
+                    if attempt == 9:
+                        return None, "server_error"
+                    time.sleep(30 + attempt * 10)
+                else:
+                    if attempt == 9:
+                        return None, "unknown"
+                    time.sleep(20 + attempt * 5)
+            except Exception as e:
                 if attempt == 9:
-                    return None
-                time.sleep(10 + attempt * 5)
-                continue
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 429:
-                retry_after = int(response.headers.get('Retry-After', 60))
-                time.sleep(retry_after + 10)
-            elif response.status_code == 403 and 'quota' in response.text.lower():
-                time.sleep(120)
-            elif response.status_code in (400, 401, 404):
-                return None
-            elif response.status_code >= 500:
-                if attempt == 9:
-                    return None
-                time.sleep(30 + attempt * 10)
-            else:
-                if attempt == 9:
-                    return None
-                time.sleep(20 + attempt * 5)
-        except Exception:
-            if attempt == 9:
-                return None
-            time.sleep(15 + attempt * 5)
+                    return None, "exception"
+                time.sleep(15 + attempt * 5)
+        return None, "max_retries"
+
+    # First attempt: with full config
+    result, error = _try_analyze(visual_features, details)
+    if result is not None:
+        return result
+
+    # Fallback: remove Celebrities if that's the issue
+    if error == "celebrities_restricted" and "Celebrities" in details:
+        logger.warning("Celebrities not permitted. Retrying without 'Celebrities'...")
+        safe_details = [d for d in details if d != "Celebrities"]
+        result, _ = _try_analyze(visual_features, safe_details)
+        if result is not None:
+            logger.info("Analysis succeeded after removing 'Celebrities'.")
+            return result
+        else:
+            logger.error("Fallback analysis also failed.")
+            return None
+
+    # Other errors: no fallback
+    logger.error(f"v3.2 analysis failed: {error}")
     return None
+
 
 # --- Main ---
 if __name__ == "__main__":
@@ -411,12 +486,14 @@ if __name__ == "__main__":
         logging.info(f"[DRY RUN] Config: {args.config_name}, Endpoint: {cloud_config_data['vision_endpoint']}")
         sys.exit(0)
 
-    ai_config = get_advanced_ai_config(args.config_name, "azure_vision") or {}
+    ai_config = get_advanced_ai_config(args.config_name, cloud_config_data.get("provider", "azure_vision")) or {}
     api_version = ai_config.get("api_version", DEFAULT_API_VERSION)
 
     if mode == "analyze_and_embed" and api_version == "3.2":
         logging.error("Embedding not supported in API v3.2")
-        sys.exit(13)
+        
+    if api_version == "4.0" and ai_config.get("details"):
+        logger.debug("'details' is not used in API v4.0 and will be ignored.")        
 
     if api_version == "4.0":
         analysis = analyze_image_v4(cloud_config_data, image_data, ai_config)
