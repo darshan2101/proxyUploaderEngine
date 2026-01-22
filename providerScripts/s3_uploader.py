@@ -13,6 +13,8 @@ import random
 import time
 from requests.adapters import HTTPAdapter
 from requests.exceptions import RequestException, SSLError, ConnectionError, Timeout
+from botocore.config import Config
+from botocore.exceptions import ClientError, EndpointConnectionError, ReadTimeoutError
 
 # Constants
 VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet", "analyze_and_embed"]
@@ -25,6 +27,40 @@ NORMALIZER_SCRIPT_PATH = "/opt/sdna/bin/rekognition_metadata_normalizer.py"
 # Detect platform
 IS_LINUX = os.path.isdir("/opt/sdna/bin")
 DNA_CLIENT_SERVICES = LINUX_CONFIG_PATH if IS_LINUX else MAC_CONFIG_PATH
+
+# Rekognition Video feature mapping
+VIDEO_FEATURE_MAP = {
+    "LABEL_DETECTION": {
+        "start": "start_label_detection",
+        "get": "get_label_detection",
+        "supports_min_conf": True
+    },
+    "FACE_DETECTION": {
+        "start": "start_face_detection",
+        "get": "get_face_detection",
+        "supports_min_conf": True
+    },
+    "CONTENT_MODERATION": {
+        "start": "start_content_moderation",
+        "get": "get_content_moderation",
+        "supports_min_conf": True
+    },
+    "CELEBRITY_RECOGNITION": {
+        "start": "start_celebrity_recognition",
+        "get": "get_celebrity_recognition",
+        "supports_min_conf": False
+    },
+    "TEXT_DETECTION": {
+        "start": "start_text_detection",
+        "get": "get_text_detection",
+        "supports_min_conf": True
+    },
+    "PERSON_TRACKING": {
+        "start": "start_person_tracking",
+        "get": "get_person_tracking",
+        "supports_min_conf": True
+    },
+}
 
 def extract_file_name(path):
     return os.path.basename(path)
