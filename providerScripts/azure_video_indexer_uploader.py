@@ -38,6 +38,24 @@ NORMALIZER_SCRIPT_PATH = "/opt/sdna/bin/azurevi_metadata_normalizer.py"
 IS_LINUX = os.path.isdir("/opt/sdna/bin")
 DNA_CLIENT_SERVICES = LINUX_CONFIG_PATH if IS_LINUX else MAC_CONFIG_PATH
 
+SDNA_EVENT_MAP = {    
+    "azure_video_transcript": "transcript",
+    "azure_video_ocr" : "ocr",
+    "azure_video_keywords" : "keywords",
+    "azure_video_topics" : "topics",
+    "azure_video_labels" : "lables",
+    "azure_video_brands" : "brands",
+    "azure_video_named_locations" : "locations",
+    "azure_video_named_people" : "celebrities",
+    "azure_video_audio_effects" : "effects",
+    "azure_video_detected_objects" : "objects",
+    "azure_video_sentiments" : "sentiments",
+    "azure_video_emotions" : "emotions",
+    "azure_video_visual_content_moderation" : "moderation",
+    "azure_video_frame_patterns" : "patterns",
+    "azure_video_speakers" : "speakers"
+}
+
 # Initialize logger
 logger = logging.getLogger()
 def setup_logging(level):
@@ -123,32 +141,95 @@ def get_admin_dropbox_path():
         return None
 
 def get_advanced_ai_config(config_name, provider_name="azurevi"):
-    """Load Advanced AI config from admin dropbox or fallback to sample"""
     admin_dropbox = get_admin_dropbox_path()
     if not admin_dropbox:
-        return None
+        return {}
 
-    config_file = os.path.join(admin_dropbox, "AdvancedAiExport", "Configs", f"{config_name}.json")
-    if os.path.exists(config_file):
-        try:
-            with open(config_file, 'r', encoding='utf-8') as f:
-                cfg = json.load(f)
-                if isinstance(cfg, dict):
-                    return cfg
-        except Exception as e:
-            logging.error(f"Failed to load Advanced AI config: {e}")
+    provider_key = provider_name.lower()  # "azurevi"
 
-    sample_file = os.path.join(admin_dropbox, "AdvancedAiExport", "Samples", f"{provider_name}.json")
-    if os.path.exists(sample_file):
-        try:
-            with open(sample_file, 'r', encoding='utf-8') as f:
-                cfg = json.load(f)
-                if isinstance(cfg, dict):
-                    return cfg
-        except Exception as e:
-            logging.error(f"Failed to load Advanced AI sample config: {e}")
+    for src in [
+        os.path.join(admin_dropbox, "AdvancedAiExport", "Configs", f"{config_name}.json"),
+        os.path.join(admin_dropbox, "AdvancedAiExport", "Samples", f"{provider_name}.json")
+    ]:
+        if os.path.exists(src):
+            try:
+                with open(src, 'r', encoding='utf-8') as f:
+                    raw = json.load(f)
+                    if not isinstance(raw, dict):
+                        continue
 
-    return None
+                    out = {}
+                    # Normalize top-level keys: strip optional "azurevi_" or "AZUREVI_" prefix
+                    for key, val in raw.items():
+                        key_lower = key.lower()
+                        clean_key = key[len(provider_key) + 1:] if key_lower.startswith(provider_key + "_") else key
+                        # Accept known Azure VI config keys
+                        if clean_key in {
+                            "features",
+                            "indexingPreset",
+                            "language",
+                            "isSearchable",
+                            "brandsCategories",
+                            "customLanguages",
+                            "preventDuplicates",
+                            "retentionPeriod"
+                        }:
+                            out[clean_key] = val
+
+                    # Normalize features: strip redundant provider prefixes
+                    if "features" in out:
+                        feats = out["features"]
+                        if isinstance(feats, str):
+                            feats = [x.strip() for x in feats.split(",") if x.strip()]
+                        cleaned = []
+                        for f in feats:
+                            if isinstance(f, str):
+                                f_lower = f.lower()
+                                for prefix in ["azurevi_", "azurvi_", "provider_", "videoindexer_"]:
+                                    if f_lower.startswith(prefix):
+                                        f = f[len(prefix):]
+                                        break
+                                cleaned.append(f)
+                            else:
+                                cleaned.append(f)
+                        out["features"] = cleaned
+
+                    # Normalize brandsCategories: string → list → comma-joined string (as VI expects)
+                    if "brandsCategories" in out:
+                        bc = out["brandsCategories"]
+                        if isinstance(bc, list):
+                            out["brandsCategories"] = ",".join(str(x).strip() for x in bc if x)
+                        elif isinstance(bc, str):
+                            out["brandsCategories"] = ",".join(x.strip() for x in bc.split(",") if x.strip())
+
+                    # Normalize customLanguages: list or string → comma-joined string
+                    if "customLanguages" in out:
+                        cl = out["customLanguages"]
+                        if isinstance(cl, list):
+                            out["customLanguages"] = ",".join(str(x).strip() for x in cl if x)
+                        elif isinstance(cl, str):
+                            out["customLanguages"] = ",".join(x.strip() for x in cl.split(",") if x.strip())
+
+                    # Normalize booleans
+                    for bool_key in ["isSearchable", "preventDuplicates"]:
+                        if bool_key in out:
+                            v = out[bool_key]
+                            out[bool_key] = v if isinstance(v, bool) else str(v).lower() in ("true", "1", "yes", "on")
+
+                    # Normalize retentionPeriod → int
+                    if "retentionPeriod" in out:
+                        try:
+                            out["retentionPeriod"] = int(out["retentionPeriod"])
+                        except (ValueError, TypeError):
+                            del out["retentionPeriod"]
+
+                    logging.info(f"Loaded and normalized Azure VI config from: {src}")
+                    return out
+
+            except Exception as e:
+                logging.error(f"Failed to load {src}: {e}")
+
+    return {}
 
 def parse_metadata_file(properties_file):
     """Parse metadata from .json, .xml, or .csv/.txt (key,value) file"""
@@ -293,21 +374,26 @@ def get_azurevi_normalized_metadata(raw_metadata_file_path, norm_metadata_file_p
         logging.error(f"Error normalizing metadata: {e}")
         return False
 
-def transform_normlized_to_enriched(norm_metadata_file_path):
+def transform_normlized_to_enriched(norm_metadata_file_path, filetype_prefix):
     try:
         with open(norm_metadata_file_path, "r") as f:
             data = json.load(f)
         result = []
         for event_type, detections in data.items():
+            sdna_event_type = SDNA_EVENT_MAP.get(event_type, 'unknown')
+ 
             for detection in detections:
+                occurrences = detection.get("occurrences", [])
+ 
                 event_obj = {
                     "eventType": event_type,
+                    "sdnaEventTypePrefix": filetype_prefix,
+                    "sdnaEventType": sdna_event_type,
                     "eventValue": detection.get("value", ""),
-                    "totalOccurrences": len(detection.get("occurrences", [])),
-                    "eventOccurence": detection.get("occurrences", [])
+                    "totalOccurrences": len(occurrences),
+                    "eventOccurence": occurrences
                 }
                 result.append(event_obj)
-       
         return result, True
     except Exception as e:
         return f"Error during transformation: {e}", False
@@ -1014,6 +1100,7 @@ if __name__ == "__main__":
     parser.add_argument("--parent-id", help="Parent folder ID (unused)")
     parser.add_argument("-sl", "--size-limit", help="File size limit in MB")
     parser.add_argument("-r", "--repo-guid", help="Override repo GUID")
+    parser.add_argument("--enrich-prefix", help="Prefix to add for sdnaEventType of AI enrich data")
     parser.add_argument("--dry-run", action="store_true", help="Dry run")
     parser.add_argument("--log-level", default="info", help="Log level")
     parser.add_argument("--export-ai-metadata", help="Export AI metadata")
@@ -1039,6 +1126,9 @@ if __name__ == "__main__":
         sys.exit(1)
 
     section = cloud_config[args.config_name]
+    
+    filetype_prefix = args.enrich_prefix if args.enrich_prefix else "gen"
+
     if args.export_ai_metadata:
         section["export_ai_metadata"] = "true" if args.export_ai_metadata.lower() == "true" else "false"
     try:
@@ -1075,7 +1165,9 @@ if __name__ == "__main__":
 
         if norm_path:
             try:
-                enriched, success = transform_normlized_to_enriched(norm_path)
+                meta_path, _ = get_store_paths()
+                norm_metadata_file_path = os.path.join(meta_path.split("/./")[0] if "/./" in meta_path else meta_path.split("/$/")[0] if "/$/" in meta_path else meta_path, norm_path)
+                enriched, success = transform_normlized_to_enriched(norm_metadata_file_path, filetype_prefix)
                 if success and client.send_ai_enriched_metadata(args.repo_guid, catalog_path_clean, enriched):
                     logger.info("AI enriched metadata sent successfully.")
                 else:
@@ -1316,7 +1408,9 @@ if __name__ == "__main__":
 
                 if norm_path:
                     try:
-                        enriched, enrich_success = transform_normlized_to_enriched(norm_path)
+                        meta_path, _ = get_store_paths()
+                        norm_metadata_file_path = os.path.join(meta_path.split("/./")[0] if "/./" in meta_path else meta_path.split("/$/")[0] if "/$/" in meta_path else meta_path, norm_path)
+                        enriched, enrich_success = transform_normlized_to_enriched(norm_metadata_file_path, filetype_prefix)
                         if enrich_success and client.send_ai_enriched_metadata(args.repo_guid, catalog_path_clean, enriched):
                             logger.info("AI enriched metadata sent successfully.")
                         else:
