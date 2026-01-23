@@ -16,6 +16,8 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, Tuple
 import subprocess
+from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
+from datetime import datetime, timedelta
 
 # =============================
 # Constants
@@ -172,7 +174,11 @@ def get_advanced_ai_config(config_name, provider_name="azurevi"):
                             "brandsCategories",
                             "customLanguages",
                             "preventDuplicates",
-                            "retentionPeriod"
+                            "retentionPeriod",
+                            "translationLanguages",
+                            "storageAccountName",
+                            "storageAccountKey",
+                            "storageContainer"
                         }:
                             out[clean_key] = val
 
@@ -203,12 +209,14 @@ def get_advanced_ai_config(config_name, provider_name="azurevi"):
                             out["brandsCategories"] = ",".join(x.strip() for x in bc.split(",") if x.strip())
 
                     # Normalize customLanguages: list or string → comma-joined string
-                    if "customLanguages" in out:
-                        cl = out["customLanguages"]
-                        if isinstance(cl, list):
-                            out["customLanguages"] = ",".join(str(x).strip() for x in cl if x)
-                        elif isinstance(cl, str):
-                            out["customLanguages"] = ",".join(x.strip() for x in cl.split(",") if x.strip())
+                    if "translationLanguages" in out:
+                        tl = out["translationLanguages"]
+                        if isinstance(tl, list):
+                            out["translationLanguages"] = [str(x).strip() for x in tl if x]
+                        elif isinstance(tl, str):
+                            out["translationLanguages"] = [x.strip() for x in tl.split(",") if x.strip()]
+                        else:
+                            out["translationLanguages"] = []
 
                     # Normalize booleans
                     for bool_key in ["isSearchable", "preventDuplicates"]:
@@ -331,7 +339,27 @@ def make_request_with_retries(method, url, **kwargs):
 
     if last_exception:
         raise last_exception
-    return None  # Should not reach here
+    return None
+
+def add_metadata_directory(repo_guid: str, provider: str, file_path: str) -> tuple:
+    meta_path, _ = get_store_paths()
+    if not meta_path:
+        logger.error("Metadata Store settings not found.")
+        return None, None, None, None
+
+    if "/./" in meta_path:
+        meta_left, meta_right = meta_path.split("/./", 1)
+    else:
+        meta_left, meta_right = meta_path, ""
+    meta_left = meta_left.rstrip("/")
+
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    repo_guid_str = str(repo_guid)
+
+    metadata_dir = os.path.join(meta_left, meta_right, repo_guid_str, file_path, provider)
+    os.makedirs(metadata_dir, exist_ok=True)
+
+    return metadata_dir, meta_right, base_name
 
 def get_node_api_key():
     api_key = ""
@@ -485,6 +513,105 @@ def get_account_access_token_async(consts: Consts, arm_access_token: str, permis
             delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
             time.sleep(delay)
     raise RuntimeError("get_account_access_token_async failed")
+
+# =============================
+# Azure Blob Storage Helper
+# =============================
+
+def get_blob_storage_config(section, advanced_ai_config):
+    """Fetch blob storage credentials from section or advanced config."""
+    # Try section first
+    account_name = section.get("storage_account_name")
+    account_key = section.get("storage_account_key")
+    container_name = section.get("storage_container")
+    if not (account_name and account_key and container_name):
+        # Fall back to advanced config
+        account_name = advanced_ai_config.get("storageAccountName")
+        account_key = advanced_ai_config.get("storageAccountKey")
+        container_name = advanced_ai_config.get("storageContainer")
+
+    if not (account_name and account_key and container_name):
+        return None
+
+    return {
+        "account_name": account_name,
+        "account_key": account_key,
+        "container_name": container_name
+    }
+
+def upload_to_blob_storage(file_path, blob_config):
+    """Upload large file to Azure Blob Storage using parallel block upload."""
+    account_name = blob_config["account_name"]
+    account_key = blob_config["account_key"]
+    container_name = blob_config["container_name"]
+
+    blob_service_client = BlobServiceClient(
+        account_url=f"https://{account_name}.blob.core.windows.net",
+        credential=account_key
+    )
+
+    container_client = blob_service_client.get_container_client(container_name)
+    if not container_client.exists():
+        container_client.create_container()
+
+    blob_name = os.path.basename(file_path)
+    blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
+
+    # Use high-performance parallel upload
+    with open(file_path, "rb") as data:
+        blob_client.upload_blob(
+            data,
+            overwrite=True,
+            max_concurrency=8,
+            validate_content=False,
+            encoding=None
+        )
+
+    # Generate SAS URL (valid 48h for safety during VI processing)
+    sas_token = generate_blob_sas(
+        account_name=account_name,
+        container_name=container_name,
+        blob_name=blob_name,
+        account_key=account_key,
+        permission=BlobSasPermissions(read=True),
+        expiry=datetime.utcnow() + timedelta(hours=48)
+    )
+    sas_url = f"https://{account_name}.blob.core.windows.net/{container_name}/{blob_name}?{sas_token}"
+    return sas_url, blob_name
+
+def refresh_sas_url(blob_config, blob_name, duration_hours=24):
+    """Generate a fresh SAS URL for an existing blob."""
+    sas_token = generate_blob_sas(
+        account_name=blob_config["account_name"],
+        container_name=blob_config["container_name"],
+        blob_name=blob_name,
+        account_key=blob_config["account_key"],
+        permission=BlobSasPermissions(read=True),
+        expiry=datetime.utcnow() + timedelta(hours=duration_hours)
+    )
+    return f"https://{blob_config['account_name']}.blob.core.windows.net/{blob_config['container_name']}/{blob_name}?{sas_token}"
+
+def delete_blob(blob_config: dict, blob_name: str) -> bool:
+    """Safely delete a blob from Azure Blob Storage."""
+    try:
+        blob_service_client = BlobServiceClient(
+            account_url=f"https://{blob_config['account_name']}.blob.core.windows.net",
+            credential=blob_config["account_key"]
+        )
+        blob_client = blob_service_client.get_blob_client(
+            container=blob_config["container_name"],
+            blob=blob_name
+        )
+        if blob_client.exists():
+            blob_client.delete_blob()
+            logger.info(f"✅ Blob '{blob_name}' deleted successfully.")
+            return True
+        else:
+            logger.warning(f"Blob '{blob_name}' not found — nothing to delete.")
+            return True  # treat as success
+    except Exception as e:
+        logger.error(f"❌ Failed to delete blob '{blob_name}': {e}")
+        return False
 
 # =============================
 # VideoIndexerClient Class
@@ -662,7 +789,8 @@ class VideoIndexerClient:
 
     def file_upload_async(
         self,
-        media_path: str,
+        media_path: Optional[str] = None,
+        video_url: Optional[str] = None,
         video_name: Optional[str] = None,
         description: str = "",
         privacy: str = "Private",
@@ -681,10 +809,21 @@ class VideoIndexerClient:
             excluded_ai = []
         if metadata is None:
             metadata = {}
-        if not os.path.exists(media_path):
+
+        # Validate input
+        if not media_path and not video_url:
+            raise ValueError("Either media_path or video_url must be provided.")
+        if media_path and video_url:
+            raise ValueError("Provide only one of media_path or video_url.")
+
+        if media_path and not os.path.exists(media_path):
             raise FileNotFoundError(f"Media file not found: {media_path}")
+
         if video_name is None:
-            video_name = os.path.splitext(os.path.basename(media_path))[0]
+            if media_path:
+                video_name = os.path.splitext(os.path.basename(media_path))[0]
+            else:
+                video_name = "remote_video"
 
         self.get_account()
         url = (
@@ -696,7 +835,6 @@ class VideoIndexerClient:
         params = {
             "accessToken": self.vi_access_token,
             "name": video_name[:80],
-            "description": description,
             "privacy": privacy,
             "partition": partition
         }
@@ -727,9 +865,17 @@ class VideoIndexerClient:
 
         for attempt in range(3):
             try:
-                with open(media_path, 'rb') as f:
-                    files = {'file': (video_name, f, 'video/mp4')}
-                    response = requests.post(url, params=params, files=files)
+                if video_url:
+                    # Remote upload via videoUrl
+                    params["videoUrl"] = video_url
+                    logger.info(f"Using remote video URL (SAS): {video_url[:60]}...")
+                    response = requests.post(url, params=params)
+                else:
+                    # Local file upload
+                    with open(media_path, 'rb') as f:
+                        files = {'file': (video_name, f, 'video/mp4')}
+                        response = requests.post(url, params=params, files=files)
+
                 if response.status_code in (200, 201):
                     video_id = response.json().get("id")
                     logger.info(f"✅ Upload successful. Video ID: {video_id}")
@@ -752,6 +898,7 @@ class VideoIndexerClient:
                 base_delay = [1, 3, 10][attempt]
                 delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
                 time.sleep(delay)
+
         logger.critical(f"Upload failed after 3 attempts: {video_name}")
         raise RuntimeError("Upload failed after retries.")
 
@@ -817,15 +964,25 @@ class VideoIndexerClient:
 
     def resolve_conflict_and_upload(
         self,
-        media_path: str,
         conflict_mode: str,
+        media_path: Optional[str] = None,
+        video_url: Optional[str] = None,
         video_name: Optional[str] = None,
         **upload_kwargs
     ) -> Tuple[str, bool]:
         if conflict_mode not in CONFLICT_RESOLUTION_MODES:
             raise ValueError(f"Invalid conflict_mode: {conflict_mode}. Use: {CONFLICT_RESOLUTION_MODES}")
-        file_name = extract_file_name(media_path)
-        file_size = os.path.getsize(media_path)
+
+        # Determine file name
+        if media_path:
+            file_name = extract_file_name(media_path)
+            file_size = os.path.getsize(media_path)
+        elif video_url:
+            file_name = video_name or "remote_video"
+            file_size = "N/A (remote)"
+        else:
+            raise ValueError("Either media_path or video_url must be provided.")
+
         metadata = upload_kwargs.get("metadata", {})
         partition = metadata.get("repoGuid")
         if not partition:
@@ -835,11 +992,19 @@ class VideoIndexerClient:
             (v for v in videos if v["name"] == file_name),
             None
         )
+
         if not matching_video:
-            video_id = self.file_upload_async(media_path, video_name=video_name, **upload_kwargs)
+            video_id = self.file_upload_async(
+                media_path=media_path,
+                video_url=video_url,
+                video_name=video_name,
+                **upload_kwargs
+            )
             return video_id, True
+
         video_id = matching_video["id"]
         logger.info(f"Found matching video: ID={video_id}, Name='{file_name}', Size={file_size}")
+
         if conflict_mode == "skip":
             self.update_catalog(partition, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], video_id)
             logger.info("Conflict mode 'skip'. Skipping upload.")
@@ -848,7 +1013,12 @@ class VideoIndexerClient:
             logger.info("Conflict mode 'overwrite'. Deleting and re-uploading.")
             if not self.delete_video(video_id):
                 raise RuntimeError("Failed to delete existing video for overwrite.")
-            video_id = self.file_upload_async(media_path, video_name=video_name, **upload_kwargs)
+            video_id = self.file_upload_async(
+                media_path=media_path,
+                video_url=video_url,
+                video_name=video_name,
+                **upload_kwargs
+            )
             return video_id, True
         elif conflict_mode == "reindex":
             logger.info("Conflict mode 'reindex'. Triggering reindex.")
@@ -951,42 +1121,121 @@ class VideoIndexerClient:
             if attempt < max_attempts - 1:
                 time.sleep(2 ** attempt)
         return None
-    
-    def store_metadata_file(self, repo_guid, file_path, metadata, max_attempts=3):
-        meta_path, proxy_path = get_store_paths()
-        if not meta_path:
-            logging.error("Metadata Store settings not found.")
-            return None, None
 
+    def get_translated_metadata(self, video_id: str, language_code: str, max_attempts=3):
+        self.get_account()
+        url = (
+            f"{API_ENDPOINT}/{self.account['location']}/Accounts/"
+            f"{self.account['properties']['accountId']}/Videos/{video_id}/Index"
+        )
+        params = {
+            "accessToken": self.vi_access_token,
+            "language": language_code  # This triggers translation
+        }
+
+        for attempt in range(max_attempts):
+            try:
+                response = make_request_with_retries("GET", url, params=params)
+                if response and response.status_code == 200:
+                    data = response.json()
+                    if data.get("state") != "Processed":
+                        logger.warning(f"Video not processed yet. Current state: {data.get('state')}")
+                        return None
+                    videos = data.get("videos", [])
+                    if videos and "insights" in videos[0]:
+                        logger.info(f"Retrieved translated metadata for language: {language_code}")
+                        return videos[0]["insights"]
+                    else:
+                        logger.warning(f"No insights found for language: {language_code}")
+                        return None
+                else:
+                    logger.warning(f"Failed to fetch translated metadata (status {response.status_code if response else 'No response'})")
+            except Exception as e:
+                logger.warning(f"Error fetching translated metadata (attempt {attempt+1}): {e}")
+            if attempt < max_attempts - 1:
+                time.sleep(2 ** attempt)
+        return None
+
+    def save_metadata_to_file(self, file_path: str, metadata: dict) -> bool:
+        try:
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=4)
+            logger.info(f"Saved metadata to: {file_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save metadata to {file_path}: {e}")
+            return False
+
+    def combine_multilanguage_metadata(self, base_metadata: dict, translated_data: dict) -> dict:
+        combined = {
+            "version": base_metadata.get("version", "1.0"),
+            "id": base_metadata.get("id"),
+            "name": base_metadata.get("name"),
+            "description": base_metadata.get("description"),
+            "insights": base_metadata
+        }
+        if translated_data:
+            combined["multilanguage_insights"] = translated_data
+        return combined
+
+    def fetch_and_save_all_metadata(self, video_id: str, repo_guid: str, file_path: str, translation_languages: list = None) -> tuple:
+        # Build metadata directory
         provider = section.get("provider", "AZUREVI")
-        base = os.path.splitext(os.path.basename(file_path))[0]
-        repo_guid_str = str(repo_guid)
+        metadata_dir, meta_right, base_name = add_metadata_directory(repo_guid, provider, file_path)
+
+        # 1. Fetch and save base metadata
+        logger.info("Fetching base metadata...")
+        base_metadata = self.get_ai_metadata(video_id)
+        if not base_metadata:
+            logger.error("Failed to fetch base metadata")
+            return None
+
+        base_json_path = os.path.join(metadata_dir, f"{base_name}.json")
+        if not self.save_metadata_to_file(base_json_path, base_metadata):
+            logger.error("Failed to save base metadata")
+            return None
+
+        # 2. Fetch and save translated metadata
+        translated_data = {}
+        if translation_languages:
+            logger.info(f"Fetching translations for languages: {translation_languages}")
+            for lang_code in translation_languages:
+                logger.info(f"Fetching translation for: {lang_code}")
+                translated_insights = self.get_translated_metadata(video_id, lang_code)
+                
+                if translated_insights:
+                    # Save individual language file
+                    lang_json_path = os.path.join(metadata_dir, f"{base_name}_transcript_{lang_code}.json")
+                    if self.save_metadata_to_file(lang_json_path, translated_insights):
+                        translated_data[lang_code] = translated_insights
+                    else:
+                        logger.warning(f"Failed to save translation for {lang_code}")
+                else:
+                    logger.warning(f"No translation data received for {lang_code}")
+
+        # 3. Combine metadata
+        combined_metadata = self.combine_multilanguage_metadata(base_metadata, translated_data)
+        return combined_metadata
+
+    def store_metadata_file(self, repo_guid, file_path, metadata, max_attempts=3):
+        # -----------------------------------------
+        # 1. Build metadata directory
+        # -----------------------------------------
+        provider = section.get("provider", "AZUREVI")
+        metadata_dir, meta_right, base = add_metadata_directory(repo_guid, provider, file_path)
 
         # -----------------------------------------
-        # 1. Split meta_path at /./
+        # 2. Build PHYSICAL PATH (local disk path) metadata_dir/file_paths
         # -----------------------------------------
-        if "/./" in meta_path:
-            meta_left, meta_right = meta_path.split("/./", 1)
-        else:
-            meta_left, meta_right = meta_path, ""
-
-        meta_left = meta_left.rstrip("/")
-
-        # -----------------------------------------
-        # 2. Build PHYSICAL PATH (local disk path) meta_left/meta_right/repo_guid/file_path/provider
-        # -----------------------------------------
-        metadata_dir = os.path.join(meta_left, meta_right, repo_guid_str, file_path, provider)
-        os.makedirs(metadata_dir, exist_ok=True)
-
-        # Full local physical paths
         raw_json = os.path.join(metadata_dir, f"{base}_raw.json")
         norm_json = os.path.join(metadata_dir, f"{base}_norm.json")
 
         # -----------------------------------------
         # 3. Returned paths (AFTER /./) meta_right/repo_guid/file_path/provider/file.json
         # -----------------------------------------
-        raw_return = os.path.join(meta_right, repo_guid_str, file_path, provider, f"{base}_raw.json")
-        norm_return = os.path.join(meta_right, repo_guid_str, file_path, provider, f"{base}_norm.json")
+        raw_return = os.path.join(meta_right, str(repo_guid), file_path, provider, f"{base}_raw.json")
+        norm_return = os.path.join(meta_right, str(repo_guid), file_path, provider, f"{base}_norm.json")
 
         raw_success = False
         norm_success = False
@@ -1149,13 +1398,20 @@ if __name__ == "__main__":
         if not all([args.asset_id, args.repo_guid, args.catalog_path]):
             fail("Asset ID, Repo GUID, and Catalog path required.", 1)
 
+        catalog_path_clean = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
+        advanced_ai_config = get_advanced_ai_config(args.config_name, "azurevi") or {}
+        translation_languages = advanced_ai_config.get("translationLanguages", [])
+
         client = VideoIndexerClient(consts)
         client.authenticate()
-        ai_metadata = client.get_ai_metadata(args.asset_id)
+        ai_metadata = client.fetch_and_save_all_metadata(
+            args.asset_id, 
+            args.repo_guid, 
+            catalog_path_clean,
+            translation_languages
+        )
         if not ai_metadata:
             fail("No AI metadata returned.")
-
-        catalog_path_clean = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
         raw_path, norm_path = client.store_metadata_file(args.repo_guid, catalog_path_clean, ai_metadata)
 
         if not client.send_extracted_metadata(args.repo_guid, catalog_path_clean, raw_path, norm_path):
@@ -1287,29 +1543,6 @@ if __name__ == "__main__":
     relative_path = normalized_path.split("/1/", 1)[-1] if "/1/" in normalized_path else normalized_path
     repo_guid = args.repo_guid or (normalized_path.split("/1/")[0].split("/")[-1] if "/1/" in normalized_path else "")
 
-    client_ip, _ = (args.controller_address.split(":", 1) if args.controller_address and ":" in args.controller_address
-                    else get_link_address_and_port())
-    backlink_url = (
-        f"https://{client_ip}/dashboard/projects/{args.job_guid or ''}"
-        f"/browse&search?path={urllib.parse.quote(relative_path)}"
-        f"&filename={urllib.parse.quote(file_name_for_url)}"
-    )
-
-    metadata = {
-        "relativePath": "/" + relative_path if not relative_path.startswith("/") else relative_path,
-        "repoGuid": repo_guid,
-        "fileName": file_name_for_url,
-        "fabric_size": os.path.getsize(matched_file),
-        "fabric-URL": backlink_url
-    }
-
-    # Paths and backlink
-    file_name_for_url = extract_file_name(args.catalog_path)
-    catalog_dir = remove_file_name_from_path(args.catalog_path or matched_file)
-    normalized_path = catalog_dir.replace("\\", "/")
-    relative_path = normalized_path.split("/1/", 1)[-1] if "/1/" in normalized_path else normalized_path
-    repo_guid = args.repo_guid or (normalized_path.split("/1/")[0].split("/")[-1] if "/1/" in normalized_path else "")
-
     # Backlink URL
     job_guid = args.job_guid or ""
     client_ip, _ = (args.controller_address.split(":", 1) if args.controller_address and ":" in args.controller_address
@@ -1362,9 +1595,28 @@ if __name__ == "__main__":
         partition = metadata.pop("partition", repo_guid)
         description = backlink_url
 
+        # Determine if we should use blob storage (file > 2 GB)
+        USE_BLOB_THRESHOLD = 2 * 1024 * 1024 * 1024  # 2 GB
+        file_size = os.path.getsize(matched_file)
+        use_blob = file_size > USE_BLOB_THRESHOLD
+
+        blob_config = None
+        sas_url = None
+        blob_name = None
+
+        if use_blob:
+            blob_config = get_blob_storage_config(section, advanced_ai_config)
+            if not blob_config:
+                logger.error("File > 2 GB but Azure Blob Storage credentials missing in config or advanced JSON.")
+                sys.exit(6)
+            logger.info("File exceeds 2 GB. Uploading to Azure Blob Storage...")
+            sas_url, blob_name = upload_to_blob_storage(matched_file, blob_config)
+            logger.info(f"Uploaded to blob. SAS URL generated (expires in 24h).")
+
         # Upload or resolve conflict
-        video_id, is_new = client.resolve_conflict_and_upload(
-            media_path=matched_file,
+        if use_blob:
+            video_id, is_new = client.resolve_conflict_and_upload(
+            video_url=sas_url,
             conflict_mode=conflict_mode,
             video_name=file_name,
             description=description,
@@ -1379,7 +1631,25 @@ if __name__ == "__main__":
             brands_categories=brands_categories,
             custom_languages=custom_languages,
             prevent_duplicates=prevent_duplicates
-        )
+            )
+        else:
+            video_id, is_new = client.resolve_conflict_and_upload(
+                media_path=matched_file,
+                conflict_mode=conflict_mode,
+                video_name=file_name,
+                description=description,
+                privacy="Private",
+                partition=partition,
+                metadata=metadata,
+                excluded_ai=excluded_ai,
+                indexing_preset=indexing_preset,
+                language=language,
+                retention_period=retention_period,
+                is_searchable=is_searchable,
+                brands_categories=brands_categories,
+                custom_languages=custom_languages,
+                prevent_duplicates=prevent_duplicates
+            )
         status = "Processed" if conflict_mode == "skip" else "Unknown"
         # Only poll if it's a new upload or reindex was not enough
         if conflict_mode != "skip" or is_new == True:
@@ -1391,14 +1661,18 @@ if __name__ == "__main__":
         print(f"VideoID={video_id}")
 
         catalog_path_clean = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
-        print(f"export_ai_metadata={section.get('export_ai_metadata', 'false')}")
         if section.get("export_ai_metadata") == "true" and status == "Processed" and is_new == True:
             try:
-                ai_metadata = client.get_ai_metadata(video_id)
+                translation_languages = advanced_ai_config.get("translationLanguages", [])
+                ai_metadata = client.fetch_and_save_all_metadata(
+                    video_id,
+                    repo_guid, 
+                    catalog_path_clean,
+                    translation_languages
+                )
                 if not ai_metadata:
                     fail("No AI metadata returned.")
 
-                catalog_path_clean = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
                 raw_path, norm_path = client.store_metadata_file(args.repo_guid, catalog_path_clean, ai_metadata)
 
                 if not client.send_extracted_metadata(args.repo_guid, catalog_path_clean, raw_path, norm_path):
@@ -1422,6 +1696,13 @@ if __name__ == "__main__":
 
             except Exception as e:
                 fail(f"Error extracting/sending AI metadata: {e}")
+
+        # Clean up blob if used
+        if use_blob and blob_config and blob_name:
+            if delete_blob(blob_config, blob_name):
+                logger.info("Temporary blob cleaned up.")
+            else:
+                logger.warning("Blob cleanup failed — manual cleanup may be required.")
 
         sys.exit(0)
 
