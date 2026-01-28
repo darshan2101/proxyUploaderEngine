@@ -209,6 +209,7 @@ def save_extended_metadata(repo_guid, provider, file_path, raw_metadata_path=Non
     payload = {
         "repoGuid": repo_guid,
         "providerName": provider,
+        "sourceLanguage": "Default",
         "extendedMetadata": [{
             "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
             "fileName": os.path.basename(file_path)
@@ -284,6 +285,7 @@ def send_ai_enriched_metadata(record, ai_export_base, proxy_prefix):
         "fullPath": record["fullPath"],
         "fileName": record["fileName"],
         "providerName": record["providerName"],
+        "sourceLanguage": "Default",
         "normalizedMetadata": enriched
     }
 
