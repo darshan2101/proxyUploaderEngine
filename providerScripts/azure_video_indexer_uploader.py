@@ -58,6 +58,75 @@ SDNA_EVENT_MAP = {
     "azure_video_speakers" : "speakers"
 }
 
+LANGUAGE_CODE_MAP = {
+  "": "default",
+  "ar-AE": "Arabic (United Arab Emirates)",
+  "ar-BH": "Arabic Modern Standard (Bahrain)",
+  "ar-EG": "Arabic Egypt",
+  "ar-IL": "Arabic (Israel)",
+  "ar-IQ": "Arabic (Iraq)",
+  "ar-JO": "Arabic (Jordan)",
+  "ar-KW": "Arabic (Kuwait)",
+  "ar-LB": "Arabic (Lebanon)",
+  "ar-OM": "Arabic (Oman)",
+  "ar-PS": "Arabic (Palestinian Authority)",
+  "ar-QA": "Arabic (Qatar)",
+  "ar-SA": "Arabic (Saudi Arabia)",
+  "ar-SY": "Arabic Syrian Arab Republic",
+  "bg-BG": "Bulgarian",
+  "ca-ES": "Catalan",
+  "cs-CZ": "Czech",
+  "da-DK": "Danish",
+  "de-DE": "German",
+  "el-GR": "Greek",
+  "en-AU": "English Australia",
+  "en-GB": "English United Kingdom",
+  "en-US": "English United States",
+  "es-ES": "Spanish",
+  "es-MX": "Spanish (Mexico)",
+  "et-EE": "Estonian",
+  "fa-IR": "Persian",
+  "fi-FI": "Finnish",
+  "fil-PH": "Filipino",
+  "fr-CA": "French (Canada)",
+  "fr-FR": "French",
+  "ga-IE": "Irish",
+  "gu-IN": "Gujarati",
+  "he-IL": "Hebrew",
+  "hi-IN": "Hindi",
+  "hr-HR": "Croatian",
+  "hu-HU": "Hungarian",
+  "hy-AM": "Armenian",
+  "id-ID": "Indonesian",
+  "is-IS": "Icelandic",
+  "it-IT": "Italian",
+  "ja-JP": "Japanese",
+  "kn-IN": "Kannada",
+  "ko-KR": "Korean",
+  "lt-LT": "Lithuanian",
+  "lv-LV": "Latvian",
+  "ml-IN": "Malayalam",
+  "ms-MY": "Malay",
+  "nb-NO": "Norwegian",
+  "nl-NL": "Dutch",
+  "pl-PL": "Polish",
+  "pt-BR": "Portuguese",
+  "pt-PT": "Portuguese (Portugal)",
+  "ro-RO": "Romanian",
+  "ru-RU": "Russian",
+  "sk-SK": "Slovak",
+  "sl-SI": "Slovenian",
+  "sv-SE": "Swedish",
+  "ta-IN": "Tamil",
+  "te-IN": "Telugu",
+  "th-TH": "Thai",
+  "tr-TR": "Turkish",
+  "uk-UA": "Ukrainian",
+  "vi-VN": "Vietnamese",
+  "zh-Hans": "Chinese (Simplified)",
+  "zh-HK": "Chinese (Cantonese, Traditional)"
+}
+
 # Initialize logger
 logger = logging.getLogger()
 def setup_logging(level):
@@ -208,7 +277,7 @@ def get_advanced_ai_config(config_name, provider_name="azurevi"):
                         elif isinstance(bc, str):
                             out["brandsCategories"] = ",".join(x.strip() for x in bc.split(",") if x.strip())
 
-                    # Normalize customLanguages: list or string → comma-joined string
+                    # Normalize translationLanguages: list or string → comma-joined string
                     if "translationLanguages" in out:
                         tl = out["translationLanguages"]
                         if isinstance(tl, list):
@@ -402,8 +471,9 @@ def get_azurevi_normalized_metadata(raw_metadata_file_path, norm_metadata_file_p
         logging.error(f"Error normalizing metadata: {e}")
         return False
 
-def transform_normlized_to_enriched(norm_metadata_file_path, filetype_prefix):
+def transform_normalized_to_enriched(norm_metadata_file_path, filetype_prefix, language_code):
     try:
+        logging.debug(f"Transforming normalized metadata from: {norm_metadata_file_path}, Filetype Prefix: {filetype_prefix}, Language Code: {language_code}")
         with open(norm_metadata_file_path, "r") as f:
             data = json.load(f)
         result = []
@@ -425,6 +495,7 @@ def transform_normlized_to_enriched(norm_metadata_file_path, filetype_prefix):
         return result, True
     except Exception as e:
         return f"Error during transformation: {e}", False
+
 
 
 # =============================
@@ -604,13 +675,13 @@ def delete_blob(blob_config: dict, blob_name: str) -> bool:
         )
         if blob_client.exists():
             blob_client.delete_blob()
-            logger.info(f"✅ Blob '{blob_name}' deleted successfully.")
+            logger.info(f"Blob '{blob_name}' deleted successfully.")
             return True
         else:
             logger.warning(f"Blob '{blob_name}' not found — nothing to delete.")
             return True  # treat as success
     except Exception as e:
-        logger.error(f"❌ Failed to delete blob '{blob_name}': {e}")
+        logger.error(f"Failed to delete blob '{blob_name}': {e}")
         return False
 
 # =============================
@@ -898,7 +969,6 @@ class VideoIndexerClient:
                 base_delay = [1, 3, 10][attempt]
                 delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
                 time.sleep(delay)
-
         logger.critical(f"Upload failed after 3 attempts: {video_name}")
         raise RuntimeError("Upload failed after retries.")
 
@@ -992,7 +1062,6 @@ class VideoIndexerClient:
             (v for v in videos if v["name"] == file_name),
             None
         )
-
         if not matching_video:
             video_id = self.file_upload_async(
                 media_path=media_path,
@@ -1001,10 +1070,8 @@ class VideoIndexerClient:
                 **upload_kwargs
             )
             return video_id, True
-
         video_id = matching_video["id"]
         logger.info(f"Found matching video: ID={video_id}, Name='{file_name}', Size={file_size}")
-
         if conflict_mode == "skip":
             self.update_catalog(partition, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], video_id)
             logger.info("Conflict mode 'skip'. Skipping upload.")
@@ -1206,7 +1273,7 @@ class VideoIndexerClient:
                 
                 if translated_insights:
                     # Save individual language file
-                    lang_json_path = os.path.join(metadata_dir, f"{base_name}_transcript_{lang_code}.json")
+                    lang_json_path = os.path.join(metadata_dir, f"{base_name}_{lang_code}.json")
                     if self.save_metadata_to_file(lang_json_path, translated_insights):
                         translated_data[lang_code] = translated_insights
                     else:
@@ -1218,67 +1285,69 @@ class VideoIndexerClient:
         combined_metadata = self.combine_multilanguage_metadata(base_metadata, translated_data)
         return combined_metadata
 
-    def store_metadata_file(self, repo_guid, file_path, metadata, max_attempts=3):
-        # -----------------------------------------
-        # 1. Build metadata directory
-        # -----------------------------------------
+    def store_metadata_file(self, repo_guid, file_path, combined_metadata, max_attempts=3):
+        # Build metadata directory
         provider = section.get("provider", "AZUREVI")
-        metadata_dir, meta_right, base = add_metadata_directory(repo_guid, provider, file_path)
+        metadata_dir, meta_right, base_name = add_metadata_directory(repo_guid, provider, file_path)
+    
+        # repo_guid string for path construction
+        repo_guid_str = str(repo_guid)
 
-        # -----------------------------------------
-        # 2. Build PHYSICAL PATH (local disk path) metadata_dir/file_paths
-        # -----------------------------------------
-        raw_json = os.path.join(metadata_dir, f"{base}_raw.json")
-        norm_json = os.path.join(metadata_dir, f"{base}_norm.json")
+        # Paths for default language
+        raw_json_default = os.path.join(metadata_dir, f"{base_name}.json")
+        norm_json_default = os.path.join(metadata_dir, f"{base_name}_norm.json")
 
-        # -----------------------------------------
-        # 3. Returned paths (AFTER /./) meta_right/repo_guid/file_path/provider/file.json
-        # -----------------------------------------
-        raw_return = os.path.join(meta_right, str(repo_guid), file_path, provider, f"{base}_raw.json")
-        norm_return = os.path.join(meta_right, str(repo_guid), file_path, provider, f"{base}_norm.json")
+        # Save default raw
+        if not self.save_metadata_to_file(raw_json_default, combined_metadata):
+            logger.error("Failed to save default raw metadata")
+            return [], []
 
-        raw_success = False
-        norm_success = False
+        # Normalize default
+        if not get_azurevi_normalized_metadata(raw_json_default, norm_json_default):
+            logger.error("Normalization failed for default language")
+            return [], []
 
-        # -----------------------------------------
-        # 4. Write metadata with retry
-        # -----------------------------------------
-        for attempt in range(max_attempts):
-            try:
-                # RAW write
-                with open(raw_json, "w", encoding="utf-8") as f:
-                    json.dump(metadata, f, ensure_ascii=False, indent=4)
-                raw_success = True
+        # Collect all paths to return
+        raw_paths = []
+        norm_paths = []
 
-                # NORMALIZED write
-                if not get_azurevi_normalized_metadata(raw_json, norm_json):
-                    logging.error("Normalization failed.")
-                    norm_success = False
-                else:
-                    norm_success = True
+        # Prepare paths for return to node API
+        raw_return_default = os.path.join(meta_right, repo_guid_str, file_path, provider, f"{base_name}.json")
+        norm_return_default = os.path.join(meta_right, repo_guid_str, file_path, provider, f"{base_name}_norm.json")
+        raw_paths.append((raw_return_default, None))  # (path, language_code)
+        norm_paths.append((norm_return_default, None))
 
-                break  # No need for more retries
+        # Handle multilanguage insights
+        multilanguage_insights = combined_metadata.get("multilanguage_insights", {})
+        for lang_code, lang_data in multilanguage_insights.items():
+            # Save per-language raw
+            raw_json_lang = os.path.join(metadata_dir, f"{base_name}_{lang_code}.json")
+            if not self.save_metadata_to_file(raw_json_lang, lang_data):
+                logger.warning(f"Failed to save raw metadata for {lang_code}")
+                continue
 
-            except Exception as e:
-                logging.warning(f"Metadata write failed (Attempt {attempt+1}): {e}")
-                if attempt < max_attempts - 1:
-                    time.sleep([1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt]))
+            # Normalize per-language
+            norm_json_lang = os.path.join(metadata_dir, f"{base_name}_norm_{lang_code}.json")
+            if not get_azurevi_normalized_metadata(raw_json_lang, norm_json_lang):
+                logger.warning(f"Normalization failed for {lang_code}")
+                continue
 
-        # -----------------------------------------
-        # 5. Return results
-        # -----------------------------------------
-        return (
-            raw_return if raw_success else None,
-            norm_return if norm_success else None
-        )
+            # Add to return lists - USE file_path not base_name
+            raw_return_lang = os.path.join(meta_right, repo_guid_str, file_path, provider, f"{base_name}_{lang_code}.json")
+            norm_return_lang = os.path.join(meta_right, repo_guid_str, file_path, provider, f"{base_name}_norm_{lang_code}.json")
+            raw_paths.append((raw_return_lang, lang_code))
+            norm_paths.append((norm_return_lang, lang_code))
 
-    def send_extracted_metadata(self, repo_guid, file_path, rawMetadataFilePath, normMetadataFilePath=None, max_attempts=3):
+        return raw_paths, norm_paths
+
+    def send_extracted_metadata(self, repo_guid, file_path, rawMetadataFilePath, normMetadataFilePath=None, language_code=None, max_attempts=3):
         url = "http://127.0.0.1:5080/catalogs/extendedMetadata"
         node_api_key = get_node_api_key()
         headers = {"apikey": node_api_key, "Content-Type": "application/json"}
         payload = {
             "repoGuid": repo_guid,
             "providerName": section.get("provider", "AZUREVI"),
+            "sourceLanguage": LANGUAGE_CODE_MAP.get(language_code, "Default") if language_code is not None else "Default",
             "extendedMetadata": [{
                 "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
                 "fileName": os.path.basename(file_path)
@@ -1302,7 +1371,7 @@ class VideoIndexerClient:
                 time.sleep(delay)
         return False
 
-    def send_ai_enriched_metadata(self, repo_guid, file_path, enrichedMetadata, max_attempts=3):
+    def send_ai_enriched_metadata(self, repo_guid, file_path, enrichedMetadata, language_code=None, max_attempts=3):
         url = "http://127.0.0.1:5080/catalogs/aiEnrichedMetadata"
         node_api_key = get_node_api_key()
         headers = {"apikey": node_api_key, "Content-Type": "application/json"}
@@ -1310,6 +1379,7 @@ class VideoIndexerClient:
             "repoGuid": repo_guid,
             "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
             "fileName": os.path.basename(file_path),
+            "sourceLanguage": LANGUAGE_CODE_MAP.get(language_code, "Default") if language_code is not None else "Default",
             "providerName": section.get("provider", "AZUREVI"),
             "normalizedMetadata": enrichedMetadata
         }
@@ -1317,8 +1387,10 @@ class VideoIndexerClient:
         for attempt in range(max_attempts):
             try:
                 r = make_request_with_retries("POST", url, headers=headers, json=payload)
-                if r and r.status_code in (200, 201):
+                if r is not None and r.status_code in (200, 201):
                     return True
+                else:
+                    logging.debug(f"send_ai_enriched_metadata response: {r.text if r is not None else 'No response'}")
             except Exception as e:
                 if attempt == 2:
                     logging.critical(f"Failed to send metadata after 3 attempts: {e}")
@@ -1412,24 +1484,41 @@ if __name__ == "__main__":
         )
         if not ai_metadata:
             fail("No AI metadata returned.")
-        raw_path, norm_path = client.store_metadata_file(args.repo_guid, catalog_path_clean, ai_metadata)
-
-        if not client.send_extracted_metadata(args.repo_guid, catalog_path_clean, raw_path, norm_path):
-            fail("Failed to send extracted metadata.")
+        raw_paths, norm_paths = client.store_metadata_file(args.repo_guid, catalog_path_clean, ai_metadata)
+        for raw_return, lang_code in raw_paths:
+            norm_return = next((p for p, lc in norm_paths if lc == lang_code), None)
+            if not client.send_extracted_metadata(
+                args.repo_guid,
+                catalog_path_clean,
+                raw_return,
+                norm_return,
+                language_code=lang_code
+            ):
+                fail("Failed to send extracted metadata.")
 
         logger.info("Extracted metadata sent successfully.")
 
-        if norm_path:
-            try:
-                meta_path, _ = get_store_paths()
-                norm_metadata_file_path = os.path.join(meta_path.split("/./")[0] if "/./" in meta_path else meta_path.split("/$/")[0] if "/$/" in meta_path else meta_path, norm_path)
-                enriched, success = transform_normlized_to_enriched(norm_metadata_file_path, filetype_prefix)
-                if success and client.send_ai_enriched_metadata(args.repo_guid, catalog_path_clean, enriched):
-                    logger.info("AI enriched metadata sent successfully.")
-                else:
-                    logger.warning("AI enriched metadata send failed — skipping.")
-            except Exception:
-                logger.exception("AI enriched metadata transform failed — skipping.")
+        if norm_paths:
+            for norm_return, lang_code in norm_paths:
+                if not norm_return:
+                    continue
+                try:
+                    meta_path, _ = get_store_paths()
+                    norm_metadata_file_path = os.path.join(
+                        meta_path.split("/./")[0] if "/./" in meta_path else meta_path,
+                        norm_return
+                    )
+                    logger.debug(f"Attempting to transform: {norm_metadata_file_path}")
+                    enriched, success = transform_normalized_to_enriched(norm_metadata_file_path, filetype_prefix, lang_code)
+                    if not success:
+                        logger.error(f"Transformation failed for {lang_code or 'default'}: {enriched}")
+                        continue
+                    if client.send_ai_enriched_metadata(args.repo_guid, catalog_path_clean, enriched, lang_code):
+                        logger.info(f"AI enriched metadata sent successfully for {lang_code or 'default'}.")
+                    else:
+                        logger.warning(f"AI enriched metadata send failed for {lang_code or 'default'} — skipping.")
+                except Exception as e:
+                    logger.exception(f"AI enriched metadata transform/send failed for {lang_code or 'default'}: {e}")
         else:
             logger.info("Normalized metadata not present — skipping AI enrichment.")
 
@@ -1673,24 +1762,37 @@ if __name__ == "__main__":
                 if not ai_metadata:
                     fail("No AI metadata returned.")
 
-                raw_path, norm_path = client.store_metadata_file(args.repo_guid, catalog_path_clean, ai_metadata)
-
-                if not client.send_extracted_metadata(args.repo_guid, catalog_path_clean, raw_path, norm_path):
-                    fail("Failed to send extracted metadata.")
+                raw_paths, norm_paths = client.store_metadata_file(args.repo_guid, catalog_path_clean, ai_metadata)
+                for raw_return, lang_code in raw_paths:
+                    norm_return = next((p for p, lc in norm_paths if lc == lang_code), None)
+                    if not client.send_extracted_metadata(
+                        args.repo_guid,
+                        catalog_path_clean,
+                        raw_return,
+                        norm_return,
+                        language_code=lang_code
+                    ):
+                        fail("Failed to send extracted metadata.")
 
                 logger.info("Extracted metadata sent successfully.")
 
-                if norm_path:
-                    try:
-                        meta_path, _ = get_store_paths()
-                        norm_metadata_file_path = os.path.join(meta_path.split("/./")[0] if "/./" in meta_path else meta_path.split("/$/")[0] if "/$/" in meta_path else meta_path, norm_path)
-                        enriched, enrich_success = transform_normlized_to_enriched(norm_metadata_file_path, filetype_prefix)
-                        if enrich_success and client.send_ai_enriched_metadata(args.repo_guid, catalog_path_clean, enriched):
-                            logger.info("AI enriched metadata sent successfully.")
-                        else:
-                            logger.warning("AI enriched metadata send failed — skipping.")
-                    except Exception:
-                        logger.exception("AI enriched metadata transform failed — skipping.")
+                if norm_paths:
+                    for norm_return, lang_code in norm_paths:
+                        if not norm_return:
+                            continue
+                        try:
+                            meta_path, _ = get_store_paths()
+                            norm_metadata_file_path = os.path.join(
+                                meta_path.split("/./")[0] if "/./" in meta_path else meta_path,
+                                norm_return
+                            )
+                            enriched, success = transform_normalized_to_enriched(norm_metadata_file_path, filetype_prefix, lang_code)
+                            if success and client.send_ai_enriched_metadata(args.repo_guid, catalog_path_clean, enriched, lang_code):
+                                logger.info(f"AI enriched metadata sent successfully for {lang_code or 'default'}.")
+                            else:
+                                logger.warning(f"AI enriched metadata send failed for {lang_code or 'default'} — skipping.")
+                        except Exception:
+                            logger.exception(f"AI enriched metadata transform failed for {lang_code or 'default'} — skipping.")
                 else:
                     logger.info("Normalized metadata not present — skipping AI enrichment.")
 
