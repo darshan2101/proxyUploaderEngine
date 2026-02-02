@@ -16,19 +16,54 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Constants
 VALID_MODES = ["proxy", "original", "get_base_target","generate_video_proxy","generate_video_frame_proxy","generate_intelligence_proxy","generate_video_to_spritesheet", "send_extracted_metadata"]
+CHUNK_SIZE = 5 * 1024 * 1024 
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
 CONFLICT_RESOLUTION_MODES = ["skip", "overwrite"]
 DEFAULT_CONFLICT_RESOLUTION = "skip"
+NORMALIZER_SCRIPT_PATH = "/opt/sdna/bin/twelvelabs_metadata_normalizer.py"
+
+# SDNA Event Map for enriched metadata
+SDNA_EVENT_MAP = {
+    "twelvelabs_labels": "labels",
+    "twelvelabs_keywords": "keywords",
+    "twelvelabs_summary": "summary",
+    "twelvelabs_highlights": "highlights",
+    "twelvelabs_transcript": "transcript",
+}
 
 DEFAULT_TWELVELABS_CONFIG = {
-    "gist": {
-        "types": ["title", "topic", "hashtag"]
-    },
-    "summary": {
-        "subtypes": ["summary", "chapter", "highlight"],
-        "summary": {
+    "fetch_transcript": True,
+    "fetch_embeddings": True,
+    "embedding_options": ["visual", "audio", "transcription"],
+    "extraction_schemas": [
+        {
+            "name": "gist",
+            "prompt": "Generate title, appropriate topics according to content, and suitable hashtags for this video.",
+            "temperature": 0.3,
+            "max_tokens": 150,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "topics": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        },
+                        "hashtags": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        }
+                    },
+                    "required": ["title", "topic", "hashtags"]
+                }
+            }
+        },
+        {
+            "name": "summary",
             "prompt": "Generate detailed summary of this video containing content and keypoints and give suitable title.",
             "temperature": 0.3,
             "max_tokens": 300,
@@ -48,46 +83,65 @@ DEFAULT_TWELVELABS_CONFIG = {
                 }
             }
         },
-        "chapter": {
-            "prompt": "Generate a summary for a blog post, with chapter based insights.",
-            "max_tokens": 500
+        {
+            "name": "chapter",
+            "prompt": "Generate a list of chapter titles and timestamps for this video.",
+            "temperature": 0.3,
+            "max_tokens": 400,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "type": "object",
+                    "properties": {
+                        "chapters": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "title": {"type": "string"},
+                                    "brief": {"type": "string"},
+                                    "timestamp": {"type": "string"}
+                                },
+                                "required": ["title", "brief", "timestamp"]
+                            }
+                        }
+                    },
+                    "required": ["chapters"]
+                }
+            }
         },
-        "highlight": {
+        {
+            "name": "highlights",
             "prompt": "Generate a list of key highlights from the video content.",
-            "max_tokens": 300
-        }
-    },
-    "open_ended": {
-        "prompt": "Analyze the video and generate a structured minified JSON capturing: celebrities or people featured, objects or items visible in the scene, atmosphere or mood, actions or key events, and a transcript of the dialogue. Include only these details and follow the schema strictly. Do not include title, summary, or keywords.",
-        "temperature": 0.35,
-        "max_tokens": 1024,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "type": "object",
-                "properties": {
-                    "celebrities": {
-                        "type": "array",
-                        "items": {"type": "string"}
-                    },
-                    "objects": {
-                        "type": "array",
-                        "items": {"type": "string"}
-                    },
-                    "object_count": {"type": "integer"},
-                    "atmosphere": {"type": "string"},
-                    "actions": {
-                        "type": "array",
-                        "items": {"type": "string"}
-                    },
-                    "transcript": {"type": "string"}
+            "temperature": 0.3,
+            "max_tokens": 700,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "type": "object",
+                    "properties": {
+                        "highlights": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "start": {"type": "string"},
+                                    "end": {"type": "string"},
+                                    "highlight": {"type": "string"},
+                                    "highlight_summary": {"type": "string"},
+                                    "highlight_sentiment": {"type": "string"},
+                                    "highlight_index": {"type": "integer"}
+                                },
+                                "required": ["highlight", "start", "end", "highlight_index"]
+                            }
+                        }
+                    }
                 },
-                "required": ["celebrities", "objects", "atmosphere", "actions", "transcript"]
             }
         }
-    },
-    "embeddings_and_transcript": True
+    ],
 }
+
 # Detect platform
 IS_LINUX = os.path.isdir("/opt/sdna/bin")
 DNA_CLIENT_SERVICES = LINUX_CONFIG_PATH if IS_LINUX else MAC_CONFIG_PATH
@@ -172,35 +226,58 @@ def get_advanced_ai_config(config_name, provider_name):
     if not admin_dropbox:
         logging.warning("Admin dropbox path not available, using default Twelve Labs config")
         return DEFAULT_TWELVELABS_CONFIG if provider_name.lower() == "twelvelabs" else None
+    
+    # Try config-specific file first
     config_file_path = os.path.join(admin_dropbox, "AdvancedAiExport", "Configs", f"{config_name}.json")
     logging.debug(f"Checking for config-specific AI settings at: {config_file_path}")
+    
     if os.path.exists(config_file_path):
         try:
             with open(config_file_path, 'r') as f:
                 config_data = json.load(f)
+            
             if not isinstance(config_data, dict):
-                logging.error(f"Invalid JSON format in {config_file_path}")
+                logging.error(f"Invalid JSON format in {config_file_path}: expected object/dict, got {type(config_data).__name__}")
             else:
                 logging.info(f"Loaded advanced AI config from: {config_file_path}")
                 return config_data
-        except Exception as e:
+        except json.JSONDecodeError as e:
+            logging.error(f"Invalid JSON in config file {config_file_path}: {e}")
+        except IOError as e:
             logging.error(f"Error reading config file {config_file_path}: {e}")
+        except Exception as e:
+            logging.error(f"Unexpected error reading config file {config_file_path}: {e}")
+    else:
+        logging.debug(f"Config-specific file not found: {config_file_path}")
+    
+    # Fallback to provider sample file
     sample_file_path = os.path.join(admin_dropbox, "AdvancedAiExport", "Samples", f"{provider_name}.json")
     logging.debug(f"Checking for provider sample at: {sample_file_path}")
+    
     if os.path.exists(sample_file_path):
         try:
             with open(sample_file_path, 'r') as f:
                 sample_data = json.load(f)
+            
             if not isinstance(sample_data, dict):
-                logging.error(f"Invalid JSON format in {sample_file_path}")
+                logging.error(f"Invalid JSON format in {sample_file_path}: expected object/dict, got {type(sample_data).__name__}")
             else:
                 logging.info(f"Loaded advanced AI config from provider sample: {sample_file_path}")
                 return sample_data
-        except Exception as e:
+        except json.JSONDecodeError as e:
+            logging.error(f"Invalid JSON in sample file {sample_file_path}: {e}")
+        except IOError as e:
             logging.error(f"Error reading sample file {sample_file_path}: {e}")
+        except Exception as e:
+            logging.error(f"Unexpected error reading sample file {sample_file_path}: {e}")
+    else:
+        logging.debug(f"Provider sample file not found: {sample_file_path}")
+    
+    # Final fallback to hardcoded default for Twelve Labs
     if provider_name.lower() == "twelvelabs":
         logging.info("Using hardcoded default Twelve Labs AI config")
         return DEFAULT_TWELVELABS_CONFIG
+    
     logging.warning(f"No advanced AI config found for provider '{provider_name}'")
     return None
 
@@ -248,9 +325,46 @@ def get_metadata_store_path():
 
     return host, path
 
+def get_store_paths():
+    metadata_store_path, proxy_store_path = "", ""
+    try:
+        # Read ai-config.json file
+        config_path = "/opt/sdna/nginx/ai-config.json" if IS_LINUX else "/Library/Application Support/StorageDNA/nginx/ai-config.json"
+        with open(config_path, 'r') as f:
+            config_data = json.load(f)
+            metadata_store_path = config_data.get("ai_export_shared_drive_path", "")
+            proxy_store_path = config_data.get("ai_proxy_shared_drive_path", "")
+            logging.info(f"Metadata Store Path: {metadata_store_path}, Proxy Store Path: {proxy_store_path}")
+        
+    except Exception as e:
+        logging.error(f"Error reading Metadata Store or Proxy Store settings: {e}")
+        sys.exit(5)
+
+    if not metadata_store_path or not proxy_store_path:
+        logging.error("Store settings not found in ai-config.json")
+        sys.exit(5)
+
+    return metadata_store_path, proxy_store_path
+
+def get_twelvelabs_normalized_metadata(raw_json_path, norm_json_path):
+    try:
+        with open(raw_json_path, 'r') as f:
+            raw_data = json.load(f)
+        
+        # TODO: Implement your normalization logic here
+        # This is a placeholder that just copies the raw data
+        normalized_data = raw_data
+        
+        with open(norm_json_path, 'w') as f:
+            json.dump(normalized_data, f, indent=4)
+        
+        return True
+    except Exception as e:
+        logging.error(f"Normalization failed: {e}")
+        return False
+
 def get_retry_session(retries=3, backoff_factor_range=(1.0, 2.0)):
     session = requests.Session()
-    # handling retry delays manually via backoff in the range
     adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
@@ -285,7 +399,7 @@ def make_request_with_retries(method, url, **kwargs):
         raise last_exception
     return None
 
-def prepare_metadata_to_upload(repo_guid ,relative_path, file_name, file_size, backlink_url, properties_file=None):    
+def prepare_metadata_to_upload(repo_guid, relative_path, file_name, file_size, backlink_url, properties_file=None):    
     metadata = {
         "relativePath": relative_path if relative_path.startswith("/") else "/" + relative_path,
         "repoGuid": repo_guid,
@@ -295,7 +409,8 @@ def prepare_metadata_to_upload(repo_guid ,relative_path, file_name, file_size, b
     }
     
     if not properties_file or not os.path.exists(properties_file):
-        logging.error(f"Properties file not found: {properties_file}")
+        if properties_file:
+            logging.error(f"Properties file not found: {properties_file}")
         return metadata
     
     logging.debug(f"Reading properties from: {properties_file}")
@@ -332,74 +447,393 @@ def prepare_metadata_to_upload(repo_guid ,relative_path, file_name, file_size, b
     
     return metadata
 
-def file_exists_in_index(api_key, index_id, filename, file_size):
-    url = f"https://api.twelvelabs.io/v1.3/indexes/{index_id}/videos"
-    headers = {"x-api-key": api_key}
-    params = {"filename": filename, "size": file_size}
-    logging.info(f"Searching for existing video: '{filename}' (Size: {file_size} bytes)")
-    logger.debug(f"URL :------------------------------------------->  {url}")
+# -----------------------------
+# Multipart Upload Helpers
+# -----------------------------
+def create_multipart_upload_session(api_key, filename, file_size):
+    url = "https://api.twelvelabs.io/v1.3/assets/multipart-uploads"
+    headers = {"x-api-key": api_key, "Content-Type": "application/json"}
+    payload = {"filename": filename, "type": "video", "total_size": file_size}
 
     for attempt in range(3):
         try:
-            page = 1
-            total_pages = 1
-            video_id = None
-
-            while page <= total_pages:
-                params["page"] = page
-                response = make_request_with_retries("GET", url, headers=headers, params=params)
-                if not response or response.status_code != 200:
-                    raise Exception(f"List videos failed: {response.status_code if response else 'No response'}")
-
-                data = response.json()
-                results = data.get("data", [])
-                for video in results:
-                    meta = video.get("system_metadata", {})
-                    if meta.get("filename") == filename and meta.get("size") == file_size:
-                        video_id = video["_id"]
-                        logging.info(f"Matching video found: ID={video_id}")
-                        return video_id
-
-                page_info = data.get("page_info", {})
-                total_pages = page_info.get("total_page", 1)
-                page += 1
-
-            return None
-
+            response = make_request_with_retries("POST", url, headers=headers, json=payload)
+            if not response or response.status_code != 201:
+                raise RuntimeError(f"Multipart session creation failed: {response.status_code if response else 'No response'}")
+            data = response.json() or {}
+            return data["upload_id"], data["asset_id"], data["chunk_size"], data.get("total_chunks"), data["upload_urls"]
         except Exception as e:
-            if attempt == 2:
-                logging.critical(f"Failed to check video existence after 3 attempts: {e}")
-                return None
-            base_delay = [1, 3, 10][attempt]
-            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
-            time.sleep(delay)
-    return None
+            logging.warning(f"Attempt {attempt + 1} to create multipart upload session failed: {e}")
+            if attempt < 2:
+                time.sleep([1, 3, 10][attempt])
+            else:
+                logging.error("All attempts to create multipart upload session have failed.")
+                raise
 
-def delete_video(api_key, index_id, video_id):
-    url = f"https://api.twelvelabs.io/v1.3/indexes/{index_id}/videos/{video_id}"
-    headers = {"x-api-key": api_key}
-    logger.debug(f"URL :------------------------------------------->  {url}")
+def upload_single_chunk(chunk_file, presigned_url, chunk_index):
+    headers = {'Content-Type': 'application/octet-stream'}
+    for attempt in range(3):
+        try:
+            with open(chunk_file, 'rb') as f:
+                resp = requests.put(presigned_url, data=f, headers=headers)
+            resp.raise_for_status()
+            etag = resp.headers.get('ETag', '').strip('"').strip()
+            if not etag:
+                raise ValueError(f"No ETag received for chunk {chunk_index}")
+            return etag
+        except (RequestException, Exception) as e:
+            logging.warning(f"Attempt {attempt + 1} to upload chunk {chunk_index} failed: {e}")
+            if attempt < 2:
+                time.sleep([1, 3, 10][attempt])
+            else:
+                logging.error(f"All attempts to upload chunk {chunk_index} have failed.")
+                raise
+
+def get_additional_presigned_urls(api_key, upload_id, start, count):
+    url = f"https://api.twelvelabs.io/v1.3/assets/multipart-uploads/{upload_id}/presigned-urls"
+    headers = {"x-api-key": api_key, "Content-Type": "application/json"}
+    payload = {"start": start, "count": count}
 
     for attempt in range(3):
         try:
-            response = make_request_with_retries("DELETE", url, headers=headers)
-            if response and response.status_code in (200, 204):
-                logging.info(f"Deleted existing video ID: {video_id}")
-                return True
-            elif response:
-                logging.warning(f"Delete failed: {response.status_code} {response.text}")
-            if attempt == 2:
-                return False
+            response = make_request_with_retries("POST", url, headers=headers, json=payload)
+            if not response or response.status_code != 200:
+                raise RuntimeError(f"Failed to get additional presigned URLs: {response.status_code if response else 'No response'}")
+            
+            data = response.json()
+            upload_urls = data.get("upload_urls", [])
+            logging.info(f"Retrieved {len(upload_urls)} presigned URLs starting from chunk {start}")
+            return upload_urls
+            
         except Exception as e:
-            if attempt == 2:
-                logging.critical(f"Failed to delete video {video_id} after 3 attempts: {e}")
-                return False
-            base_delay = [1, 3, 10][attempt]
-            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
-            time.sleep(delay)
+            logging.warning(f"Attempt {attempt + 1} to get additional presigned URLs failed: {e}")
+            if attempt < 2:
+                time.sleep([1, 3, 10][attempt])
+            else:
+                logging.error("All attempts to get additional presigned URLs have failed.")
+                raise
+
+def report_completed_chunks(api_key, upload_id, completed_chunks, batch_size=20):
+    url = f"https://api.twelvelabs.io/v1.3/assets/multipart-uploads/{upload_id}"
+    headers = {"x-api-key": api_key, "Content-Type": "application/json"}
+    
+    for chunk in completed_chunks:
+        if not isinstance(chunk.get('chunk_index'), int):
+            raise ValueError(f"Invalid chunk_index: {chunk.get('chunk_index')}")
+        if not chunk.get('proof'):
+            raise ValueError(f"Missing proof for chunk {chunk.get('chunk_index')}")
+        if chunk.get('proof_type') != 'etag':
+            raise ValueError(f"Invalid proof_type for chunk {chunk.get('chunk_index')}: {chunk.get('proof_type')}")
+    
+    total_reported = 0
+    for i in range(0, len(completed_chunks), batch_size):
+        batch = completed_chunks[i:i+batch_size]
+        payload = {"completed_chunks": batch}
+        
+        logging.info(f"Reporting batch of {len(batch)} chunks (total: {total_reported + len(batch)}/{len(completed_chunks)})")
+        logging.debug(f"Batch range: chunks {batch[0]['chunk_index']} to {batch[-1]['chunk_index']}")
+
+        for attempt in range(3):
+            try:
+                response = make_request_with_retries("POST", url, headers=headers, json=payload)
+                
+                if response is None:
+                    raise RuntimeError("No response received from server")
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    total_reported += data.get('processed_chunks', 0)
+                    logging.info(f"Batch reported: processed={data.get('processed_chunks')}, duplicates={data.get('duplicate_chunks')}, total_completed={data.get('total_completed')}")
+                    break
+                else:
+                    error_body = response.text
+                    logging.error(f"Failed to report batch. Status: {response.status_code}, Response: {error_body}")
+                    raise RuntimeError(f"Failed to report batch: HTTP {response.status_code} - {error_body}")
+                    
+            except Exception as e:
+                logging.warning(f"Attempt {attempt + 1} to report batch failed: {e}")
+                if attempt < 2:
+                    time.sleep([1, 3, 10][attempt])
+                else:
+                    logging.error("All attempts to report batch have failed.")
+                    raise
+    
+    logging.info(f"All chunks reported successfully. Total: {total_reported}")
+
+def upload_file_chunks(api_key, file_path, upload_id, asset_id, chunk_size, upload_urls, max_workers=2):
+    chunk_files = []
+    chunk_dir = os.path.join(os.path.dirname(file_path), f"{os.path.basename(file_path)}.chunks")
+    os.makedirs(chunk_dir, exist_ok=True)
+    
+    logging.debug(f"Splitting file into chunks of size {chunk_size} bytes")
+    with open(file_path, 'rb') as f:
+        i = 1
+        while True:
+            data = f.read(chunk_size)
+            if not data: 
+                break
+            cf = os.path.join(chunk_dir, f"chunk_{i:04d}")
+            with open(cf, 'wb') as out:
+                out.write(data)
+            chunk_files.append(cf)
+            i += 1
+    
+    total_chunks = len(chunk_files)
+    logging.info(f"File split into {total_chunks} chunks")
+    
+    url_map = {}
+    for u in upload_urls:
+        chunk_idx = u["chunk_index"]
+        url_map[chunk_idx] = u["url"]
+        logging.debug(f"Initial URL for chunk {chunk_idx}")
+    
+    logging.info(f"Received {len(url_map)} initial presigned URLs for chunks: {sorted(url_map.keys())}")
+    
+    missing_chunks = []
+    for idx in range(1, total_chunks + 1):
+        if idx not in url_map:
+            missing_chunks.append(idx)
+    
+    if missing_chunks:
+        logging.info(f"Need to fetch URLs for {len(missing_chunks)} additional chunks")
+        
+        batch_size = 50
+        for i in range(0, len(missing_chunks), batch_size):
+            batch = missing_chunks[i:i+batch_size]
+            start_chunk = batch[0]
+            count = len(batch)
+            
+            logging.info(f"Requesting {count} URLs starting from chunk {start_chunk}")
+            extra_urls = get_additional_presigned_urls(api_key, upload_id, start_chunk, count)
+            
+            for u in extra_urls:
+                chunk_idx = u["chunk_index"]
+                url_map[chunk_idx] = u["url"]
+                logging.debug(f"Added URL for chunk {chunk_idx}")
+            
+            logging.debug(f"URL map now has {len(url_map)} total URLs")
+    
+    missing = []
+    for idx in range(1, total_chunks + 1):
+        if idx not in url_map:
+            missing.append(idx)
+    
+    if missing:
+        raise RuntimeError(
+            f"Missing presigned URLs for {len(missing)} chunks: {missing[:10]}{'...' if len(missing) > 10 else ''}. "
+            f"Have URLs for: {sorted(url_map.keys())}"
+        )
+    
+    logging.info(f"All {total_chunks} presigned URLs ready. Starting parallel upload.")
+    
+    completed_chunks = []
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_chunk = {}
+        for idx, cf in enumerate(chunk_files):
+            chunk_index = idx + 1
+            future = executor.submit(upload_single_chunk, cf, url_map[chunk_index], chunk_index)
+            future_to_chunk[future] = (chunk_index, cf)
+        
+        for future in as_completed(future_to_chunk):
+            chunk_index, cf = future_to_chunk[future]
+            try:
+                etag = future.result()
+                completed_chunks.append({
+                    "chunk_index": chunk_index,
+                    "proof": etag,
+                    "proof_type": "etag",
+                    "chunk_size": os.path.getsize(cf)
+                })
+                logging.info(f"Chunk {chunk_index}/{total_chunks} uploaded successfully (ETag: {etag[:8]}...)")
+            except Exception as e:
+                logging.error(f"Failed to upload chunk {chunk_index}: {e}")
+                raise
+    
+    logging.info(f"All {total_chunks} chunks uploaded. Reporting to Twelve Labs.")
+    report_completed_chunks(api_key, upload_id, completed_chunks)
+    
+    for cf in chunk_files:
+        try: 
+            os.remove(cf)
+            logging.debug(f"Removed chunk file: {cf}")
+        except Exception as e:
+            logging.warning(f"Could not remove chunk file {cf}: {e}")
+    
+    try: 
+        os.rmdir(chunk_dir)
+        logging.debug(f"Removed chunk directory: {chunk_dir}")
+    except Exception as e:
+        logging.warning(f"Could not remove chunk directory {chunk_dir}: {e}")
+    
+    logging.info("Chunk upload and cleanup completed successfully")
+
+def poll_upload_session_status(api_key, upload_id, max_wait=7200):
+    url = f"https://api.twelvelabs.io/v1.3/assets/multipart-uploads/{upload_id}"
+    headers = {"x-api-key": api_key}
+    start = time.time()
+    
+    while time.time() - start < max_wait:
+        for attempt in range(3):
+            try:
+                resp = make_request_with_retries("GET", url, headers=headers)
+                if resp and resp.status_code == 200:
+                    data = resp.json()
+                    status = data.get("status")
+                    logging.debug(f"Upload session status: {status}")
+                    
+                    if status == "completed":
+                        logging.info("Upload session completed successfully")
+                        return True
+                    elif status == "failed":
+                        error_msg = data.get('error', 'Unknown error')
+                        logging.error(f"Upload session failed: {error_msg}")
+                        raise RuntimeError(f"Upload session failed: {error_msg}")
+                    
+                    # Still processing, wait and retry
+                    time.sleep(5)
+                    break
+                else:
+                    logging.warning(f"Failed to poll upload session: {resp.status_code if resp else 'No response'}")
+                    
+            except Exception as e:
+                logging.warning(f"Attempt {attempt + 1} to poll upload session status failed: {e}")
+                if attempt < 2:
+                    time.sleep([1, 3, 10][attempt])
+                else:
+                    logging.error("All attempts to poll upload session status have failed.")
+                    raise
+    
+    raise TimeoutError(f"Upload session polling timed out after {max_wait} seconds")
+
+def index_asset(api_key, index_id, asset_id):
+    url = f"https://api.twelvelabs.io/v1.3/indexes/{index_id}/indexed-assets"
+    headers = {"x-api-key": api_key, "Content-Type": "application/json"}
+    payload = {"asset_id": asset_id}
+    
+    for attempt in range(3):
+        try:
+            resp = make_request_with_retries("POST", url, headers=headers, json=payload)
+            if resp and resp.status_code == 202:
+                indexed_asset_id = resp.json()["_id"]
+                logging.info(f"Indexing started. Indexed asset ID: {indexed_asset_id}")
+                return indexed_asset_id
+            else:
+                error_msg = resp.text if resp else "No response"
+                logging.error(f"Indexing failed: status={resp.status_code if resp else 'N/A'}, error={error_msg}")
+                raise RuntimeError(f"Indexing failed: {resp.status_code if resp else 'No response'}")
+        except Exception as e:
+            logging.warning(f"Attempt {attempt + 1} to index asset failed: {e}")
+            if attempt < 2:
+                time.sleep([1, 3, 10][attempt])
+            else:
+                logging.error("All attempts to index asset have failed.")
+                raise
+
+def poll_indexed_asset_status(api_key, index_id, indexed_asset_id, max_wait=1200):
+    url = f"https://api.twelvelabs.io/v1.3/indexes/{index_id}/indexed-assets/{indexed_asset_id}"
+    headers = {"x-api-key": api_key}
+    start = time.time()
+    
+    while time.time() - start < max_wait:
+        for attempt in range(3):
+            try:
+                resp = make_request_with_retries("GET", url, headers=headers)
+                
+                if resp is None:
+                    logging.warning("No response received from server")
+                    if attempt < 2:
+                        time.sleep([1, 3, 10][attempt])
+                        continue
+                    else:
+                        raise RuntimeError("Failed to get response after retries")
+                
+                if resp.status_code == 200:
+                    data = resp.json()
+                    status = data.get("status")
+                    logging.debug(f"Indexed asset status: {status}")
+                    
+                    if status == "ready":
+                        logging.info("Indexing completed successfully")
+                        return True
+                    elif status == "failed":
+                        error_msg = data.get('error', 'Unknown error')
+                        logging.error(f"Indexing failed: {error_msg}")
+                        return False
+                    
+                    time.sleep(10)
+                    break
+                    
+                else:
+                    try:
+                        error_body = resp.text
+                        error_json = resp.json() if error_body else {}
+                        logging.error(f"Failed to poll indexed asset: status={resp.status_code}, response={error_body}")
+                        logging.debug(f"Error details: {error_json}")
+                    except:
+                        logging.error(f"Failed to poll indexed asset: status={resp.status_code}, response={resp.text}")
+                    
+                    if attempt < 2:
+                        time.sleep([1, 3, 10][attempt])
+                    else:
+                        raise RuntimeError(f"Polling failed with status {resp.status_code}: {resp.text}")
+                    
+            except Exception as e:
+                logging.warning(f"Attempt {attempt + 1} to poll indexed asset status failed: {e}")
+                if attempt < 2:
+                    time.sleep([1, 3, 10][attempt])
+                else:
+                    logging.error("All attempts to poll indexed asset status have failed.")
+                    raise
+    
+    logging.error(f"Indexed asset polling timed out after {max_wait} seconds")
     return False
 
-def upload_asset(api_key, index_id, file_path):
+# -----------------------------
+# Core Functions
+# -----------------------------
+
+def file_exists_in_index(api_key, index_id, filename, file_size):
+    url = f"https://api.twelvelabs.io/v1.3/indexes/{index_id}/indexed-assets"
+    headers = {"x-api-key": api_key}
+    params = {"filename": filename, "size": file_size}
+    page = 1
+    
+    while True:
+        params["page"] = page
+        resp = make_request_with_retries("GET", url, headers=headers, params=params)
+        if not resp or resp.status_code != 200:
+            return None
+        
+        data = resp.json()
+        for item in data.get("data", []):
+            meta = item.get("system_metadata", {})
+            if meta.get("filename") == filename and meta.get("size") == file_size:
+                return item["_id"]
+        
+        if page >= data.get("page_info", {}).get("total_page", 1):
+            break
+        page += 1
+    
+    return None
+
+def delete_video(api_key, index_id, indexed_asset_id):
+    url = f"https://api.twelvelabs.io/v1.3/indexes/{index_id}/indexed-assets/{indexed_asset_id}"
+    headers = {"x-api-key": api_key}
+    
+    for attempt in range(3):
+        try:    
+            resp = make_request_with_retries("DELETE", url, headers=headers)
+            return resp and resp.status_code in (200, 204)
+        except Exception as e:
+            logging.warning(f"Attempt {attempt + 1} to delete video failed: {e}")
+            if attempt < 2:
+                time.sleep([1, 3, 10][attempt])
+            else:
+                logging.error("All attempts to delete video have failed.")
+                raise
+
+def upload_asset(api_key, index_id, file_path, cloud_config_data, repo_guid, catalog_path):
     original_file_name = os.path.basename(file_path)
     name_part, ext_part = os.path.splitext(original_file_name)
     sanitized_name_part = name_part.strip()
@@ -407,426 +841,345 @@ def upload_asset(api_key, index_id, file_path):
     
     if file_name != original_file_name:
         logging.info(f"Filename sanitized from '{original_file_name}' to '{file_name}'")
+    
     file_size = os.path.getsize(file_path)
-
-    # Check for duplicates (with retry)
     conflict_resolution = cloud_config_data.get('conflict_resolution', DEFAULT_CONFLICT_RESOLUTION)
-    existing_video_id = file_exists_in_index(api_key, index_id, file_name, file_size)
-    if existing_video_id:
+    
+    # Check if file already exists
+    existing_id = file_exists_in_index(api_key, index_id, file_name, file_size)
+    
+    if existing_id:
         if conflict_resolution == "skip":
             logging.info(f"File '{file_name}' exists. Skipping upload.")
-            update_catalog(args.repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], index_id, existing_video_id)
+            update_catalog(repo_guid, catalog_path.replace("\\", "/").split("/1/", 1)[-1], index_id, existing_id)
             logging.info("Catalog updated with existing asset. Exiting successfully.")
             print(f"File '{file_name}' already exists. Skipping upload.")
             sys.exit(0)
         elif conflict_resolution == "overwrite":
-            if not delete_video(api_key, index_id, existing_video_id):
-                logging.warning("Proceeding with upload despite failed deletion.")
-    else:
-        logging.info(f"No duplicate found for '{file_name}'.")
+            logging.info(f"File '{file_name}' exists. Deleting before re-upload.")
+            if not delete_video(api_key, index_id, existing_id):
+                logging.warning("Proceeding despite failed deletion.")
+    
+    # Create multipart upload session
+    logging.info(f"Creating multipart upload session for '{file_name}'")
+    upload_id, asset_id, chunk_size, _, upload_urls = create_multipart_upload_session(api_key, file_name, file_size)
+    logging.info(f"Upload session created. Upload ID: {upload_id}, Asset ID: {asset_id}")
+    
+    # Upload chunks
+    logging.info("Starting chunk upload")
+    upload_file_chunks(api_key, file_path, upload_id, asset_id, chunk_size, upload_urls)
+    logging.info("All chunks uploaded successfully")
+    
+    # Poll for upload completion
+    logging.info("Polling for upload session completion")
+    if not poll_upload_session_status(api_key, upload_id):
+        raise RuntimeError("Upload session did not complete successfully")
+    
+    logging.info(f"Asset uploaded successfully. Asset ID: {asset_id}")
+    return asset_id, upload_id
 
-    url = "https://api.twelvelabs.io/v1.3/tasks"
-    headers = {"x-api-key": api_key}
-    payload = {"index_id": index_id}
+def add_metadata(api_key, index_id, indexed_asset_id, metadata):
+    url = f"https://api.twelvelabs.io/v1.3/indexes/{index_id}/indexed-assets/{indexed_asset_id}"
+    headers = {"x-api-key": api_key, "Content-Type": "application/json"}
 
-    for attempt in range(3):
-        try:
-            with open(file_path, 'rb') as f:
-                files = {"video_file": f}
-                logging.info(f"Uploading '{file_name}' to Twelve Labs index {index_id}... (Attempt {attempt + 1})")
-                response = requests.post(
-                    url,
-                    data=payload,
-                    files=files,
-                    headers=headers
-                )
-
-            # If 4xx, don't retry — it's a client error (e.g. bad index_id, auth)
-            if 400 <= response.status_code < 500:
-                error_msg = f"Client error: {response.status_code} {response.text}"
-                logging.error(error_msg)
-                raise RuntimeError(error_msg)
-
-            # If 2xx, success
-            if response.status_code in (200, 201):
-                logging.debug(f"Upload successful: {response.text}")
-                return response.json()
-
-            # If 5xx or unexpected, retry
-            logging.warning(f"Server error {response.status_code}: {response.text}. Retrying...")
-
-        except (ConnectionError, Timeout, requests.exceptions.ChunkedEncodingError) as e:
-            logging.warning(f"Network error on attempt {attempt + 1}: {e}")
-        except Exception as e:
-            if "4xx" in str(e).lower():
-                logging.error(f"Client error during upload: {e}")
-                raise
-            logging.warning(f"Transient error on attempt {attempt + 1}: {e}")
-
-        if attempt < 2:
-            base_delay = [1, 3, 10][attempt]
-            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
-            time.sleep(delay)
+    filtered_metadata = {}
+    for key, value in metadata.items():
+        if not isinstance(value, (str, int, float, bool)):
+            logging.debug(f"Converting non-primitive metadata field '{key}' to string")
+            filtered_metadata[key] = str(value)
         else:
-            logging.critical(f"Upload failed after 3 attempts: {file_name}")
-            raise RuntimeError("Upload failed after retries.")
+            filtered_metadata[key] = value
 
-    raise RuntimeError("Upload failed.")
+    payload = {"user_metadata": filtered_metadata}
 
-def poll_task_status(api_key, task_id, max_wait=1200, interval=10):
-    url = f"https://api.twelvelabs.io/v1.3/tasks/{task_id}"
-    headers = {"x-api-key": api_key}
-    logger.debug(f"URL :------------------------------------------->  {url}")
-    logging.info(f"Polling task {task_id} status. Max wait: {max_wait}s")
-
-    start_time = time.time()
-    attempt_counter = 0
-
-    while (time.time() - start_time) < max_wait:
-        try:
-            response = make_request_with_retries("GET", url, headers=headers)
-            if not response:
-                raise ConnectionError("No response from server")
-
-            if response.status_code == 404:
-                logging.error(f"Task {task_id} not found (404)")
-                return False
-            elif response.status_code != 200:
-                logging.warning(f"Status {response.status_code}: {response.text}")
-                if attempt_counter < 2:
-                    attempt_counter += 1
-                    delay = [1, 3, 10][attempt_counter-1] + random.uniform(0, [1, 1, 5][attempt_counter-1])
-                    time.sleep(delay)
-                    continue
-                else:
-                    logging.critical(f"Failed to fetch task status after retries: {response.text}")
-                    return False
-
-            data = response.json()
-            status = data.get("status")
-            hls_status = data.get("hls", {}).get("status")
-
-            logging.info(f"Task {task_id} | Status: {status} | HLS: {hls_status}")
-
-            if status == "ready":
-                logging.info(f"Task {task_id} completed successfully.")
-                return data
-
-            elif status == "failed":
-                reason = data.get("error", "No error message provided")
-                logging.error(f"Task {task_id} failed: {reason}")
-                return False
-
-            # Reset retry counter on successful poll
-            attempt_counter = 0
-
-        except Exception as e:
-            logging.debug(f"Exception during polling: {e}")
-            if attempt_counter < 2:
-                attempt_counter += 1
-                delay = [1, 3, 10][attempt_counter-1] + random.uniform(0, [1, 1, 5][attempt_counter-1])
-                time.sleep(delay)
-                continue
-            logging.warning(f"Polling transient error after retries: {e}")
-
-        # Wait before next poll
-        time.sleep(interval)
-
-    # Timeout
-    logging.critical(f" Polling timed out after {max_wait}s. Task {task_id} did not reach 'ready'.")
-    return False
-
-def add_metadata(api_key, index_id, video_id, metadata):
-    url = f"https://api.twelvelabs.io/v1.3/indexes/{index_id}/videos/{video_id}"
-    headers = {
-        "x-api-key": api_key,
-        "Content-Type": "application/json"
-    }
-    payload = {"user_metadata": metadata}
     for attempt in range(3):
-        try:
-            response = make_request_with_retries("PUT", url, json=payload, headers=headers)
-            if not response:
-                logger.warning(f"[add_metadata] [Attempt {attempt+1}] No response received.")
-                if attempt == 2:
-                    raise RuntimeError("No response from Twelve Labs after 3 attempts")
-                time.sleep([1, 3, 10][attempt] + random.uniform(0, 1))
-                continue
-
-            logger.debug(f"[add_metadata] [Attempt {attempt+1}] Status: {response.status_code}, Body: {response.text}")
-
-            if response.status_code == 204:
-                logger.info("[add_metadata] Metadata updated successfully (204 No Content).")
-                return None
-            elif response.status_code == 200:
-                logger.info("[add_metadata] Metadata updated successfully (200 OK).")
-                return response.json()
-            else:
-                error_detail = response.text or "No error body"
-                logger.error(
-                    f"[add_metadata] [Attempt {attempt+1}] Request failed: status={response.status_code}, response={error_detail}"
-                )
-                if attempt == 2:
-                    raise RuntimeError(f"Metadata update failed permanently: {response.status_code} {error_detail}")
-
+        resp = make_request_with_retries("PATCH", url, headers=headers, json=payload)
+        if resp is not None and resp.status_code == 204:
+            logging.info("Metadata updated successfully.")
+            return True
+        elif resp is not None and resp.status_code >= 400:
+            error_detail = resp.text or "No error body"
+            logging.error(
+                f"[add_metadata] [Attempt {attempt+1}] Request failed: status={resp.status_code}, response={error_detail}"
+            )
+            if attempt < 2:
                 delay = [1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt])
                 time.sleep(delay)
-
-        except Exception as e:
-            logger.exception(f"[add_metadata] [Attempt {attempt+1}] Exception: {e}")
-            if attempt == 2:
-                raise RuntimeError(f"Metadata update failed after 3 attempts: {e}")
+        else:
             delay = [1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt])
             time.sleep(delay)
 
-    raise RuntimeError("Metadata update failed after all retries.")
+    logging.warning("Metadata update failed after retries - continuing anyway")
+    return False
 
-def update_catalog(repo_guid, file_path, index_id, video_id, max_attempts=3):
+def update_catalog(repo_guid, file_path, index_id, indexed_asset_id, max_attempts=3):
     url = "http://127.0.0.1:5080/catalogs/providerData"
-    # Read NodeAPIKey from client services config
     node_api_key = get_node_api_key()
-    headers = {
-        "apikey": node_api_key,
-        "Content-Type": "application/json"
-    }
+    headers = {"apikey": node_api_key, "Content-Type": "application/json"}
+    
     payload = {
         "repoGuid": repo_guid,
         "fileName": os.path.basename(file_path),
         "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
         "providerName": cloud_config_data.get("provider", "twelvelabs"),
         "providerData": {
-            "assetId": video_id,
+            "assetId": indexed_asset_id,
             "indexId": index_id,
-            "providerUiLink": f"https://playground.twelvelabs.io/indexes/{index_id}/analyze?v={video_id}"
+            "providerUiLink": f"https://playground.twelvelabs.io/indexes/{index_id}/analyze?v={indexed_asset_id}"
         }
     }
+    
     for attempt in range(max_attempts):
-        try:
-            logging.debug(f"[Attempt {attempt+1}/{max_attempts}] Starting catalog update request to {url}")
-            response = make_request_with_retries("POST", url, headers=headers, json=payload)
-            if response is None:
-                logging.error(f"[Attempt {attempt+1}] Response is None!")
-                time.sleep(5)
-                continue
-            try:
-                resp_json = response.json() if response.text.strip() else {}
-            except Exception as e:
-                logging.warning(f"Failed to parse response JSON: {e}")
-                resp_json = {}
-            if response.status_code in (200, 201):
-                logging.info("Catalog updated successfully.")
-                return True
-            # --- Handle 404 explicitly ---
-            if response.status_code == 404:
-                logging.info("[404 DETECTED] Entering 404 handling block")
-                message = resp_json.get('message', '')
-                logging.debug(f"[404] Raw message from response: [{repr(message)}]")
-                clean_message = message.strip().lower()
-                logging.debug(f"[404] Cleaned message: [{repr(clean_message)}]")
+        resp = make_request_with_retries("POST", url, headers=headers, json=payload)
+        if resp and resp.status_code in (200, 201):
+            logging.info("Catalog updated successfully.")
+            return True
+        time.sleep(5)
+    
+    return False
 
-                if clean_message == "catalog item not found":
-                    wait_time = 60 + (attempt * 10)
-                    logging.warning(f"[404] Known 'not found' case. Waiting {wait_time} seconds before retry...")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    logging.error(f"[404] Unexpected message: {message}")
-                    break  # non-retryable 404
-            else:
-                logging.warning(f"[Attempt {attempt+1}] Non-404 error status: {response.status_code}")
-
-        except Exception as e:
-            logging.exception(f"[Attempt {attempt+1}] Unexpected exception in update_catalog: {e}")
-            if attempt < max_attempts - 1:
-                fallback_delay = 5 + attempt * 2
-                logging.debug(f"Sleeping {fallback_delay}s before next attempt")
-                time.sleep(fallback_delay)
-    pass
-
-def get_ai_metadata(api_key, index_id, video_id, advanced_settings=None, max_attempts=3):
+def get_ai_metadata(api_key, index_id, indexed_asset_id, advanced_settings=None, max_attempts=3):
     if not advanced_settings or not isinstance(advanced_settings, dict):
         logging.warning("No valid advanced_settings provided. Skipping all AI metadata extraction.")
         return {}
 
-    headers = {"x-api-key": api_key}
-    logging.debug(f"Advanced AI settings: {advanced_settings}")
+    headers = {
+        "x-api-key": api_key,
+        "Content-Type": "application/json"
+    }
     metadata = {}
+    url = "https://api.twelvelabs.io/v1.3/analyze"
 
-    # === Gist ===
-    if "gist" in advanced_settings and isinstance(advanced_settings["gist"], dict):
-        gist_config = advanced_settings["gist"]
-        allowed_types = {"title", "topic", "hashtag"}
-        if "types" in gist_config and isinstance(gist_config["types"], list):
-            filtered_types = [t for t in gist_config["types"] if t in allowed_types]
-            if filtered_types:
-                payload = {"video_id": video_id, "types": filtered_types}
-                url = "https://api.twelvelabs.io/v1.3/gist"
-                for attempt in range(max_attempts):
-                    try:
-                        response = make_request_with_retries("POST", url, headers=headers, json=payload)
-                        if response and response.status_code == 200:
-                            metadata["gist"] = response.json()
-                            logging.info("Retrieved gist metadata successfully.")
-                            break
-                    except Exception as e:
-                        logging.warning(f"Gist attempt {attempt+1} failed: {e}")
-                    if attempt < max_attempts - 1:
-                        time.sleep([1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt]))
-                else:
-                    logging.error("Gist failed after max retries.")
-            else:
-                logging.warning("No valid gist types found (only 'title', 'topic', 'hashtag' allowed). Skipping gist.")
-        else:
-            logging.warning("Gist block missing 'types' or invalid. Skipping gist.")
+    # Run each extraction schema via /analyze
+    if "extraction_schemas" in advanced_settings:
+        for schema in advanced_settings["extraction_schemas"]:
+            name = schema["name"]
+            if "prompt" not in schema:
+                logging.warning(f"Schema '{name}' missing 'prompt'. Skipping.")
+                continue
 
-    # === Open-ended ===
-    if "open_ended" in advanced_settings and isinstance(advanced_settings["open_ended"], dict):
-        open_cfg = advanced_settings["open_ended"]
-        if "prompt" not in open_cfg:
-            logging.warning("open_ended block missing required 'prompt'. Skipping open-ended analysis.")
-        else:
-            payload = {"video_id": video_id, "stream": False, "prompt": open_cfg["prompt"]}
-            # Add optional fields only if present
-            if "max_tokens" in open_cfg:
-                payload["max_tokens"] = int(open_cfg["max_tokens"])
-            if "temperature" in open_cfg:
-                payload["temperature"] = float(open_cfg["temperature"])
-            if "response_format" in open_cfg:
-                payload["response_format"] = open_cfg["response_format"]  # Full object
+            payload = {
+                "video_id": indexed_asset_id,
+                "prompt": schema["prompt"],
+                "stream": False
+            }
+            if "temperature" in schema:
+                payload["temperature"] = float(schema["temperature"])
+            if "max_tokens" in schema:
+                payload["max_tokens"] = int(schema["max_tokens"])
+            if "response_format" in schema:
+                payload["response_format"] = schema["response_format"]
 
-            url = "https://api.twelvelabs.io/v1.3/analyze"
             for attempt in range(max_attempts):
                 try:
                     response = make_request_with_retries("POST", url, headers=headers, json=payload)
                     if response and response.status_code == 200:
-                        metadata["open"] = response.json()
-                        logging.info("Retrieved open-ended metadata successfully.")
+                        resp_json = response.json()
+                        finish_reason = resp_json.get("finish_reason")
+                        raw_data = resp_json.get("data")
+
+                        if finish_reason == "length":
+                            logging.warning(f"Response for '{name}' truncated due to token limit.")
+
+                        # Parse data if it's a JSON string
+                        if isinstance(raw_data, str):
+                            try:
+                                parsed = json.loads(raw_data)
+                            except json.JSONDecodeError:
+                                logging.error(f"Failed to parse 'data' as JSON for '{name}'. Keeping as string.")
+                                parsed = raw_data
+                        else:
+                            parsed = raw_data
+
+                        metadata[name] = parsed
+                        logging.info(f"Successfully extracted '{name}'.")
                         break
+
+                    else:
+                        logging.warning(f"HTTP {response.status_code} for '{name}': {response.text}")
+
                 except Exception as e:
-                    logging.warning(f"Open-ended attempt {attempt+1} failed: {e}")
-                if attempt < max_attempts - 1:
-                    time.sleep([1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt]))
-            else:
-                logging.error("Open-ended failed after max retries.")
+                    logging.warning(f"Attempt {attempt+1} failed for '{name}': {e}")
+                    if attempt == max_attempts - 1:
+                        logging.error(f"All retries failed for '{name}'.")
 
-    # === Summary ===
-    if "summary" in advanced_settings and isinstance(advanced_settings["summary"], dict):
-        summary_block = advanced_settings["summary"]
-        subtypes_list = summary_block.get("subtypes")
-        if isinstance(subtypes_list, list) and subtypes_list:
-            metadata["summary"] = {}
-            url = "https://api.twelvelabs.io/v1.3/summarize"
-            for subtype in subtypes_list:
-                subtype_config = summary_block.get(subtype, {})
-                if not isinstance(subtype_config, dict):
-                    subtype_config = {}
-                payload = {"video_id": video_id, "type": subtype}
-                # Common fields for all summary subtypes
-                if "prompt" in subtype_config:
-                    payload["prompt"] = subtype_config["prompt"]
-                if "temperature" in subtype_config:
-                    payload["temperature"] = float(subtype_config["temperature"])
-                if "max_tokens" in subtype_config:
-                    payload["max_tokens"] = int(subtype_config["max_tokens"])
-                # response_format ONLY allowed for "summary" subtype
-                if subtype == "summary" and "response_format" in subtype_config:
-                    payload["response_format"] = subtype_config["response_format"]
+    # Embeddings & Transcript
+    get_embeddings = True if advanced_settings.get("fetch_embeddings").lower() in ("1","true","yes") else False
+    get_transcript = True if advanced_settings.get("fetch_transcript").lower() in ("1","true","yes") else False
+    logging.info(f"Fetching embeddings: {get_embeddings}, transcript: {get_transcript}")
+    if get_embeddings or get_transcript:
+        url = f"https://api.twelvelabs.io/v1.3/indexes/{index_id}/indexed-assets/{indexed_asset_id}"
+        params = {}
+        if get_embeddings:
+            params["embedding_option"] = advanced_settings.get("embedding_options", [])
+        if get_transcript:
+            params["transcription"] = "true"
 
-                for attempt in range(max_attempts):
-                    try:
-                        response = make_request_with_retries("POST", url, headers=headers, json=payload)
-                        if response and response.status_code == 200:
-                            metadata["summary"][subtype] = response.json()
-                            logging.info(f"Retrieved summary ({subtype}) successfully.")
-                            break
-                    except Exception as e:
-                        logging.warning(f"Summary ({subtype}) attempt {attempt+1} failed: {e}")
-                    if attempt < max_attempts - 1:
-                        time.sleep([1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt]))
-                else:
-                    logging.error(f"Summary ({subtype}) failed after max retries.")
-        else:
-            logging.warning("Summary block missing 'subtypes' or it's empty. Skipping all summary generation.")
-
-    # === Embeddings & Transcript ===
-    if "embeddings_and_transcript" in advanced_settings and advanced_settings["embeddings_and_transcript"] == True:
-        url = f"https://api.twelvelabs.io/v1.3/indexes/{index_id}/videos/{video_id}"
-        params = {"embedding_option": ["audio", "visual-text"], "transcription": "true"}
         for attempt in range(max_attempts):
             try:
-                response = make_request_with_retries("GET", url, headers=headers, params=params)
-                if response and response.status_code == 200:
-                    metadata["embeddings_and_transcript"] = response.json()
-                    logging.info("Retrieved embeddings and transcription successfully.")
+                resp = make_request_with_retries("GET", url, headers=headers, params=params)
+                if resp and resp.status_code == 200:
+                    data = resp.json()
+                    if "embedding" in data:
+                        metadata["embeddings"] = data["embedding"]
+                    if "transcription" in data:
+                        metadata["transcription"] = data["transcription"]
                     break
             except Exception as e:
-                logging.warning(f"Embeddings/transcript attempt {attempt+1} failed: {e}")
-            if attempt < max_attempts - 1:
-                time.sleep([1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt]))
-        else:
-            logging.error("Embeddings/transcript failed after max retries.")
+                logging.warning(f"Attempt {attempt + 1} to fetch embeddings/transcript failed: {e}")
+                if attempt < max_attempts - 1:
+                    time.sleep([1, 3, 10][attempt])
+                else:
+                    logging.error("All attempts to fetch embeddings/transcript have failed.")
 
     return metadata
 
-def store_metadata_file(repo_guid, file_path, metadata, max_attempts=3):
-    host, meta_path = get_metadata_store_path()
-    if not host or not meta_path:
+def store_metadata_file(config, repo_guid, file_path, metadata, max_attempts=3):
+    meta_path, proxy_path = get_store_paths()
+    if not meta_path:
         logging.error("Metadata Store settings not found.")
-        return None
-    logging.debug(f"Metadata Store Host: {host}, Path: {meta_path}")
-    clean_file_path = file_path if file_path.startswith("/") else f"/{file_path}"
-    logging.debug(f"Clean file path for metadata storage: {clean_file_path}")
-    metadata_dir = os.path.join(meta_path, repo_guid, clean_file_path.lstrip("/"))
-    logging.debug(f"Local metadata directory: {metadata_dir}")
-    os.makedirs(metadata_dir, exist_ok=True)
-    provider = cloud_config_data.get('provider', 'twelvelabs')
-    metadata_file_path = os.path.join(metadata_dir, f"{provider}.json")
-    logging.debug(f"Metadata file path: {metadata_file_path}")
+        return None, None
 
+    provider = config.get("provider", "twelvelabs")
+    base = os.path.splitext(os.path.basename(file_path))[0]
+    repo_guid_str = str(repo_guid)
+
+    # Split meta_path at /./
+    if "/./" in meta_path:
+        meta_left, meta_right = meta_path.split("/./", 1)
+    else:
+        meta_left, meta_right = meta_path, ""
+
+    meta_left = meta_left.rstrip("/")
+
+    # Build physical path
+    metadata_dir = os.path.join(meta_left, meta_right, repo_guid_str, file_path, provider)
+    os.makedirs(metadata_dir, exist_ok=True)
+
+    # Full local physical paths
+    raw_json = os.path.join(metadata_dir, f"{base}_raw.json")
+    norm_json = os.path.join(metadata_dir, f"{base}_norm.json")
+
+    # Returned paths (after /./)
+    raw_return = os.path.join(meta_right, repo_guid_str, file_path, provider, f"{base}_raw.json")
+    norm_return = os.path.join(meta_right, repo_guid_str, file_path, provider, f"{base}_norm.json")
+
+    raw_success = False
+    norm_success = False
+
+    # Write metadata with retry
     for attempt in range(max_attempts):
         try:
-            with open(metadata_file_path, 'w') as f:
+            # RAW write
+            with open(raw_json, "w", encoding="utf-8") as f:
                 json.dump(metadata, f, ensure_ascii=False, indent=4)
-            logging.info(f"Metadata file stored at: {metadata_file_path}")
+            raw_success = True
 
-            base = host if host.endswith('/') else host + '/'
-            rel_path = f"{repo_guid}/{clean_file_path}/{provider}.json".lstrip("/")
-            rel_path_enc = urllib.parse.quote(rel_path, safe="/")
-            metadata_file_url = urllib.parse.urljoin(base, rel_path_enc)
-            logging.debug(f"Metadata file URL: {metadata_file_url}")
-            return metadata_file_url
+            # NORMALIZED write
+            if not get_twelvelabs_normalized_metadata(raw_json, norm_json):
+                logging.error("Normalization failed.")
+                norm_success = False
+            else:
+                norm_success = True
+
+            break
+
         except Exception as e:
-            logging.warning(f"Failed to store metadata file (Attempt {attempt+1}): {e}")
+            logging.warning(f"Metadata write failed (Attempt {attempt+1}): {e}")
             if attempt < max_attempts - 1:
                 time.sleep([1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt]))
-    logging.error("Failed to store metadata file after max retries.")
-    return None
 
-def send_extracted_metadata(repo_guid, file_path, metadataFileURL, max_attempts=3):
+    return (
+        raw_return if raw_success else None,
+        norm_return if norm_success else None
+    )
+
+def send_extracted_metadata(config, repo_guid, file_path, rawMetadataFilePath, normMetadataFilePath=None, max_attempts=3):
     url = "http://127.0.0.1:5080/catalogs/extendedMetadata"
     node_api_key = get_node_api_key()
     headers = {"apikey": node_api_key, "Content-Type": "application/json"}
     payload = {
         "repoGuid": repo_guid,
-        "providerName": cloud_config_data.get("provider", "twelvelabs"),
+        "providerName": config.get("provider", "twelvelabs"),
         "extendedMetadata": [{
             "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
-            "fileName": os.path.basename(file_path),
-            "metadataFilePath": metadataFileURL
+            "fileName": os.path.basename(file_path)
         }]
     }
-    for _ in range(max_attempts):
+    if rawMetadataFilePath is not None:
+        payload["extendedMetadata"][0]["metadataRawJsonFilePath"] = rawMetadataFilePath
+    if normMetadataFilePath is not None:
+        payload["extendedMetadata"][0]["metadataFilePath"] = normMetadataFilePath
+    for attempt in range(max_attempts):
         try:
             r = make_request_with_retries("POST", url, headers=headers, json=payload)
             if r and r.status_code in (200, 201):
                 return True
         except Exception as e:
-            logging.warning(f"Metadata send error: {e}")
+            if attempt == 2:
+                logging.critical(f"Failed to send metadata after 3 attempts: {e}")
+                raise
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
     return False
+
+def transform_normalized_to_enriched(norm_metadata_file_path, filetype_prefix):
+    try:
+        with open(norm_metadata_file_path, "r") as f:
+            data = json.load(f)
+        result = []
+        for event_type, detections in data.items():
+            sdna_event_type = SDNA_EVENT_MAP.get(event_type, 'unknown')
+            for detection in detections:
+                occurrences = detection.get("occurrences", [])
+                event_obj = {
+                    "eventType": event_type,
+                    "sdnaEventType": sdna_event_type,
+                    "sdnaEventTypePrefix": filetype_prefix,
+                    "eventValue": detection.get("value", ""),
+                    "totalOccurrences": len(occurrences),
+                    "eventOccurence": occurrences
+                }
+                result.append(event_obj)
+        return result, True
+    except Exception as e:
+        return f"Error during transformation: {e}", False
+
+def send_ai_enriched_metadata(config, repo_guid, file_path, enrichedMetadata, max_attempts=3):
+    url = "http://127.0.0.1:5080/catalogs/aiEnrichedMetadata"
+    node_api_key = get_node_api_key()
+    headers = {"apikey": node_api_key, "Content-Type": "application/json"}
+    payload = {
+        "repoGuid": repo_guid,
+        "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
+        "fileName": os.path.basename(file_path),
+        "providerName": config.get("provider", "twelvelabs"),
+        "normalizedMetadata": enrichedMetadata
+    }
+
+    for attempt in range(max_attempts):
+        try:
+            r = make_request_with_retries("POST", url, headers=headers, json=payload)
+            logging.debug(f"AI enrichment response: {r.text if r else 'No response'}")
+            if r and r.status_code in (200, 201):
+                return True
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to send metadata after 3 attempts: {e}")
+                raise
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return False
+
+# -----------------------------
+# Main Execution
+# -----------------------------
 
 if __name__ == '__main__':
     time.sleep(random.uniform(0.0, 1.5))
-
+    
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--mode", required=True, help="Mode: proxy, original, get_base_target")
     parser.add_argument("-c", "--config-name", required=True, help="Name of cloud configuration")
@@ -841,10 +1194,10 @@ if __name__ == '__main__':
     parser.add_argument("--dry-run", action="store_true", help="Dry run mode")
     parser.add_argument("--log-level", default="debug", help="Logging level")
     parser.add_argument("-r", "--repo-guid", help="Repo GUID")
+    parser.add_argument("--enrich-prefix", help="Prefix to add for sdnaEventType of AI enrich data")
     parser.add_argument("--resolved-upload-id", action="store_true", help="Treat upload-path as index ID")
     parser.add_argument("--controller-address", help="Controller IP:Port")
     parser.add_argument("--export-ai-metadata", help="Export AI metadata")
-    parser.add_argument("--export-prompt",help= "Prompt for open ended analysis")
 
     args = parser.parse_args()
 
@@ -874,31 +1227,60 @@ if __name__ == '__main__':
     if args.export_ai_metadata:
         cloud_config_data["export_ai_metadata"] = "true" if args.export_ai_metadata.lower() == "true" else "false"
 
-    # Load advanced AI settings
-    advanced_settings_path = cloud_config_data.get("advanced_settings")
-    advanced_ai_settings = None
-    if advanced_settings_path:
-        advanced_ai_settings = load_advanced_ai_settings(advanced_settings_path)
+    filetype_prefix = args.enrich_prefix if args.enrich_prefix else "gen"
 
+    # Load advanced AI settings
+    provider_name = cloud_config_data.get("provider", "twelvelabs")
+    advanced_ai_settings = get_advanced_ai_config(args.config_name, provider_name)
+    if not advanced_ai_settings:
+        logging.warning("No advanced AI settings available. AI metadata extraction may be limited.")
+
+    # Handle send_extracted_metadata mode
     if args.mode == "send_extracted_metadata":
         if not (args.asset_id and args.repo_guid and args.catalog_path):
             logging.error("Asset ID, Repo GUID, and Catalog path required.")
             sys.exit(1)
+        
         index_id = args.upload_path if args.resolved_upload_id else cloud_config_data.get('index_id')
         clean_catalog_path = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
+        
         if not advanced_ai_settings:
             logging.error("Advanced AI settings required for metadata extraction.")
             sys.exit(1)
+        
         ai_metadata = get_ai_metadata(api_key, index_id, args.asset_id, advanced_settings=advanced_ai_settings)
-        if ai_metadata:
-            metadata_url = store_metadata_file(args.repo_guid, clean_catalog_path, ai_metadata)
-            if not send_extracted_metadata(args.repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], metadata_url):
-                logging.error("Failed to send extracted metadata.")
-                sys.exit(1)
-            else:
-                logging.info("Extracted metadata sent successfully.")
-                sys.exit(0)
+        if not ai_metadata:
+            logging.error("Could not get AI metadata")
+            sys.exit(7)
 
+        raw_path, norm_path = store_metadata_file(cloud_config_data, args.repo_guid, clean_catalog_path, ai_metadata)
+        if not send_extracted_metadata(cloud_config_data, args.repo_guid, clean_catalog_path, raw_path, norm_path):
+            logging.error("Failed to send extracted metadata.")
+            sys.exit(7)
+        
+        logger.info("Extracted metadata sent successfully.")
+
+        if norm_path:
+            try:
+                meta_path, _ = get_store_paths()
+                norm_metadata_file_path = os.path.join(
+                    meta_path.split("/./")[0] if "/./" in meta_path else meta_path.split("/$/")[0] if "/$/" in meta_path else meta_path, 
+                    norm_path
+                )
+                enriched, success = transform_normalized_to_enriched(norm_metadata_file_path, filetype_prefix)
+                
+                if success and send_ai_enriched_metadata(cloud_config_data, args.repo_guid, clean_catalog_path, enriched):
+                    logger.info("AI enriched metadata sent successfully.")
+                else:
+                    logger.warning("AI enriched metadata send failed – skipping.")
+            except Exception as e:
+                logger.exception(f"AI enriched metadata transform failed: {e}")
+        else:
+            logger.info("Normalized metadata not present – skipping AI enrichment.")
+
+        sys.exit(0)
+
+    # Main upload workflow
     index_id = args.upload_path if args.resolved_upload_id else cloud_config_data.get('index_id')
     if not index_id:
         logging.error("Index ID not provided and not found in config.")
@@ -912,7 +1294,7 @@ if __name__ == '__main__':
         logging.error(f"File not found: {matched_file}")
         sys.exit(4)
 
-    # Size limit
+    # Size limit check
     if mode == "original" and args.size_limit:
         try:
             limit_bytes = float(args.size_limit) * 1024 * 1024
@@ -923,7 +1305,7 @@ if __name__ == '__main__':
         except ValueError:
             logging.warning(f"Invalid size limit: {args.size_limit}")
 
-    # Backlink URL
+    # Generate backlink URL
     catalog_path = args.catalog_path or matched_file
     rel_path = remove_file_name_from_path(catalog_path).replace("\\", "/")
     rel_path = rel_path.split("/1/", 1)[-1] if "/1/" in rel_path else rel_path
@@ -967,7 +1349,6 @@ if __name__ == '__main__':
 
         safe_metadata = {}
         for key, value in metadata_obj.items():
-            # Normalize key to lowercase for comparison
             if key.lower() in RESERVED_METADATA_FIELDS:
                 new_key = f"fabric-{key}"
                 safe_metadata[new_key] = value
@@ -981,75 +1362,76 @@ if __name__ == '__main__':
         logging.error(f"Failed to prepare metadata: {e}")
         metadata_obj = {}
 
-    # Step 1: Upload
+    # Execute upload workflow
     try:
-        result = upload_asset(api_key, index_id, matched_file)
-        task_id = result.get("_id")
-        if not task_id:
-            logging.error("Upload succeeded but no 'task_id' in response.")
+        # Step 1: Upload asset and wait for completion
+        logging.info("STEP 1: Uploading asset")
+        asset_id, upload_id = upload_asset(api_key, index_id, matched_file, cloud_config_data, args.repo_guid, args.catalog_path)
+        
+        # Step 2: Index the asset
+        logging.info("STEP 2: Indexing asset")
+        indexed_asset_id = index_asset(api_key, index_id, asset_id)
+        
+        # Step 3: Poll for indexing completion FIRST
+        logging.info("STEP 3: Waiting for indexing to complete")
+        indexing_success = poll_indexed_asset_status(api_key, index_id, indexed_asset_id)
+
+        if not indexing_success:
+            logging.error("Indexing failed or timed out")
             sys.exit(1)
-        logging.info(f"Upload successful. Task ID: {task_id}")
-
-        # Step 2: Apply metadata BEFORE polling (as requested)
-        video_id = result.get("video_id")  # may not exist yet
-        if not video_id:
-            logging.warning("video_id not in upload response. Will extract after ready.")
-        else:
-            try:
-                add_metadata(api_key, index_id, video_id, metadata_obj)
-                logging.info(f"Metadata applied to video {video_id}")
-            except Exception as e:
-                logging.warning(f"Metadata application failed: {e}")
-
-        # Step 3: Poll for indexing completion
-        poll_result = poll_task_status(api_key, task_id)
-        if not poll_result:
-            logging.error("Task polling failed or timed out.")
-            sys.exit(1)
-
-        final_video_id = poll_result.get("video_id")
-        if not final_video_id:
-            logging.error("Task completed but 'video_id' missing.")
-            sys.exit(1)
-
-        logging.info(f"Indexing complete. Final Video ID: {final_video_id}")
-        if update_catalog(args.repo_guid, catalog_path.replace("\\", "/").split("/1/", 1)[-1], index_id, final_video_id):
-            logging.debug("Catalog updation succeeded")
-
-        # Step 4: Send extracted AI metadata ...
+        
+        # Step 4: Apply metadata AFTER indexing is ready
+        logging.info("STEP 4: Applying metadata")
         try:
-            if cloud_config_data.get('export_ai_metadata') == "true" and poll_result.get('status') == "ready":
-                ai_metadata = get_ai_metadata(api_key, index_id, final_video_id, advanced_settings=advanced_ai_settings)
-                if ai_metadata:
-                    metadata_url = store_metadata_file(args.repo_guid, clean_catalog_path, ai_metadata)
-                    if not send_extracted_metadata(args.repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], metadata_url):
-                        logger.error("Failed to send extracted AI metadata.")
-                        print(f"Metadata extraction failed for asset: {final_video_id}")
-                        sys.exit(7)
-                    else:
-                        logger.info("Extracted AI metadata sent successfully.")
-                else:
-                    logger.error("AI metadata could not be retrieved.")
-                    print(f"Metadata extraction failed for asset: {final_video_id}")
-                    sys.exit(7)
-            elif cloud_config_data.get('export_ai_metadata') == "true":
-                logger.error("Poll result status is not 'ready'; cannot export AI metadata.")
-                print(f"Metadata extraction failed for asset: {final_video_id}")
-                sys.exit(7)
+            add_metadata(api_key, index_id, indexed_asset_id, metadata_obj)
+            logging.info(f"Metadata applied to indexed asset {indexed_asset_id}")
         except Exception as e:
-            logger.error(f"Exception while exporting AI metadata: {e}")
-            print(f"Metadata extraction failed for asset: {final_video_id}")
-            sys.exit(7)
-
-        # Re-apply metadata if not done earlier (e.g., video_id wasn't available)
-        if not video_id:
+            logging.warning(f"Metadata application failed: {e}")
+    
+        # Step 5: Update catalog
+        logging.info("STEP 5: Updating catalog")
+        if update_catalog(args.repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], index_id, indexed_asset_id):
+            logging.info("Catalog updated successfully")
+        else:
+            logging.warning("Catalog update failed but continuing")
+        # Step 6: Export AI metadata if requested
+        if cloud_config_data.get('export_ai_metadata') == "true":
+            logging.info("STEP 6: Exporting AI metadata")
             try:
-                add_metadata(api_key, index_id, final_video_id, metadata_obj)
-                logging.info(f"Metadata applied after indexing: {final_video_id}")
-            except Exception as e:
-                logging.warning(f"Metadata application failed post-indexing: {e}")
+                ai_metadata = get_ai_metadata(api_key, index_id, indexed_asset_id, advanced_settings=advanced_ai_settings)
+                clean_catalog_path = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
 
-        logging.info("Twelve Labs upload and indexing completed successfully.")
+                if not ai_metadata:
+                    logging.error("Could not get AI metadata")
+                    sys.exit(7)
+                raw_path, norm_path = store_metadata_file(cloud_config_data, args.repo_guid, clean_catalog_path, ai_metadata)
+                if not send_extracted_metadata(cloud_config_data, args.repo_guid, clean_catalog_path, raw_path, norm_path):
+                    logging.error("Failed to send extracted metadata.")
+                    sys.exit(7)
+                logger.info("Extracted metadata sent successfully.")
+                if norm_path:
+                    try:
+                        meta_path, _ = get_store_paths()
+                        norm_metadata_file_path = os.path.join(
+                            meta_path.split("/./")[0] if "/./" in meta_path else meta_path.split("/$/")[0] if "/$/" in meta_path else meta_path, 
+                            norm_path
+                        )
+                        enriched, enrich_success = transform_normalized_to_enriched(norm_metadata_file_path, filetype_prefix)
+                        if enrich_success and send_ai_enriched_metadata(cloud_config_data, args.repo_guid, clean_catalog_path, enriched):
+                            logger.info("AI enriched metadata sent successfully.")
+                        else:
+                            logger.warning("AI enriched metadata send failed – skipping.")
+                    except Exception as e:
+                        logger.exception(f"AI enriched metadata transform failed: {e}")
+                else:
+                    logger.info("Normalized metadata not present – skipping AI enrichment.")
+            except Exception as e:
+                logger.error(f"Exception while exporting AI metadata: {e}")
+                print(f"Metadata extraction failed for asset: {indexed_asset_id}")
+                sys.exit(7)
+
+        logging.info("SUCCESS: Twelve Labs upload and indexing completed")
+        logging.info(f"Indexed Asset ID: {indexed_asset_id}")
         sys.exit(0)
 
     except Exception as e:
