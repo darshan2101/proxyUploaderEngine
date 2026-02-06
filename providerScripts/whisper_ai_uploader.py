@@ -18,7 +18,7 @@ import requests
 from requests.adapters import HTTPAdapter
 
 # Constants
-VALID_MODES = ["transcribe", "translate", "batch_transcribe", "send_extracted_metadata"]
+VALID_MODES = ["original", "proxy", "send_extracted_metadata"]
 DEFAULT_CHUNK_DURATION = 300
 RATE_LIMIT_DELAY = 0.5
 MAX_RETRIES = 3
@@ -97,6 +97,7 @@ def get_retry_session():
 
 def make_request_with_retries(method, url, max_retries=3, **kwargs):
     session = get_retry_session()
+    last_error = None
     for attempt in range(max_retries):
         try:
             response = session.request(method, url, timeout=(10, 30), **kwargs)
@@ -105,9 +106,11 @@ def make_request_with_retries(method, url, max_retries=3, **kwargs):
             if attempt == max_retries - 1:
                 return response
             time.sleep(5)
-        except Exception:
+        except Exception as e:
+            last_error = e
             if attempt == max_retries - 1:
-                raise
+                logger.error(f"Request failed after {max_retries} attempts: {e}")
+                return None
             time.sleep([2, 5, 15][attempt] + random.uniform(0, 2))
     return None
 
@@ -170,34 +173,37 @@ def get_node_api_key():
         if IS_LINUX:
             parser = ConfigParser()
             parser.read(DNA_CLIENT_SERVICES)
-            api_key = parser.get('General', 'ApiKey', fallback='').strip()
+            api_key = parser.get('General', 'NodeAPIKey', fallback='').strip()
         else:
             import plistlib
             with open(DNA_CLIENT_SERVICES, 'rb') as fp:
                 data = plistlib.load(fp)
-                api_key = data.get('ApiKey', '').strip()
+                api_key = data.get('NodeAPIKey', '').strip()
         return api_key
     except Exception as e:
         logger.error(f"Failed to read API key: {e}")
         sys.exit(5)
 
 def get_store_paths():
+    metadata_store_path, proxy_store_path = "", ""
     try:
-        if IS_LINUX:
-            parser = ConfigParser()
-            parser.read(DNA_CLIENT_SERVICES)
-            meta = parser.get('General', 'MetadataPath', fallback='').strip()
-            repo = parser.get('General', 'RepositoryPath', fallback='').strip()
-        else:
-            import plistlib
-            with open(DNA_CLIENT_SERVICES, 'rb') as fp:
-                data = plistlib.load(fp)
-                meta = data.get('MetadataPath', '').strip()
-                repo = data.get('RepositoryPath', '').strip()
-        return meta, repo
+        #read opt/sdna/nginx/ai-config.json file to get "ai_proxy_shared_drive_path" and ai_export_shared_drive_path":
+        config_path = "/opt/sdna/nginx/ai-config.json" if IS_LINUX else "/Library/Application Support/StorageDNA/nginx/ai-config.json"
+        with open(config_path, 'r') as f:
+            config_data = json.load(f)
+            metadata_store_path = config_data.get("ai_export_shared_drive_path", "")
+            proxy_store_path = config_data.get("ai_proxy_shared_drive_path", "")
+            logging.info(f"Metadata Store Path: {metadata_store_path}, Proxy Store Path: {proxy_store_path}")
+        
     except Exception as e:
-        logger.error(f"Error reading store paths: {e}")
+        logging.error(f"Error reading Metadata Store or Proxy Store settings: {e}")
         sys.exit(5)
+
+    if not metadata_store_path or not proxy_store_path:
+        logging.info("Store settings not found.")
+        sys.exit(5)
+
+    return metadata_store_path, proxy_store_path
 
 def add_metadata_directory(repo_guid, provider, file_path):
     meta_path, _ = get_store_paths()
@@ -411,19 +417,26 @@ class WhisperProcessor:
             logger.error(f"Save failed: {e}")
             return False
 
-    def fetch_and_save_all_metadata(self, input_path, repo_guid, file_path, translation_languages=None):
+    def fetch_and_save_all_metadata(self, input_path, repo_guid, file_path, translation_languages=None, force_refresh=False):
         provider = "WHISPER"
         metadata_dir, meta_right, base_name = add_metadata_directory(repo_guid, provider, file_path)
 
         # Base transcription
-        logger.info("Fetching base transcription...")
-        base_metadata = self.transcribe(input_path)
-        if not base_metadata:
-            fail("Transcription failed")
-
         base_json_path = os.path.join(metadata_dir, f"{base_name}.json")
-        if not self.save_metadata_to_file(base_json_path, base_metadata):
-            fail("Failed to save base metadata")
+        if os.path.exists(base_json_path) and not force_refresh:
+            logger.info(f"Using cached base transcription: {base_json_path}")
+            with open(base_json_path, 'r', encoding='utf-8') as f:
+                base_metadata = json.load(f)
+        else:
+            if force_refresh:
+                logger.info("Force refresh enabled - regenerating base transcription")
+            else:
+                logger.info("Fetching base transcription...")
+            base_metadata = self.transcribe(input_path)
+            if not base_metadata:
+                fail("Transcription failed")
+            if not self.save_metadata_to_file(base_json_path, base_metadata):
+                fail("Failed to save base metadata")
 
         # Translations
         translated_data = {}
@@ -434,11 +447,23 @@ class WhisperProcessor:
                     logger.warning(f"Unsupported language: {lang_code}")
                     continue
                 
-                logger.info(f"Translating to: {lang_code}")
+                lang_json_path = os.path.join(metadata_dir, f"{base_name}_{lang_code}.json")
+                if os.path.exists(lang_json_path) and not force_refresh:
+                    logger.info(f"Using cached translation for {lang_code}: {lang_json_path}")
+                    try:
+                        with open(lang_json_path, 'r', encoding='utf-8') as f:
+                            translated_data[lang_code] = json.load(f)
+                        continue
+                    except Exception as e:
+                        logger.warning(f"Failed to load cached {lang_code}, regenerating: {e}")
+                
+                if force_refresh:
+                    logger.info(f"Force refresh - regenerating translation for: {lang_code}")
+                else:
+                    logger.info(f"Translating to: {lang_code}")
                 translated_metadata = self.transcribe(input_path, language=lang_code)
                 
                 if translated_metadata:
-                    lang_json_path = os.path.join(metadata_dir, f"{base_name}_{lang_code}.json")
                     if self.save_metadata_to_file(lang_json_path, translated_metadata):
                         translated_data[lang_code] = translated_metadata
 
@@ -500,34 +525,72 @@ class WhisperProcessor:
         url = "http://127.0.0.1:5080/catalogs/extendedMetadata"
         node_api_key = get_node_api_key()
         headers = {"apikey": node_api_key, "Content-Type": "application/json"}
+
+        metadata_array = []
+        if normMetadataFilePath is not None:
+            metadata_array.append({
+                "type": "metadataFilePath",
+                "path": normMetadataFilePath
+            })
+        if rawMetadataFilePath is not None:
+            metadata_array.append({
+                "type": "metadataRawJsonFilePath", 
+                "path": rawMetadataFilePath
+            })
+
         payload = {
             "repoGuid": repo_guid,
-            "providerName": "WHISPER",
+            "providerName": "WHISPER_AI",
             "sourceLanguage": WHISPER_LANGUAGES.get(language_code, "Default") if language_code else "Default",
             "extendedMetadata": [{
                 "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
-                "fileName": os.path.basename(file_path)
+                "fileName": os.path.basename(file_path),
+                "metadata": metadata_array
             }]
         }
         
-        if rawMetadataFilePath is not None:
-            payload["extendedMetadata"][0]["metadataRawJsonFilePath"] = rawMetadataFilePath
-        if normMetadataFilePath is not None:
-            payload["extendedMetadata"][0]["metadataFilePath"] = normMetadataFilePath
-        
+        logger.debug(f"Sending to {url}, lang={language_code}, raw={rawMetadataFilePath}, norm={normMetadataFilePath}")
+        logger.debug(f" headers: {headers}, payload: {json.dumps(payload)[:500]}")
         for attempt in range(max_attempts):
+            r = None
+            error_detail = None
             try:
                 r = make_request_with_retries("POST", url, headers=headers, json=payload)
+                logger.debug(f"Response: {r.status_code} - {r.text if r is not None else 'No response'}")
                 if r and r.status_code in (200, 201):
+                    logger.debug(f"Metadata sent: {r.status_code}")
                     return True
+                elif r:
+                    logger.warning(f"Attempt {attempt+1}/{max_attempts} failed: {r.status_code} - {r.text[:500]}")
+                    error_detail = f"HTTP {r.status_code}"
+                else:
+                    error_detail = "No response received"
             except Exception as e:
-                if attempt == 2:
-                    fail(f"Failed to send metadata: {e}")
+                error_detail = f"{type(e).__name__}: {e}"
+                logger.warning(f"Attempt {attempt+1}/{max_attempts} error: {error_detail}")
+            
+            if r is None and attempt == 0:
+                try:
+                    import socket
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(2)
+                    result = sock.connect_ex(('127.0.0.1', 5080))
+                    sock.close()
+                    if result != 0:
+                        logger.error(f"Port 5080 not listening (connect returned {result}) - catalog service may not be running")
+                    else:
+                        logger.error(f"Port 5080 is listening but not responding - check catalog service logs")
+                except Exception as sock_err:
+                    logger.error(f"Socket check failed: {sock_err}")
+            
+            if attempt < max_attempts - 1:
                 time.sleep([1, 3, 10][attempt] + random.uniform(0, 1))
+        
+        logger.error(f"Failed to send metadata after {max_attempts} attempts - last error: {error_detail}")
         return False
 
     def send_ai_enriched_metadata(self, repo_guid, file_path, enrichedMetadata, language_code=None, max_attempts=3):
-        url = "http://127.0.0.1:5080/catalogs/aiEnrichedMetadata"
+        url = "http://127.0.0.1:5080/catalogs/aiEnrichedMetadata/add"
         node_api_key = get_node_api_key()
         headers = {"apikey": node_api_key, "Content-Type": "application/json"}
         payload = {
@@ -565,8 +628,9 @@ if __name__ == "__main__":
     parser.add_argument("-j", "--job-guid", help="Job GUID")
     parser.add_argument("--controller-address", help="Override IP:Port")
     parser.add_argument("--enrich-prefix", help="Prefix for sdnaEventType of AI enrich data")
-    parser.add_argument("--log-level", default="info")
+    parser.add_argument("--log-level", default="debug", help="Logging level")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--force-refresh", action="store_true", help="Ignore cached transcripts and regenerate all")
     args = parser.parse_args()
 
     setup_logging(args.log_level)
@@ -625,7 +689,8 @@ if __name__ == "__main__":
             args.source_path,
             args.repo_guid,
             catalog_path_clean,
-            translation_languages
+            translation_languages,
+            force_refresh=args.force_refresh
         )
         
         if not combined_metadata:
@@ -635,6 +700,7 @@ if __name__ == "__main__":
         raw_paths, norm_paths = processor.store_metadata_file(args.repo_guid, catalog_path_clean, combined_metadata)
         
         # Send to API
+        send_failures = []
         for raw_return, lang_code in raw_paths:
             norm_return = next((p for p, lc in norm_paths if lc == lang_code), None)
             if not processor.send_extracted_metadata(
@@ -644,7 +710,10 @@ if __name__ == "__main__":
                 norm_return,
                 language_code=lang_code
             ):
-                fail("Failed to send extracted metadata")
+                send_failures.append(lang_code or "default")
+        
+        if send_failures:
+            fail(f"Failed to send extracted metadata for: {', '.join(send_failures)}")
 
         logger.info("Extracted metadata sent successfully")
 
