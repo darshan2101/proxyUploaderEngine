@@ -24,6 +24,21 @@ SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/b
 RUBICX_BASE_URL = "https://api.rubicx.ai"
 NORMALIZER_SCRIPT_PATH = "/opt/sdna/bin/rubicx_metadata_normalizer.py"
 
+# Exit codes
+EXIT_SUCCESS = 0
+EXIT_GENERAL_ERROR = 1
+EXIT_CONFIG_ERROR = 5
+EXIT_TIMEOUT_RETRYABLE = 7  # For timeouts that can be retried via send_extracted_metadata
+EXIT_ANALYSIS_FAILED = 8     # For permanent analysis failures (cannot be retried)
+
+SDNA_EVENT_MAP = {
+    "rubicksx_scene_analysis" : "highlights",
+    "rubicksx_summary" : "summary",
+    "rubicksx_subjects" : "subjetcs",
+    "rubicksx_objects" : "objects",
+    "rubicksx_emotions" : "emotions",
+}
+
 # Detect platform
 IS_LINUX = os.path.isdir("/opt/sdna/bin")
 DNA_CLIENT_SERVICES = LINUX_CONFIG_PATH if IS_LINUX else MAC_CONFIG_PATH
@@ -35,6 +50,12 @@ def extract_file_name(path):
 
 def remove_file_name_from_path(path):
     return os.path.dirname(path)
+
+def fail(msg, code=EXIT_TIMEOUT_RETRYABLE):
+    logger.error(msg)
+    if code == 7:
+        print(f"Metadata extraction failed for asset: {args.asset_id}")
+    sys.exit(code)
 
 def setup_logging(level):
     numeric_level = getattr(logging, level.upper(), logging.DEBUG)
@@ -90,7 +111,7 @@ def get_link_address_and_port():
                     port = lines[i + 1].split(">")[1].split("<")[0].strip()
     except Exception as e:
         logging.error(f"Error reading {SERVERS_CONF_PATH}: {e}")
-        sys.exit(5)
+        sys.exit(EXIT_CONFIG_ERROR)
     logging.info(f"Server connection details - Address: {ip}, Port: {port}")
     return ip, port
 
@@ -100,7 +121,7 @@ def get_store_paths():
         config_path = "/opt/sdna/nginx/ai-config.json"
         if not os.path.exists(config_path):
             logger.error(f"AI config file not found: {config_path}")
-            exit(5)
+            exit(EXIT_CONFIG_ERROR)
         with open(config_path, 'r') as f:
             config_data = json.load(f)
             metadata_store_path = config_data.get("ai_export_shared_drive_path", "")
@@ -109,11 +130,11 @@ def get_store_paths():
         
     except Exception as e:
         logging.error(f"Error reading Metadata Store or Proxy Store settings: {e}")
-        sys.exit(5)
+        sys.exit(EXIT_CONFIG_ERROR)
 
     if not metadata_store_path or not proxy_store_path:
         logging.info("Store settings not found.")
-        sys.exit(5)
+        sys.exit(EXIT_CONFIG_ERROR)
 
     return metadata_store_path, proxy_store_path
 
@@ -305,7 +326,7 @@ def parse_metadata_file(properties_file):
             else:
                 logging.warning("No <meta-data> section found in XML.")
 
-        else:  # assume CSV
+        else:
             with open(properties_file, 'r') as f:
                 for line in f:
                     parts = line.strip().split(',')
@@ -314,8 +335,8 @@ def parse_metadata_file(properties_file):
                         metadata[key] = value
 
     except Exception as e:
-        logging.error(f"Failed to parse {properties_file}: {e}")
-
+        logging.error(f"Error parsing metadata file: {e}")
+    
     return metadata
 
 def update_catalog(repo_guid, file_path, media_id, max_attempts=3):
@@ -426,18 +447,21 @@ def send_extracted_metadata(config, repo_guid, file_path, rawMetadataFilePath, n
     url = "http://127.0.0.1:5080/catalogs/extendedMetadata"
     node_api_key = get_node_api_key()
     headers = {"apikey": node_api_key, "Content-Type": "application/json"}
+    metadata_array = []
+    if norm_path:
+        metadata_array.append({"type": "metadataFilePath", "path": norm_path})
+    if raw_path:
+        metadata_array.append({"type": "metadataRawJsonFilePath", "path": raw_path})
     payload = {
         "repoGuid": repo_guid,
-        "providerName": config.get("provider", "rubicx"),
+        "providerName": config.get("provider", "AWS Rekognition"),
+        "sourceLanguage": "Default",
         "extendedMetadata": [{
             "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
-            "fileName": os.path.basename(file_path)
+            "fileName": os.path.basename(file_path),
+            "metadata": metadata_array
         }]
     }
-    if rawMetadataFilePath is not None:
-        payload["extendedMetadata"][0]["metadataRawJsonFilePath"] = rawMetadataFilePath
-    if normMetadataFilePath is not None:
-        payload["extendedMetadata"][0]["metadataFilePath"] = normMetadataFilePath
     for attempt in range(max_attempts):
         try:
             r = make_request_with_retries("POST", url, headers=headers, json=payload)
@@ -472,15 +496,21 @@ def upload_asset(api_key, file_path, max_attempts=3):
     for attempt in range(max_attempts):
         try:
             url = f"{RUBICX_BASE_URL}/api/videos/upload"
-            headers = {"X-API-Key": api_key}
-            data = {
-                "filename": file_name,
-                "content_type": mime_type,
+            headers = {
+                "X-API-Key": api_key,
+                "Content-Type": "application/json"
+            }
+            params = {
                 "api_key": api_key
             }
+            json_data = {
+                "filename": file_name,
+                "content_type": mime_type
+            }
             logging.info(f"Requesting presigned URL for '{file_name}' (attempt {attempt + 1}/{max_attempts})...")
-            response = make_request_with_retries("POST", url, headers=headers, data=data, timeout=(10, 30))
+            response = make_request_with_retries("POST", url, headers=headers, params=params, json=json_data, timeout=(10, 30))
             if not (response and response.status_code == 200):
+                print(f"Response Text ----------------------> {response}")
                 raise RuntimeError(f"Presigned URL request failed: {response.status_code if response else 'No response'} - {response.text if response else ''}")
 
             result = response.json()
@@ -534,10 +564,95 @@ def start_analysis(api_key, video_id, max_attempts=3):
             else:
                 raise
 
+def start_transcription(api_key, video_id, max_attempts=3):
+    url = f"{RUBICX_BASE_URL}/api/videos/{video_id}/transcribe"
+    headers = {"X-API-Key": api_key}
+    params = {"api_key": api_key}
+
+    logging.info("Starting audio transcription...")
+    
+    for attempt in range(max_attempts):
+        try:
+            response = make_request_with_retries("POST", url, headers=headers, params=params, timeout=(10, 30))
+            if response and response.status_code == 200:
+                logging.info("Transcription started successfully.")
+                return True
+            else:
+                logging.warning(f"Transcription start returned status: {response.status_code if response else 'No response'}")
+                if attempt < max_attempts - 1:
+                    delay = [1, 3, 10][attempt] + random.uniform(0, 1)
+                    time.sleep(delay)
+                else:
+                    logging.error("Failed to start transcription after all attempts")
+                    return False
+        except Exception as e:
+            logging.warning(f"Start transcription attempt {attempt + 1} failed: {e}")
+            if attempt < max_attempts - 1:
+                delay = [1, 3, 10][attempt] + random.uniform(0, 1)
+                time.sleep(delay)
+            else:
+                logging.error(f"Transcription start failed after {max_attempts} attempts")
+                return False
+    return False
+
+def fetch_transcription(api_key, video_id, include_segments=True, max_attempts=3):
+    url = f"{RUBICX_BASE_URL}/api/videos/{video_id}/transcription"
+    headers = {"X-API-Key": api_key}
+    params = {
+        "api_key": api_key,
+        "include_segments": str(include_segments).lower()
+    }
+
+    logging.info("Fetching transcription results...")
+    
+    for attempt in range(max_attempts):
+        try:
+            response = make_request_with_retries("GET", url, headers=headers, params=params, timeout=(10, 30))
+            if response and response.status_code == 200:
+                try:
+                    data = response.json()
+                    status = data.get("status")
+                    
+                    if status == "completed":
+                        logging.info("Transcription completed successfully.")
+                        return data
+                    elif status == "processing":
+                        logging.info("Transcription still processing...")
+                        return None
+                    elif status == "failed":
+                        logging.error(f"Transcription failed: {data.get('error')}")
+                        return None
+                    else:
+                        logging.warning(f"Unknown transcription status: {status}")
+                        return None
+                        
+                except ValueError as e:
+                    logging.error(f"Failed to parse transcription response: {e}")
+                    return None
+            elif response and response.status_code == 404:
+                logging.info("Transcription not found or not started yet.")
+                return None
+            else:
+                logging.warning(f"Transcription fetch returned status: {response.status_code if response else 'No response'}")
+                if attempt < max_attempts - 1:
+                    delay = [1, 3, 10][attempt] + random.uniform(0, 1)
+                    time.sleep(delay)
+                else:
+                    return None
+        except Exception as e:
+            logging.warning(f"Fetch transcription attempt {attempt + 1} failed: {e}")
+            if attempt < max_attempts - 1:
+                delay = [1, 3, 10][attempt] + random.uniform(0, 1)
+                time.sleep(delay)
+            else:
+                logging.error(f"Transcription fetch failed after {max_attempts} attempts")
+                return None
+    return None
+
 def poll_analysis_progress(api_key, video_id, max_wait=1200, interval=5, max_attempts=3):
     headers = {"X-API-Key": api_key}
     params = {"api_key": api_key}
-    progress_url = f"{RUBICX_BASE_URL}/api/videos/{video_id}/analysis/progress"
+    progress_url = f"{RUBICX_BASE_URL}/api/videos/{video_id}/analysis"
 
     logging.info("Step 3: Polling analysis progress (20-min timeout)...")
 
@@ -555,24 +670,37 @@ def poll_analysis_progress(api_key, video_id, max_wait=1200, interval=5, max_att
                 data = resp.json()
                 status = data.get("status")
                 progress_pct = data.get("progress", 0)
-                error_msg = data.get("error")
+                error_msg = data.get("error_message")
 
                 logging.info(f"Analysis progress: {status} ({progress_pct}%)")
 
                 if error_msg:
-                    logging.error(f"Analysis error: {error_msg}")
+                    logging.error(f"Analysis error reported: {error_msg}")
 
                 if status == "completed":
                     logging.info("Analysis completed successfully.")
                     return True
 
                 if status == "failed":
-                    logging.critical("Analysis permanently failed.")
-                    return False
+                    logging.critical(f"Analysis permanently failed with response: {json.dumps(data, indent=2)}")
 
+                    error_details = error_msg or "Unknown error"
+                    current_stage = data.get("current_stage", "unknown")
+
+                    logging.error(f"Analysis failed at stage '{current_stage}': {error_details}")
+                    logging.error("This is a permanent failure and cannot be retried via send_extracted_metadata mode.")
+
+                    print(f"Analysis failed permanently for asset: {video_id}")
+                    print(f"Error: {error_details}")
+                    print(f"Stage: {current_stage}")
+
+                    # Exit with code 8 to report failure of analysis
+                    sys.exit(EXIT_ANALYSIS_FAILED)
                 time.sleep(interval)
 
-            logging.error("Analysis progress timed out.")
+            # Timeout reached
+            logging.error(f"Analysis progress timed out after {max_wait} seconds.")
+            logging.info("This may be retryable via send_extracted_metadata mode.")
             return False
 
         except Exception as e:
@@ -581,16 +709,17 @@ def poll_analysis_progress(api_key, video_id, max_wait=1200, interval=5, max_att
                 backoff = [5, 15, 30][outer_attempt] + random.uniform(0, 2)
                 time.sleep(backoff)
             else:
+                logging.error("Polling failed after all retry attempts.")
                 return False
 
 def fetch_batch_results(api_key, video_id, max_attempts=7, base_interval=60, max_allowed_eta_seconds=3600):
     url = f"{RUBICX_BASE_URL}/api/videos/{video_id}/batch-results"
     headers = {"X-API-Key": api_key}
-    data = {"api_key": api_key}
+    params = {"api_key": api_key}
 
     for attempt in range(max_attempts):
         try:
-            response = make_request_with_retries("POST", url, headers=headers, data=data, timeout=(10, 30))
+            response = make_request_with_retries("POST", url, headers=headers, params= params, timeout=(10, 30))
             if response and response.status_code == 200:
                 try:
                     result = response.json()
@@ -607,35 +736,25 @@ def fetch_batch_results(api_key, video_id, max_attempts=7, base_interval=60, max
                 # Check ETA for early exit
                 eta_str = result.get("estimated_time_remaining")
                 eta_seconds = parse_estimated_time(eta_str) if eta_str else None
-                if eta_seconds is not None and eta_seconds > max_allowed_eta_seconds:
-                    logging.warning(
-                        f"Batch ETA ({eta_str} = {eta_seconds:.0f}s) exceeds {max_allowed_eta_seconds}s limit. Failing fast."
-                    )
+                if eta_seconds and eta_seconds > max_allowed_eta_seconds:
+                    logging.warning(f"Batch ETA too high ({eta_str}), aborting early.")
                     return False
 
-                # Also check progress block
-                progress_info = result.get("progress", {})
-                eta_from_progress = progress_info.get("estimated_time_remaining")
-                if eta_from_progress:
-                    eta_sec2 = parse_estimated_time(eta_from_progress)
-                    if eta_sec2 is not None and eta_sec2 > max_allowed_eta_seconds:
-                        logging.warning(
-                            f"Batch ETA from progress ({eta_from_progress} = {eta_sec2:.0f}s) exceeds limit. Failing fast."
-                        )
-                        return False
+                # Determine wait interval
+                if eta_seconds:
+                    wait_time = min(eta_seconds, base_interval * (attempt + 1))
+                else:
+                    wait_time = base_interval * (attempt + 1)
 
-                logging.warning(f"Batch not ready: success={success}, status={status}, ETA={eta_str}")
+                logging.info(f"Batch not ready. Status: {status}. ETA: {eta_str}. Waiting {wait_time}s...")
+                time.sleep(wait_time)
             else:
-                logging.warning(f"Batch results HTTP {response.status_code if response else 'None'}")
+                logging.warning(f"Batch results request failed: {response.status_code if response else 'No response'}")
+                time.sleep(base_interval * (attempt + 1))
 
         except Exception as e:
             logging.warning(f"Batch results attempt {attempt + 1} failed: {e}")
-
-        # Don't sleep after last attempt
-        if attempt < max_attempts - 1:
-            delay = base_interval * (2 ** attempt)
-            logging.info(f"Waiting {delay}s before next batch check (attempt {attempt + 2}/{max_attempts})")
-            time.sleep(delay)
+            time.sleep(base_interval * (attempt + 1))
 
     logging.error("Batch results did not complete within retry window.")
     return False
@@ -689,16 +808,19 @@ def fetch_metadata(api_key, video_id, n_th_frame=None, max_attempts=3, page_limi
     return meta
 
 def add_custom_metadata(api_key, asset_id, metadata, max_attempts=3):
-    url = f"{RUBICX_BASE_URL}/v2/metadata/upload?video_id={asset_id}"
+    url = f"{RUBICX_BASE_URL}/v2/metadata/upload"
     headers = {
         "accept": "application/json",
         "X-API-Key": api_key,
         "Content-Type": "application/json"
     }
+    params = {
+        "video_id": asset_id
+    }
 
     for attempt in range(max_attempts):
         try:
-            resp = make_request_with_retries("POST", url, headers=headers, json=metadata, timeout=(10, 30))
+            resp = make_request_with_retries("POST", url, headers=headers, params=params, json=metadata, timeout=(10, 30))
             status = resp.status_code if resp else None
             detail = None
             if resp is not None:
@@ -721,24 +843,72 @@ def add_custom_metadata(api_key, asset_id, metadata, max_attempts=3):
             else:
                 return {"status_code": 500, "detail": str(e)}
     return {"status_code": 500, "detail": "Max retry attempts exhausted"}
+def transform_normlized_to_enriched(norm_metadata_file_path, filetype_prefix):
+    try:
+        with open(norm_metadata_file_path, "r") as f:
+            data = json.load(f)
+        result = []
+        for event_type, detections in data.items():
+            sdna_event_type = SDNA_EVENT_MAP.get(event_type, 'unknown')
+            for detection in detections:
+                occurrences = detection.get("occurrences", [])
+                event_obj = {
+                    "eventType": event_type,
+                    "sdnaEventType": sdna_event_type,
+                    "sdnaEventTypePrefix": filetype_prefix,
+                    "eventValue": detection.get("value", ""),
+                    "totalOccurrences": len(occurrences),
+                    "eventOccurence": occurrences
+                }
+                result.append(event_obj)
+        return result, True
+    except Exception as e:
+        return f"Error during transformation: {e}", False
+
+def send_ai_enriched_metadata(config, repo_guid, file_path, enrichedMetadata, max_attempts=3):
+    url = "http://127.0.0.1:5080/catalogs/aiEnrichedMetadata/add"
+    node_api_key = get_node_api_key()
+    headers = {"apikey": node_api_key, "Content-Type": "application/json"}
+    payload = {
+        "repoGuid": repo_guid,
+        "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
+        "fileName": os.path.basename(file_path),
+        "providerName": config.get("provider", "twelvelabs"),
+        "sourceLanguage": "Default",
+        "normalizedMetadata": enrichedMetadata
+    }
+
+    for attempt in range(max_attempts):
+        try:
+            r = make_request_with_retries("POST", url, headers=headers, json=payload)
+            if r and r.status_code in (200, 201):
+                return True
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to send metadata after 3 attempts: {e}")
+                raise
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return False
 
 # --- Main ---
-if __name__ == '__main__':
+if __name__ == "__main__":
     time.sleep(random.uniform(0.0, 1.5))
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-m", "--mode", required=True, help="Mode: proxy, original, get_base_target, send_extracted_metadata")
-    parser.add_argument("-c", "--config-name", required=True, help="Name of cloud configuration")
-    parser.add_argument("-j", "--job-guid", help="Job GUID of SDNA job")
-    parser.add_argument("-id", "--asset-id", help="Asset ID (video_id) for metadata operations")
-    parser.add_argument("--parent-id", help="Parent folder ID")
-    parser.add_argument("-cp", "--catalog-path", help="Catalog path")
-    parser.add_argument("-sp", "--source-path", help="Source file path")
-    parser.add_argument("-mp", "--metadata-file", help="Path to metadata file (unused in Rubicx)")
-    parser.add_argument("-up", "--upload-path", help="Ignored for Rubicx (no index concept)")
-    parser.add_argument("-sl", "--size-limit", help="File size limit in MB")
-    parser.add_argument("--dry-run", action="store_true", help="Dry run mode")
-    parser.add_argument("--log-level", default="debug", help="Logging level")
-    parser.add_argument("-r", "--repo-guid", help="Repo GUID")
+    parser = argparse.ArgumentParser(description="Rubicx Video Uploader")
+    parser.add_argument("--mode", required=True, choices=VALID_MODES, help="Operation mode")
+    parser.add_argument("--source-path", help="Path to the video file")
+    parser.add_argument("--size-limit", help="Max file size in MB for 'original' mode")
+    parser.add_argument("--config-name", required=True, help="Cloud config name")
+    parser.add_argument("--catalog-path", help="Catalog path of the asset")
+    parser.add_argument("--repo-guid", help="Repository GUID")
+    parser.add_argument("-up", "--upload-path", help="Path where file will be uploaded to frameIO")
+    parser.add_argument("--asset-id", help="Asset ID for send_extracted_metadata mode")
+    parser.add_argument("--metadata-file", help="Path to metadata XML/JSON file")
+    parser.add_argument("--job-guid", help="Job GUID for backlink URL")
+    parser.add_argument("--dry-run", action="store_true", help="Dry run (no upload/analysis)")
+    parser.add_argument("--log-level", default="INFO", help="Logging level")
+    parser.add_argument("--enrich-prefix", help="Prefix for enriched metadata filetypes")
     parser.add_argument("--resolved-upload-id", action="store_true", help="Ignored")
     parser.add_argument("--controller-address", help="Controller IP:Port")
     parser.add_argument("--export-ai-metadata", help="Ignored flag (always true for Rubicx)")
@@ -748,24 +918,26 @@ if __name__ == '__main__':
 
     if args.mode not in VALID_MODES:
         logging.error(f"Invalid mode. Use one of: {VALID_MODES}")
-        sys.exit(1)
+        sys.exit(EXIT_GENERAL_ERROR)
 
     cloud_config_path = get_cloud_config_path()
     if not os.path.exists(cloud_config_path):
         logging.error(f"Cloud config not found: {cloud_config_path}")
-        sys.exit(1)
+        sys.exit(EXIT_CONFIG_ERROR)
 
     cloud_config = ConfigParser()
     cloud_config.read(cloud_config_path)
     if args.config_name not in cloud_config:
         logging.error(f"Config '{args.config_name}' not found.")
-        sys.exit(1)
+        sys.exit(EXIT_CONFIG_ERROR)
 
     cloud_config_data = cloud_config[args.config_name]
     api_key = cloud_config_data.get("api_key")
     if not api_key:
         logging.error("API key not found in config.")
-        sys.exit(1)
+        sys.exit(EXIT_CONFIG_ERROR)
+        
+    filetype_prefix = args.enrich_prefix if args.enrich_prefix else "gen"
 
     # Check for advanced AI export configuration
     advanced_ai_config = get_advanced_ai_config(args.config_name)
@@ -779,22 +951,48 @@ if __name__ == '__main__':
     if args.mode == "send_extracted_metadata":
         if not (args.asset_id and args.repo_guid and args.catalog_path):
             logging.error("Asset ID, Repo GUID, and Catalog path required for send_extracted_metadata mode.")
-            sys.exit(1)
+            sys.exit(EXIT_GENERAL_ERROR)
         batch_completed = fetch_batch_results(api_key, args.asset_id)
         if not batch_completed:
             logging.error("Batch processing not completed. Cannot fetch metadata.")
             print(f"Metadata extraction failed for asset: {args.asset_id}")
-            sys.exit(7)
+            sys.exit(EXIT_TIMEOUT_RETRYABLE)
+        
+        # Fetch main metadata
         ai_metadata = fetch_metadata(api_key, args.asset_id, n_th_frame=nth_frame_param)
-        clean_path = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
-        if ai_metadata:
-            raw_metadata_path, norm_metadata_path = store_metadata_file(cloud_config_data, args.repo_guid, clean_path, ai_metadata)
-            if send_extracted_metadata(cloud_config_data, args.repo_guid, clean_path, raw_metadata_path, norm_metadata_path):
-                logging.info("Extracted metadata sent successfully.")
-                sys.exit(0)
-            else:
-                logging.error("Failed to send extracted metadata.")
-                sys.exit(7)
+        if not ai_metadata:
+            fail("Could Not get AI metadata", EXIT_TIMEOUT_RETRYABLE)
+
+        # Fetch transcription data and add it to metadata
+        transcription_data = fetch_transcription(api_key, args.asset_id, include_segments=True)
+        if transcription_data:
+            logging.info("Transcription data retrieved successfully.")
+            ai_metadata["transcription"] = transcription_data
+        else:
+            logging.warning("Transcription data not available or still processing.")
+            ai_metadata["transcription"] = None
+
+        catalog_path_clean = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
+        raw_path, norm_path = store_metadata_file(cloud_config_data, args.repo_guid, catalog_path_clean, ai_metadata)
+        if not send_extracted_metadata(cloud_config_data, args.repo_guid, catalog_path_clean, raw_path, norm_path):
+            fail("Failed to send extracted metadata.", EXIT_TIMEOUT_RETRYABLE)
+        logger.info("Extracted metadata sent successfully.")
+
+        if norm_path:
+            try:
+                meta_path, _ = get_store_paths()
+                norm_metadata_file_path = os.path.join(meta_path.split("/./")[0] if "/./" in meta_path else meta_path.split("/$/")[0] if "/$/" in meta_path else meta_path, norm_path)
+                enriched, success = transform_normlized_to_enriched(norm_metadata_file_path, filetype_prefix)
+                if success and send_ai_enriched_metadata(cloud_config_data, args.repo_guid, catalog_path_clean, enriched):
+                    logger.info("AI enriched metadata sent successfully.")
+                else:
+                    logger.warning("AI enriched metadata send failed — skipping.")
+            except Exception:
+                logger.exception("AI enriched metadata transform failed — skipping.")
+        else:
+            logger.info("Normalized metadata not present — skipping AI enrichment.")
+
+        sys.exit(EXIT_SUCCESS)
 
     matched_file = args.source_path
     if not matched_file or not os.path.exists(matched_file):
@@ -833,7 +1031,7 @@ if __name__ == '__main__':
     if args.dry_run:
         logging.info("[DRY RUN] Upload and analysis skipped.")
         logging.info(f"[DRY RUN] File: {matched_file}")
-        sys.exit(0)
+        sys.exit(EXIT_SUCCESS)
 
     try:
         try:
@@ -842,10 +1040,17 @@ if __name__ == '__main__':
             update_catalog(args.repo_guid, clean_catalog_path, video_id)
         except Exception as e:
             logging.critical(f"Upload failed: {e}")
-            sys.exit(1)
+            sys.exit(EXIT_GENERAL_ERROR)
 
         start_analysis(api_key, video_id)
         logging.info("Analysis started.")
+        
+        # Start transcription in parallel with analysis
+        transcription_started = start_transcription(api_key, video_id)
+        if transcription_started:
+            logging.info("Transcription initiated.")
+        else:
+            logging.warning("Transcription could not be started, continuing without it.")
         
         try:
             meta_response = add_custom_metadata(
@@ -863,25 +1068,54 @@ if __name__ == '__main__':
 
         analysis_success = poll_analysis_progress(api_key, video_id)
         if not analysis_success:
-            logging.error("Analysis failed permanently during processing.")
+            # poll_analysis_progress already exits with EXIT_ANALYSIS_FAILED if status is "failed"
+            # If we reach here, it's a timeout scenario
+            logging.error("Analysis timed out during processing.")
+            logging.info("This can be retried using send_extracted_metadata mode.")
             print(f"Metadata extraction failed for asset: {video_id}")
-            sys.exit(7)
+            sys.exit(EXIT_TIMEOUT_RETRYABLE)
 
         if not fetch_batch_results(api_key, video_id):
             logging.error("Batch processing did not complete successfully.")
             print(f"Metadata extraction failed for asset: {video_id}")
-            sys.exit(7)
+            sys.exit(EXIT_TIMEOUT_RETRYABLE)
+        
+        # Fetch main metadata
         ai_metadata = fetch_metadata(api_key, video_id, n_th_frame=nth_frame_param)
+        if not ai_metadata:
+            fail("Could Not get AI metadata", EXIT_TIMEOUT_RETRYABLE)
 
-        if ai_metadata:
-            raw_metadata_path, norm_metadata_path = store_metadata_file(cloud_config_data,args.repo_guid, clean_path, ai_metadata)
-            if send_extracted_metadata(cloud_config_data, args.repo_guid, clean_catalog_path, raw_metadata_path, norm_metadata_path):
-                logging.info("Extracted metadata sent successfully.")
-                sys.exit(0)
-            else:
-                logging.error("Failed to send extracted metadata.")
-                sys.exit(7)
+        # Fetch transcription data and add it to combined metadata
+        transcription_data = fetch_transcription(api_key, video_id, include_segments=True)
+        if transcription_data:
+            logging.info("Transcription data retrieved successfully.")
+            ai_metadata["transcription"] = transcription_data
+        else:
+            logging.warning("Transcription data not available or still processing.")
+            ai_metadata["transcription"] = None
+
+        catalog_path_clean = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
+        raw_path, norm_path = store_metadata_file(cloud_config_data, args.repo_guid, catalog_path_clean, ai_metadata)
+        if not send_extracted_metadata(cloud_config_data, args.repo_guid, catalog_path_clean, raw_path, norm_path):
+            fail("Failed to send extracted metadata.", EXIT_TIMEOUT_RETRYABLE)
+        logger.info("Extracted metadata sent successfully.")
+
+        if norm_path:
+            try:
+                meta_path, _ = get_store_paths()
+                norm_metadata_file_path = os.path.join(meta_path.split("/./")[0] if "/./" in meta_path else meta_path.split("/$/")[0] if "/$/" in meta_path else meta_path, norm_path)
+                enriched, success = transform_normlized_to_enriched(norm_metadata_file_path, filetype_prefix)
+                if success and send_ai_enriched_metadata(cloud_config_data, args.repo_guid, catalog_path_clean, enriched):
+                    logger.info("AI enriched metadata sent successfully.")
+                else:
+                    logger.warning("AI enriched metadata send failed — skipping.")
+            except Exception:
+                logger.exception("AI enriched metadata transform failed — skipping.")
+        else:
+            logger.info("Normalized metadata not present — skipping AI enrichment.")
+
+        sys.exit(EXIT_SUCCESS)
 
     except Exception as e:
         logging.critical(f"Rubicx processing failed: {e}")
-        sys.exit(1)
+        sys.exit(EXIT_GENERAL_ERROR)
