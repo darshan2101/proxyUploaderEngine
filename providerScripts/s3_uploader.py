@@ -49,6 +49,49 @@ SDNA_EVENT_MAP = {
     "CELEBRITY_RECOGNITION": "aws_vid_rekognition_celebrity"
 }
 
+TRANSCRIBE_LANGUAGE_CODE_MAP = {
+    "": "default",
+    "af-ZA": "Afrikaans",
+    "ar-AE": "Arabic (Gulf)",
+    "ar-SA": "Arabic (Modern Standard)",
+    "zh-CN": "Chinese (Simplified)",
+    "zh-TW": "Chinese (Traditional)",
+    "da-DK": "Danish",
+    "nl-NL": "Dutch",
+    "en-AU": "English (Australian)",
+    "en-GB": "English (British)",
+    "en-IN": "English (Indian)",
+    "en-IE": "English (Irish)",
+    "en-NZ": "English (New Zealand)",
+    "en-AB": "English (Scottish)",
+    "en-ZA": "English (South African)",
+    "en-US": "English (US)",
+    "en-WL": "English (Welsh)",
+    "fr-FR": "French",
+    "fr-CA": "French (Canadian)",
+    "de-DE": "German",
+    "de-CH": "German (Swiss)",
+    "he-IL": "Hebrew",
+    "hi-IN": "Hindi (Indian)",
+    "id-ID": "Indonesian",
+    "it-IT": "Italian",
+    "ja-JP": "Japanese",
+    "ko-KR": "Korean",
+    "ms-MY": "Malay",
+    "pt-PT": "Portuguese",
+    "pt-BR": "Portuguese (Brazilian)",
+    "ru-RU": "Russian",
+    "es-ES": "Spanish",
+    "es-US": "Spanish (US)",
+    "ta-IN": "Tamil",
+    "te-IN": "Telugu",
+    "th-TH": "Thai",
+    "tr-TR": "Turkish",
+    "vi-VN": "Vietnamese"
+}
+
+
+
 # ======================
 # Logging & Utilities
 # ======================
@@ -227,6 +270,49 @@ def get_advanced_ai_config(config_name, provider_name="aws"):
                         except ValueError:
                             del out[num_key]
                 logging.info(f"Loaded and normalized advanced AI config from: {src}")
+
+                # Transcribe settings
+                transcribe_keys = [
+                    "transcribe_enabled", "transcribe_language_code",
+                    "transcribe_speaker_labels", "transcribe_max_speakers",
+                    "transcribe_channel_identification", "transcribe_pii_redaction",
+                    "transcribe_pii_entity_types", "transcribe_pii_output",
+                    "transcribe_custom_vocabulary", "transcribe_vocabulary_filter",
+                    "transcribe_vocabulary_filter_method", "transcribe_subtitle_formats",
+                    "transcribe_identify_language", "transcribe_language_options",
+                    "transcribe_identify_multiple_languages", "transcribe_output_bucket"
+                ]
+                
+                for key in transcribe_keys:
+                    clean_key = key
+                    if key.startswith(f"{provider_key}_"):
+                        clean_key = key[len(provider_key) + 1:]
+                    if clean_key in raw:
+                        out[clean_key] = raw[clean_key]
+                    elif key in raw:
+                        out[clean_key] = raw[key]
+                
+                for bool_key in ["transcribe_enabled", "transcribe_speaker_labels", 
+                                    "transcribe_channel_identification", "transcribe_pii_redaction",
+                                    "transcribe_identify_language", "transcribe_identify_multiple_languages"]:
+                    if bool_key in out:
+                        v = out[bool_key]
+                        out[bool_key] = v if isinstance(v, bool) else str(v).lower() in ("true", "1", "yes", "on")
+                
+                for arr_key in ["transcribe_pii_entity_types", "transcribe_subtitle_formats", "transcribe_language_options"]:
+                    if arr_key in out:
+                        val = out[arr_key]
+                        if isinstance(val, str):
+                            out[arr_key] = [x.strip() for x in val.split(",") if x.strip()]
+                        elif not isinstance(val, list):
+                            out[arr_key] = [val] if val else []
+                
+                if "transcribe_max_speakers" in out and isinstance(out["transcribe_max_speakers"], str):
+                    try:
+                        out["transcribe_max_speakers"] = int(out["transcribe_max_speakers"])
+                    except ValueError:
+                        del out["transcribe_max_speakers"]
+
                 return out
             except Exception as e:
                 logging.error(f"Failed to load {src}: {e}")
@@ -335,10 +421,12 @@ def store_metadata_file(config, repo_guid, file_path, metadata, max_attempts=3):
     meta_left = meta_left.rstrip("/")
     metadata_dir = os.path.join(meta_left, meta_right, repo_guid_str, file_path, provider)
     os.makedirs(metadata_dir, exist_ok=True)
+    
     raw_json = os.path.join(metadata_dir, f"{base}_raw.json")
     norm_json = os.path.join(metadata_dir, f"{base}_norm.json")
     raw_return = os.path.join(meta_right, repo_guid_str, file_path, provider, f"{base}_raw.json")
     norm_return = os.path.join(meta_right, repo_guid_str, file_path, provider, f"{base}_norm.json")
+    
     for attempt in range(max_attempts):
         try:
             with open(raw_json, "w", encoding="utf-8") as f:
@@ -346,12 +434,50 @@ def store_metadata_file(config, repo_guid, file_path, metadata, max_attempts=3):
             if not get_aws_video_rek_normalized_metadata(raw_json, norm_json):
                 logging.error("Normalization failed.")
                 return raw_return, None
-            return raw_return, norm_return
+            break
         except Exception as e:
             logging.warning(f"Metadata write failed (Attempt {attempt+1}): {e}")
             if attempt < max_attempts - 1:
                 time.sleep([1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt]))
-    return None, None
+            else:
+                return None, None
+    
+    raw_paths = [(raw_return, None)]
+    norm_paths = [(norm_return, None)]
+    
+    transcribe_data = metadata.get('aws_transcribe', {})
+    multilang_transcripts = transcribe_data.get('transcripts', {})
+    
+    if multilang_transcripts and len(multilang_transcripts) > 1:
+        for lang_code, transcript_data in multilang_transcripts.items():
+            if lang_code == transcribe_data.get('primary_language'):
+                continue
+            
+            lang_raw_json = os.path.join(metadata_dir, f"{base}_raw_{lang_code}.json")
+            lang_norm_json = os.path.join(metadata_dir, f"{base}_norm_{lang_code}.json")
+            
+            try:
+                lang_metadata = {
+                    'aws_transcribe': {
+                        'primary_language': lang_code,
+                        'transcripts': {lang_code: transcript_data}
+                    }
+                }
+                
+                with open(lang_raw_json, "w", encoding="utf-8") as f:
+                    json.dump(lang_metadata, f, ensure_ascii=False, indent=4)
+                
+                if get_aws_video_rek_normalized_metadata(lang_raw_json, lang_norm_json):
+                    lang_raw_return = os.path.join(meta_right, repo_guid_str, file_path, provider, f"{base}_raw_{lang_code}.json")
+                    lang_norm_return = os.path.join(meta_right, repo_guid_str, file_path, provider, f"{base}_norm_{lang_code}.json")
+                    raw_paths.append((lang_raw_return, lang_code))
+                    norm_paths.append((lang_norm_return, lang_code))
+                else:
+                    logging.warning(f"Normalization failed for language {lang_code}")
+            except Exception as e:
+                logging.error(f"Failed to save language {lang_code}: {e}")
+    
+    return raw_paths, norm_paths
 
 # ======================
 # Node API Calls
@@ -387,7 +513,7 @@ def update_catalog(repo_guid, file_path, upload_path, bucket, max_attempts=5):
             time.sleep(5 + attempt * 2)
     return False
 
-def send_extracted_metadata(config, repo_guid, file_path, raw_path, norm_path=None, max_attempts=3):
+def send_extracted_metadata(config, repo_guid, file_path, raw_path, norm_path=None, language_code=None, max_attempts=3):
     url = "http://127.0.0.1:5080/catalogs/extendedMetadata"
     headers = {"apikey": get_node_api_key(), "Content-Type": "application/json"}
     metadata_array = []
@@ -395,10 +521,15 @@ def send_extracted_metadata(config, repo_guid, file_path, raw_path, norm_path=No
         metadata_array.append({"type": "metadataFilePath", "path": norm_path})
     if raw_path:
         metadata_array.append({"type": "metadataRawJsonFilePath", "path": raw_path})
+    
+    source_language = "Default"
+    if language_code:
+        source_language = TRANSCRIBE_LANGUAGE_CODE_MAP.get(language_code, language_code)
+    
     payload = {
         "repoGuid": repo_guid,
         "providerName": config.get("provider", "AWS Rekognition"),
-        "sourceLanguage": "Default",
+        "sourceLanguage": source_language,
         "extendedMetadata": [{
             "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
             "fileName": os.path.basename(file_path),
@@ -417,13 +548,19 @@ def send_extracted_metadata(config, repo_guid, file_path, raw_path, norm_path=No
         time.sleep([1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt]))
     return False
 
-def send_ai_enriched_metadata(config, repo_guid, file_path, enriched, max_attempts=3):
+def send_ai_enriched_metadata(config, repo_guid, file_path, enriched, language_code=None, max_attempts=3):
     url = "http://127.0.0.1:5080/catalogs/aiEnrichedMetadata"
     headers = {"apikey": get_node_api_key(), "Content-Type": "application/json"}
+    
+    source_language = "Default"
+    if language_code:
+        source_language = TRANSCRIBE_LANGUAGE_CODE_MAP.get(language_code, language_code)
+    
     payload = {
         "repoGuid": repo_guid,
         "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
         "fileName": os.path.basename(file_path),
+        "sourceLanguage": source_language,
         "providerName": config.get("provider", "aws_rekognition"),
         "normalizedMetadata": enriched
     }
@@ -610,76 +747,124 @@ def get_rekognition_job_result(job_id, feature, access_key, secret_key, region):
     return None
 
 # ======================
-# Transcribe – Placeholder for Future Expansion
+# Transcribe
 # ======================
 
-# TODO: Integrate speaker diarization, PII redaction, custom vocabularies, etc.
-# See AWS Transcribe docs for:
-#   - Settings: ShowSpeakerLabels, MaxSpeakerLabels
-#   - ContentRedactionType, PiiEntityTypes
-#   - LanguageModelName, VocabularyName
-
-def start_transcription_job(s3_uri, aws_access_key, aws_secret_key, region, language_code="en-US", job_name=None,
-                           show_speaker_labels=False, max_speaker_labels=2,
-                           enable_pii_redaction=False, pii_entity_types=None):
-    transcribe = boto3.client('transcribe', aws_access_key_id=aws_access_key,
-                              aws_secret_access_key=aws_secret_key, region_name=region)
+def start_transcription_job_advanced(s3_uri, aws_access_key, aws_secret_key, region, ai_config, job_name=None):
+    transcribe = boto3.client('transcribe', aws_access_key_id=aws_access_key, aws_secret_access_key=aws_secret_key, region_name=region)
+    
     if not job_name:
         job_name = f"transcribe-{uuid.uuid4()}"
-    ext = s3_uri.split('.')[-1].lower()
-    media_format = {'mp3':'mp3','mp4':'mp4','wav':'wav','flac':'flac','ogg':'ogg','amr':'amr','webm':'webm','m4a':'mp4'}.get(ext, 'mp4')
+    
+    ext = s3_uri.split('.')[-1].split('?')[0].lower()
+    media_format_map = {'mp3':'mp3','mp4':'mp4','wav':'wav','flac':'flac','ogg':'ogg','amr':'amr','webm':'webm','m4a':'mp4'}
+    media_format = media_format_map.get(ext, 'mp4')
+    
+    job_params = {
+        'TranscriptionJobName': job_name,
+        'Media': {'MediaFileUri': s3_uri},
+        'MediaFormat': media_format
+    }
+    
+    if ai_config.get('transcribe_identify_language'):
+        job_params['IdentifyLanguage'] = True
+        lang_opts = ai_config.get('transcribe_language_options', [])
+        if lang_opts:
+            job_params['LanguageOptions'] = lang_opts
+    elif ai_config.get('transcribe_identify_multiple_languages'):
+        job_params['IdentifyMultipleLanguages'] = True
+        lang_opts = ai_config.get('transcribe_language_options', [])
+        if lang_opts:
+            job_params['LanguageOptions'] = lang_opts
+    else:
+        job_params['LanguageCode'] = ai_config.get('transcribe_language_code', 'en-US')
+    
     settings = {}
-    if show_speaker_labels:
+    
+    if ai_config.get('transcribe_speaker_labels'):
         settings['ShowSpeakerLabels'] = True
-        settings['MaxSpeakerLabels'] = max_speaker_labels
-    if enable_pii_redaction:
-        settings['ContentRedaction'] = {
-            'RedactionType': 'PII',
-            'RedactionOutput': 'redacted'
-        }
-        if pii_entity_types:
-            settings['ContentRedaction']['PiiEntityTypes'] = pii_entity_types
+        max_spk = ai_config.get('transcribe_max_speakers')
+        if max_spk:
+            settings['MaxSpeakerLabels'] = max_spk
+    
+    if ai_config.get('transcribe_channel_identification'):
+        settings['ChannelIdentification'] = True
+    
+    if ai_config.get('transcribe_custom_vocabulary'):
+        settings['VocabularyName'] = ai_config['transcribe_custom_vocabulary']
+    
+    if ai_config.get('transcribe_vocabulary_filter'):
+        settings['VocabularyFilterName'] = ai_config['transcribe_vocabulary_filter']
+        filter_method = ai_config.get('transcribe_vocabulary_filter_method', 'mask')
+        settings['VocabularyFilterMethod'] = filter_method
+    
+    if settings:
+        job_params['Settings'] = settings
+    
+    if ai_config.get('transcribe_pii_redaction'):
+        redaction_config = {'RedactionType': 'PII'}
+        pii_output = ai_config.get('transcribe_pii_output', 'redacted')
+        redaction_config['RedactionOutput'] = pii_output
+        pii_types = ai_config.get('transcribe_pii_entity_types', [])
+        if pii_types:
+            redaction_config['PiiEntityTypes'] = pii_types
+        job_params['ContentRedaction'] = redaction_config
+    
+    subtitle_formats = ai_config.get('transcribe_subtitle_formats', [])
+    if subtitle_formats:
+        job_params['Subtitles'] = {'Formats': subtitle_formats}
+    
+    output_bucket = ai_config.get('transcribe_output_bucket')
+    if output_bucket:
+        job_params['OutputBucketName'] = output_bucket
+    
     try:
-        response = transcribe.start_transcription_job(
-            TranscriptionJobName=job_name,
-            Media={'MediaFileUri': s3_uri},
-            MediaFormat=media_format,
-            LanguageCode=language_code,
-            **({'Settings': settings} if settings else {})
-        )
+        response = transcribe.start_transcription_job(**job_params)
         logging.info(f"Started transcription job: {job_name}")
         return job_name
     except Exception as e:
         logging.error(f"Transcribe start failed: {e}")
         return None
 
-def wait_for_transcription_job(job_name, aws_access_key, aws_secret_key, region, max_wait_time=3600, poll_interval=30):
-    transcribe = boto3.client('transcribe', aws_access_key_id=aws_access_key,
-                              aws_secret_access_key=aws_secret_key, region_name=region)
-    elapsed = 0
-    while elapsed < max_wait_time:
-        try:
-            resp = transcribe.get_transcription_job(TranscriptionJobName=job_name)
-            status = resp['TranscriptionJob']['TranscriptionJobStatus']
-            if status == 'COMPLETED':
-                uri = resp['TranscriptionJob']['Transcript']['TranscriptFileUri']
-                with urllib.request.urlopen(uri) as f:
-                    return json.loads(f.read().decode())
-            elif status == 'FAILED':
-                reason = resp['TranscriptionJob'].get('FailureReason', 'Unknown')
-                logging.error(f"Transcribe job failed: {reason}")
-                return None
-        except Exception as e:
-            logging.error(f"Error polling transcribe job: {e}")
-            return None
-        time.sleep(poll_interval)
-        elapsed += poll_interval
-    logging.warning(f"Timeout waiting for transcribe job: {job_name}")
-    return None
+def get_transcription_job_result(job_name, aws_access_key, aws_secret_key, region):
+    transcribe = boto3.client('transcribe', aws_access_key_id=aws_access_key, aws_secret_access_key=aws_secret_key, region_name=region)
+    try:
+        return transcribe.get_transcription_job(TranscriptionJobName=job_name)
+    except Exception as e:
+        logging.error(f"Error fetching transcription result: {e}")
+        return None
 
-# ======================
-# Mode Handlers
-# ======================
+def download_transcript_from_uri(transcript_uri):
+    try:
+        response = requests.get(transcript_uri, timeout=30)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logging.error(f"Failed to download transcript: {e}")
+        return None
+
+def save_transcript_languages(tracking_dir, analysis_id, transcript_data, lang_code=None):
+    suffix = f"_{lang_code}" if lang_code else ""
+    transcript_path = os.path.join(tracking_dir, f"{analysis_id}_transcript{suffix}.json")
+    
+    try:
+        with open(transcript_path, 'w', encoding='utf-8') as f:
+            json.dump(transcript_data, f, indent=2, ensure_ascii=False)
+        logging.info(f"Saved transcript{suffix}: {transcript_path}")
+        
+        if 'results' in transcript_data and 'transcripts' in transcript_data['results']:
+            text_path = os.path.join(tracking_dir, f"{analysis_id}_transcript{suffix}.txt")
+            with open(text_path, 'w', encoding='utf-8') as f:
+                for trans in transcript_data['results']['transcripts']:
+                    f.write(trans.get('transcript', '') + '\n')
+            logging.info(f"Saved transcript text{suffix}: {text_path}")
+        
+        return transcript_path
+    except Exception as e:
+        logging.error(f"Failed to save transcript{suffix}: {e}")
+        return None
+
+
 
 def handle_analyze_and_embed(args, cloud_config_data):
     logging.info("Running in 'analyze_and_embed' mode")
@@ -818,20 +1003,26 @@ def handle_send_extracted_metadata_video_resume(args, cloud_config_data, advance
                     combined["rekognition_video_analysis"][feat] = json.load(f)
             else:
                 combined["rekognition_video_analysis"][feat] = {}
-        raw_ret, norm_ret = store_metadata_file(cloud_config_data, args.repo_guid, clean_catalog_path, combined)
-        if not send_extracted_metadata(cloud_config_data, args.repo_guid, clean_catalog_path, raw_ret, norm_ret):
-            logging.error("Failed to send extracted metadata.")
-            sys.exit(1)
-        if norm_ret:
-            try:
-                full_norm = os.path.join(physical_root, norm_ret)
-                enriched, ok = transform_normlized_to_enriched(full_norm, args.enrich_prefix)
-                if ok and send_ai_enriched_metadata(cloud_config_data, args.repo_guid, clean_catalog_path, enriched):
-                    logging.info("AI enriched metadata sent.")
-                else:
-                    logging.warning("AI enrichment send failed.")
-            except Exception:
-                logging.exception("Enrichment failed.")
+        raw_paths, norm_paths = store_metadata_file(cloud_config_data, args.repo_guid, clean_catalog_path, combined)
+        
+        for raw_ret, lang_code in raw_paths:
+            norm_ret = next((p for p, lc in norm_paths if lc == lang_code), None)
+            if not send_extracted_metadata(cloud_config_data, args.repo_guid, clean_catalog_path, raw_ret, norm_ret, lang_code):
+                logging.error(f"Failed to send extracted metadata for {lang_code or 'default'}")
+                sys.exit(1)
+        
+        for norm_ret, lang_code in norm_paths:
+            if norm_ret:
+                try:
+                    full_norm = os.path.join(physical_root, norm_ret)
+                    enriched, ok = transform_normlized_to_enriched(full_norm, args.enrich_prefix)
+                    if ok and send_ai_enriched_metadata(cloud_config_data, args.repo_guid, clean_catalog_path, enriched, lang_code):
+                        logging.info(f"AI enriched metadata sent for {lang_code or 'default'}.")
+                    else:
+                        logging.warning(f"AI enrichment send failed for {lang_code or 'default'}.")
+                except Exception:
+                    logging.exception(f"Enrichment failed for {lang_code or 'default'}.")
+        
         logging.info("Video analysis resume completed.")
     else:
         logging.info("Not all features done. Coordinator may retry.")
@@ -930,21 +1121,177 @@ def handle_normal_upload(args, cloud_config_data, backlink_url, clean_catalog_pa
                             combined["rekognition_video_analysis"][feat] = json.load(f)
                     else:
                         combined["rekognition_video_analysis"][feat] = {}
-                raw_ret, norm_ret = store_metadata_file(cloud_config_data, args.repo_guid, clean_catalog_path, combined)
-                if not send_extracted_metadata(cloud_config_data, args.repo_guid, clean_catalog_path, raw_ret, norm_ret):
-                    logging.error("Failed to send extracted metadata.")
-                    sys.exit(1)
-                if norm_ret:
-                    try:
-                        full_norm = os.path.join(physical_root, norm_ret)
-                        enriched, ok = transform_normlized_to_enriched(full_norm, args.enrich_prefix)
-                        if ok and send_ai_enriched_metadata(cloud_config_data, args.repo_guid, clean_catalog_path, enriched):
-                            logging.info("AI enriched metadata sent.")
-                    except Exception:
-                        logging.exception("Enrichment failed.")
+                
+                if ai_config.get("transcribe_enabled"):
+                    logging.info("Starting AWS Transcribe integration...")
+                    transcribe_job_name = start_transcription_job_advanced(
+                        s3_uri, 
+                        cloud_config_data['access_key_id'], 
+                        cloud_config_data['secret_access_key'], 
+                        region, 
+                        ai_config
+                    )
+                    
+                    if transcribe_job_name:
+                        start_wait = time.time()
+                        transcribe_completed = False
+                        
+                        while (time.time() - start_wait) < 900:
+                            result = get_transcription_job_result(
+                                transcribe_job_name, 
+                                cloud_config_data['access_key_id'],
+                                cloud_config_data['secret_access_key'], 
+                                region
+                            )
+                            
+                            if result:
+                                job = result.get('TranscriptionJob', {})
+                                status = job.get('TranscriptionJobStatus')
+                                
+                                if status == 'COMPLETED':
+                                    logging.info("Transcription job completed")
+                                    transcribe_completed = True
+                                    
+                                    transcript_uri = job.get('Transcript', {}).get('TranscriptFileUri')
+                                    if transcript_uri:
+                                        transcript_data = download_transcript_from_uri(transcript_uri)
+                                        if transcript_data:
+                                            lang_code = job.get('LanguageCode', 'en-US')
+                                            save_transcript_languages(tracking_dir, analysis_id, transcript_data, lang_code)
+                                            combined['aws_transcribe'] = {
+                                                'primary_language': lang_code,
+                                                'transcripts': {lang_code: transcript_data}
+                                            }
+                                            
+                                            if job.get('Subtitles', {}).get('SubtitleFileUris'):
+                                                combined['aws_transcribe']['subtitle_uris'] = job['Subtitles']['SubtitleFileUris']
+                                    
+                                    redacted_uri = job.get('Transcript', {}).get('RedactedTranscriptFileUri')
+                                    if redacted_uri:
+                                        redacted_data = download_transcript_from_uri(redacted_uri)
+                                        if redacted_data:
+                                            combined['aws_transcribe']['redacted_transcript'] = redacted_data
+                                    
+                                    break
+                                    
+                                elif status in ('FAILED', 'PARTIAL_SUCCESS'):
+                                    reason = job.get('FailureReason', 'Unknown')
+                                    logging.error(f"Transcription failed: {reason}")
+                                    break
+                                
+                            time.sleep(30)
+                        
+                        if not transcribe_completed:
+                            logging.warning("Transcription did not complete in time")
+                
+                raw_paths, norm_paths = store_metadata_file(cloud_config_data, args.repo_guid, clean_catalog_path, combined)
+                
+                for raw_ret, lang_code in raw_paths:
+                    norm_ret = next((p for p, lc in norm_paths if lc == lang_code), None)
+                    if not send_extracted_metadata(cloud_config_data, args.repo_guid, clean_catalog_path, raw_ret, norm_ret, lang_code):
+                        logging.error(f"Failed to send extracted metadata for {lang_code or 'default'}")
+                        sys.exit(1)
+                
+                for norm_ret, lang_code in norm_paths:
+                    if norm_ret:
+                        try:
+                            full_norm = os.path.join(physical_root, norm_ret)
+                            enriched, ok = transform_normlized_to_enriched(full_norm, args.enrich_prefix)
+                            if ok and send_ai_enriched_metadata(cloud_config_data, args.repo_guid, clean_catalog_path, enriched, lang_code):
+                                logging.info(f"AI enriched metadata sent for {lang_code or 'default'}.")
+                        except Exception:
+                            logging.exception(f"Enrichment failed for {lang_code or 'default'}.")
+            
             else:
                 logging.error("Not all video analysis jobs completed.")
                 sys.exit(7)
+        
+        elif ai_config.get("transcribe_enabled"):
+            meta_path, _ = get_store_paths()
+            if "/./" in meta_path:
+                physical_root, logical_suffix = meta_path.split("/./", 1)
+            else:
+                physical_root, logical_suffix = meta_path, ""
+            tracking_dir = os.path.join(physical_root.rstrip("/"), logical_suffix, str(args.repo_guid), clean_catalog_path, "aws_transcribe")
+            os.makedirs(tracking_dir, exist_ok=True)
+            analysis_id = str(uuid.uuid4())
+            region = cloud_config_data.get("rekognition_region", "us-east-1")
+            
+            logging.info("Starting AWS Transcribe (standalone mode)...")
+            transcribe_job_name = start_transcription_job_advanced(
+                s3_uri, 
+                cloud_config_data['access_key_id'], 
+                cloud_config_data['secret_access_key'], 
+                region, 
+                ai_config
+            )
+            
+            if transcribe_job_name:
+                start_wait = time.time()
+                combined = {}
+                
+                while (time.time() - start_wait) < 900:
+                    result = get_transcription_job_result(
+                        transcribe_job_name, 
+                        cloud_config_data['access_key_id'],
+                        cloud_config_data['secret_access_key'], 
+                        region
+                    )
+                    
+                    if result:
+                        job = result.get('TranscriptionJob', {})
+                        status = job.get('TranscriptionJobStatus')
+                        
+                        if status == 'COMPLETED':
+                            logging.info("Transcription job completed")
+                            
+                            transcript_uri = job.get('Transcript', {}).get('TranscriptFileUri')
+                            if transcript_uri:
+                                transcript_data = download_transcript_from_uri(transcript_uri)
+                                if transcript_data:
+                                    lang_code = job.get('LanguageCode', 'en-US')
+                                    save_transcript_languages(tracking_dir, analysis_id, transcript_data, lang_code)
+                                    combined['aws_transcribe'] = {
+                                        'primary_language': lang_code,
+                                        'transcripts': {lang_code: transcript_data}
+                                    }
+                                    
+                                    if job.get('Subtitles', {}).get('SubtitleFileUris'):
+                                        combined['aws_transcribe']['subtitle_uris'] = job['Subtitles']['SubtitleFileUris']
+                            
+                            redacted_uri = job.get('Transcript', {}).get('RedactedTranscriptFileUri')
+                            if redacted_uri:
+                                redacted_data = download_transcript_from_uri(redacted_uri)
+                                if redacted_data:
+                                    combined['aws_transcribe']['redacted_transcript'] = redacted_data
+                            
+                            raw_paths, norm_paths = store_metadata_file(cloud_config_data, args.repo_guid, clean_catalog_path, combined)
+                            
+                            for raw_ret, lang_code in raw_paths:
+                                norm_ret = next((p for p, lc in norm_paths if lc == lang_code), None)
+                                if not send_extracted_metadata(cloud_config_data, args.repo_guid, clean_catalog_path, raw_ret, norm_ret, lang_code):
+                                    logging.error(f"Failed to send extracted metadata for {lang_code or 'default'}")
+                                    sys.exit(1)
+                            
+                            for norm_ret, lang_code in norm_paths:
+                                if norm_ret:
+                                    try:
+                                        full_norm = os.path.join(physical_root, norm_ret)
+                                        enriched, ok = transform_normlized_to_enriched(full_norm, args.enrich_prefix)
+                                        if ok and send_ai_enriched_metadata(cloud_config_data, args.repo_guid, clean_catalog_path, enriched, lang_code):
+                                            logging.info(f"AI enriched metadata sent for {lang_code or 'default'}.")
+                                    except Exception:
+                                        logging.exception(f"Enrichment failed for {lang_code or 'default'}.")
+                            
+                            break
+                            
+                        elif status in ('FAILED', 'PARTIAL_SUCCESS'):
+                            reason = job.get('FailureReason', 'Unknown')
+                            logging.error(f"Transcription failed: {reason}")
+                            sys.exit(7)
+                    
+                    time.sleep(30)
+    
     logging.info("All parts uploaded successfully to S3")
     sys.exit(0)
 
@@ -954,23 +1301,23 @@ def handle_normal_upload(args, cloud_config_data, backlink_url, clean_catalog_pa
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("-m", "--mode", required=True, help="Operation mode")
-    parser.add_argument("-c", "--config-name", required=True)
-    parser.add_argument("-j", "--job-guid")
-    parser.add_argument("-b", "--bucket-name")
-    parser.add_argument("-id", "--asset-id")
-    parser.add_argument("-cp", "--catalog-path")
-    parser.add_argument("-sp", "--source-path", required=True)
-    parser.add_argument("-mp", "--metadata-file")
-    parser.add_argument("-up", "--upload-path")
-    parser.add_argument("-sl", "--size-limit")
-    parser.add_argument("-r", "--repo-guid")
-    parser.add_argument("-o", "--output-path")
-    parser.add_argument("--enrich-prefix")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--log-level", default="debug")
-    parser.add_argument("--controller-address")
-    parser.add_argument("--export-ai-metadata")
+    parser.add_argument("-m", "--mode", required=True, help="mode of Operation proxy or original upload")
+    parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
+    parser.add_argument("-j", "--job-guid", help="Job Guid of SDNA job")
+    parser.add_argument("-b", "--bucket-name", help= "Name of Bucket")
+    parser.add_argument("-id", "--asset-id", help="Asset ID for metadata operations")
+    parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
+    parser.add_argument("-sp", "--source-path", required=True, help="Source path of file to look for original upload")
+    parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
+    parser.add_argument("-up", "--upload-path", help="Path where file will be uploaded to frameIO")
+    parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
+    parser.add_argument("-r", "--repo-guid", help="Repository GUID for catalog update")
+    parser.add_argument("-o", "--output-path", help="Path where output will be saved")
+    parser.add_argument("--enrich-prefix", help="Prefix to add for sdnaEventType of AI enrich data")
+    parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
+    parser.add_argument("--log-level", default="debug", help="Logging level")
+    parser.add_argument("--controller-address",help="Link IP/Hostname Port")
+    parser.add_argument("--export-ai-metadata", help="Export AI metadata using Rekognition")
     args = parser.parse_args()
 
     setup_logging(args.log_level)
