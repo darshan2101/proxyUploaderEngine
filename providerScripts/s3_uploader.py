@@ -995,14 +995,15 @@ def handle_send_extracted_metadata_video_resume(args, cloud_config_data, advance
     with open(tracker_path, 'w') as f:
         json.dump(tracker, f, indent=2)
     # Phase 4: Finalize
-    if all_done:
+    has_succeeded = any(s.get("raw_file") for s in tracker["feature_status"].values())
+    
+    if has_succeeded:
         combined = {"rekognition_video_analysis": {}}
         for feat, status in tracker["feature_status"].items():
             if status["raw_file"]:
                 with open(os.path.join(tracking_dir, status["raw_file"]), 'r') as f:
                     combined["rekognition_video_analysis"][feat] = json.load(f)
-            else:
-                combined["rekognition_video_analysis"][feat] = {}
+        
         raw_paths, norm_paths = store_metadata_file(cloud_config_data, args.repo_guid, clean_catalog_path, combined)
         
         for raw_ret, lang_code in raw_paths:
@@ -1023,7 +1024,10 @@ def handle_send_extracted_metadata_video_resume(args, cloud_config_data, advance
                 except Exception:
                     logging.exception(f"Enrichment failed for {lang_code or 'default'}.")
         
-        logging.info("Video analysis resume completed.")
+        if all_done:
+            logging.info("Video analysis resume completed.")
+        else:
+            logging.warning("Partial video analysis completed. Some features incomplete.")
     else:
         logging.info("Not all features done. Coordinator may retry.")
     sys.exit(0)
@@ -1063,14 +1067,38 @@ def handle_normal_upload(args, cloud_config_data, backlink_url, clean_catalog_pa
             tracker_path = os.path.join(tracking_dir, f"{analysis_id}_status.json")
             region = cloud_config_data.get("rekognition_region", "us-east-1")
             min_conf = ai_config.get("video_rekognition_min_confidence", 80)
-            job_ids = start_video_rekognition_job(s3_uri, cloud_config_data['access_key_id'], cloud_config_data['secret_access_key'], features, region, min_conf)
-            feature_status = {
-                feat: {
-                    "job_id": job_ids.get(feat),
-                    "completed": False,
-                    "raw_file": None
-                } for feat in features
-            }
+            
+            os.makedirs(tracking_dir, exist_ok=True)
+            existing_features = {}
+            if os.path.exists(tracking_dir):
+                for f in os.listdir(tracking_dir):
+                    if f.endswith('_raw.json'):
+                        for feat in features:
+                            if f'_{feat}_raw.json' in f:
+                                existing_features[feat] = f
+                                logging.info(f"Found existing data for {feat}: {f}")
+                                break
+            
+            features_to_run = [f for f in features if f not in existing_features]
+            
+            job_ids = {}
+            if features_to_run:
+                job_ids = start_video_rekognition_job(s3_uri, cloud_config_data['access_key_id'], cloud_config_data['secret_access_key'], features_to_run, region, min_conf)
+            
+            feature_status = {}
+            for feat in features:
+                if feat in existing_features:
+                    feature_status[feat] = {
+                        "job_id": None,
+                        "completed": True,
+                        "raw_file": existing_features[feat]
+                    }
+                else:
+                    feature_status[feat] = {
+                        "job_id": job_ids.get(feat),
+                        "completed": False,
+                        "raw_file": None
+                    }
             tracker = {
                 "analysis_id": analysis_id,
                 "asset_file": os.path.basename(args.upload_path) or "unknown",
@@ -1112,78 +1140,77 @@ def handle_normal_upload(args, cloud_config_data, backlink_url, clean_catalog_pa
             tracker["all_done"] = all_done
             with open(tracker_path, 'w') as f:
                 json.dump(tracker, f, indent=2)
-            if all_done:
-                combined = {"rekognition_video_analysis": {}}
-                for feat in features:
-                    raw_file = tracker["feature_status"][feat]["raw_file"]
-                    if raw_file:
-                        with open(os.path.join(tracking_dir, raw_file), 'r') as f:
-                            combined["rekognition_video_analysis"][feat] = json.load(f)
-                    else:
-                        combined["rekognition_video_analysis"][feat] = {}
+            
+            combined = {"rekognition_video_analysis": {}}
+            for feat in features:
+                raw_file = tracker["feature_status"][feat]["raw_file"]
+                if raw_file:
+                    with open(os.path.join(tracking_dir, raw_file), 'r') as f:
+                        combined["rekognition_video_analysis"][feat] = json.load(f)
+            
+            if ai_config.get("transcribe_enabled"):
+                logging.info("Starting AWS Transcribe integration...")
+                transcribe_job_name = start_transcription_job_advanced(
+                    s3_uri, 
+                    cloud_config_data['access_key_id'], 
+                    cloud_config_data['secret_access_key'], 
+                    region, 
+                    ai_config
+                )
                 
-                if ai_config.get("transcribe_enabled"):
-                    logging.info("Starting AWS Transcribe integration...")
-                    transcribe_job_name = start_transcription_job_advanced(
-                        s3_uri, 
-                        cloud_config_data['access_key_id'], 
-                        cloud_config_data['secret_access_key'], 
-                        region, 
-                        ai_config
-                    )
+                if transcribe_job_name:
+                    start_wait = time.time()
+                    transcribe_completed = False
                     
-                    if transcribe_job_name:
-                        start_wait = time.time()
-                        transcribe_completed = False
+                    while (time.time() - start_wait) < 900:
+                        result = get_transcription_job_result(
+                            transcribe_job_name, 
+                            cloud_config_data['access_key_id'],
+                            cloud_config_data['secret_access_key'], 
+                            region
+                        )
                         
-                        while (time.time() - start_wait) < 900:
-                            result = get_transcription_job_result(
-                                transcribe_job_name, 
-                                cloud_config_data['access_key_id'],
-                                cloud_config_data['secret_access_key'], 
-                                region
-                            )
+                        if result:
+                            job = result.get('TranscriptionJob', {})
+                            status = job.get('TranscriptionJobStatus')
                             
-                            if result:
-                                job = result.get('TranscriptionJob', {})
-                                status = job.get('TranscriptionJobStatus')
+                            if status == 'COMPLETED':
+                                logging.info("Transcription job completed")
+                                transcribe_completed = True
                                 
-                                if status == 'COMPLETED':
-                                    logging.info("Transcription job completed")
-                                    transcribe_completed = True
-                                    
-                                    transcript_uri = job.get('Transcript', {}).get('TranscriptFileUri')
-                                    if transcript_uri:
-                                        transcript_data = download_transcript_from_uri(transcript_uri)
-                                        if transcript_data:
-                                            lang_code = job.get('LanguageCode', 'en-US')
-                                            save_transcript_languages(tracking_dir, analysis_id, transcript_data, lang_code)
-                                            combined['aws_transcribe'] = {
-                                                'primary_language': lang_code,
-                                                'transcripts': {lang_code: transcript_data}
-                                            }
-                                            
-                                            if job.get('Subtitles', {}).get('SubtitleFileUris'):
-                                                combined['aws_transcribe']['subtitle_uris'] = job['Subtitles']['SubtitleFileUris']
-                                    
-                                    redacted_uri = job.get('Transcript', {}).get('RedactedTranscriptFileUri')
-                                    if redacted_uri:
-                                        redacted_data = download_transcript_from_uri(redacted_uri)
-                                        if redacted_data:
-                                            combined['aws_transcribe']['redacted_transcript'] = redacted_data
-                                    
-                                    break
-                                    
-                                elif status in ('FAILED', 'PARTIAL_SUCCESS'):
-                                    reason = job.get('FailureReason', 'Unknown')
-                                    logging.error(f"Transcription failed: {reason}")
-                                    break
+                                transcript_uri = job.get('Transcript', {}).get('TranscriptFileUri')
+                                if transcript_uri:
+                                    transcript_data = download_transcript_from_uri(transcript_uri)
+                                    if transcript_data:
+                                        lang_code = job.get('LanguageCode', 'en-US')
+                                        save_transcript_languages(tracking_dir, analysis_id, transcript_data, lang_code)
+                                        combined['aws_transcribe'] = {
+                                            'primary_language': lang_code,
+                                            'transcripts': {lang_code: transcript_data}
+                                        }
+                                        
+                                        if job.get('Subtitles', {}).get('SubtitleFileUris'):
+                                            combined['aws_transcribe']['subtitle_uris'] = job['Subtitles']['SubtitleFileUris']
                                 
-                            time.sleep(30)
-                        
-                        if not transcribe_completed:
-                            logging.warning("Transcription did not complete in time")
-                
+                                redacted_uri = job.get('Transcript', {}).get('RedactedTranscriptFileUri')
+                                if redacted_uri:
+                                    redacted_data = download_transcript_from_uri(redacted_uri)
+                                    if redacted_data:
+                                        combined['aws_transcribe']['redacted_transcript'] = redacted_data
+                                
+                                break
+                                
+                            elif status in ('FAILED', 'PARTIAL_SUCCESS'):
+                                reason = job.get('FailureReason', 'Unknown')
+                                logging.error(f"Transcription failed: {reason}")
+                                break
+                            
+                        time.sleep(30)
+                    
+                    if not transcribe_completed:
+                        logging.warning("Transcription did not complete in time")
+            
+            if combined.get("rekognition_video_analysis") or combined.get("aws_transcribe"):
                 raw_paths, norm_paths = store_metadata_file(cloud_config_data, args.repo_guid, clean_catalog_path, combined)
                 
                 for raw_ret, lang_code in raw_paths:
@@ -1202,8 +1229,8 @@ def handle_normal_upload(args, cloud_config_data, backlink_url, clean_catalog_pa
                         except Exception:
                             logging.exception(f"Enrichment failed for {lang_code or 'default'}.")
             
-            else:
-                logging.error("Not all video analysis jobs completed.")
+            if not all_done:
+                logging.warning("Some video analysis jobs incomplete, but available metadata was saved.")
                 sys.exit(7)
         
         elif ai_config.get("transcribe_enabled"):
