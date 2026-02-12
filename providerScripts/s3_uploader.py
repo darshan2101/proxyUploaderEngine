@@ -19,7 +19,7 @@ from requests.exceptions import RequestException, SSLError, ConnectionError, Tim
 from botocore.config import Config
 from botocore.exceptions import ClientError, ConnectionError, EndpointConnectionError, ReadTimeoutError
 
-VALID_MODES = ["proxy", "original", "get_base_target", "analyze_and_embed"]
+VALID_MODES = ["proxy", "original", "get_base_target", "send_extracted_metadata", "analyze_and_embed"]
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
