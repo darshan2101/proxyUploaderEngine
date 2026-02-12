@@ -19,7 +19,6 @@ from requests.exceptions import RequestException, SSLError, ConnectionError, Tim
 from botocore.config import Config
 from botocore.exceptions import ClientError, ConnectionError, EndpointConnectionError, ReadTimeoutError
 
-# Constants
 VALID_MODES = ["proxy", "original", "get_base_target", "analyze_and_embed"]
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
@@ -28,59 +27,67 @@ SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/b
 NORMALIZER_SCRIPT_PATH = "/opt/sdna/bin/rekognition_metadata_normalizer.py"
 S3_METADATA_MAX_SIZE = 2048
 
-# Detect platform
 IS_LINUX = os.path.isdir("/opt/sdna/bin")
 DNA_CLIENT_SERVICES = LINUX_CONFIG_PATH if IS_LINUX else MAC_CONFIG_PATH
 
 SDNA_EVENT_MAP = {
     "LABEL_DETECTION": "aws_vid_rekognition_label",
     "FACE_DETECTION": "aws_vid_rekognition_face",
-    "PERSON_TRACKING": "aws_vid_rekognition_person",
     "TEXT_DETECTION": "aws_vid_rekognition_text",
     "CONTENT_MODERATION": "aws_vid_rekognition_moderation",
-    "CELEBRITY_RECOGNITION": "aws_vid_rekognition_celebrity"
+    "CELEBRITY_RECOGNITION": "aws_vid_rekognition_celebrity",
+    "TRANSCRIBE": "aws_transcribe"
 }
 
 VIDEO_FEATURE_MAP = {
     "LABEL_DETECTION": {
         "start": "start_label_detection",
         "get": "get_label_detection",
-        "supports_min_conf": True
+        "supports_min_conf": True,
+        "normalizer_key": "detect_labels",
+        "result_key": "Labels"
     },
     "FACE_DETECTION": {
         "start": "start_face_detection",
         "get": "get_face_detection",
-        "supports_min_conf": False
+        "supports_min_conf": False,
+        "normalizer_key": "detect_faces",
+        "result_key": "Faces"
     },
     "CONTENT_MODERATION": {
         "start": "start_content_moderation",
         "get": "get_content_moderation",
-        "supports_min_conf": True
+        "supports_min_conf": True,
+        "normalizer_key": "detect_moderation_labels",
+        "result_key": "ModerationLabels"
     },
     "CELEBRITY_RECOGNITION": {
         "start": "start_celebrity_recognition",
         "get": "get_celebrity_recognition",
-        "supports_min_conf": False
+        "supports_min_conf": False,
+        "normalizer_key": "recognize_celebrities",
+        "result_key": "Celebrities"
     },
     "TEXT_DETECTION": {
         "start": "start_text_detection",
         "get": "get_text_detection",
-        "supports_min_conf": False
-    },
-    "PERSON_TRACKING": {
-        "start": "start_person_tracking",
-        "get": "get_person_tracking",
-        "supports_min_conf": False
+        "supports_min_conf": False,
+        "normalizer_key": "detect_text",
+        "result_key": "TextDetections"
     },
     "FACE_SEARCH": {
         "start": "start_face_search",
         "get": "get_face_search",
-        "supports_min_conf": True
+        "supports_min_conf": True,
+        "normalizer_key": "search_faces",
+        "result_key": "Persons"
     },
     "SEGMENT_DETECTION": {
         "start": "start_segment_detection",
         "get": "get_segment_detection",
-        "supports_min_conf": False
+        "supports_min_conf": False,
+        "normalizer_key": "detect_segments",
+        "result_key": "Segments"
     }
 }
 
@@ -181,7 +188,6 @@ def get_admin_dropbox_path():
 
 def get_retry_session(retries=3, backoff_factor_range=(1.0, 2.0)):
     session = requests.Session()
-    # handling retry delays manually via backoff in the range
     adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
@@ -191,7 +197,7 @@ def make_request_with_retries(method, url, **kwargs):
     session = get_retry_session()
     last_exception = None
 
-    for attempt in range(3):  # Max 3 attempts
+    for attempt in range(3):
         try:
             response = session.request(method, url, timeout=(10, 30), **kwargs)
             if response.status_code < 500:
@@ -200,10 +206,10 @@ def make_request_with_retries(method, url, **kwargs):
                 logging.warning(f"Received {response.status_code} from {url}. Retrying...")
         except (SSLError, ConnectionError, Timeout) as e:
             last_exception = e
-            if attempt < 2:  # Only sleep if not last attempt
+            if attempt < 2:
                 base_delay = [1, 3, 10][attempt]
                 jitter = random.uniform(0, 1)
-                delay = base_delay + jitter * ([1, 1, 5][attempt])  # e.g., 1-2, 3-4, 10-15
+                delay = base_delay + jitter * ([1, 1, 5][attempt])
                 logging.warning(f"Attempt {attempt + 1} failed due to {type(e).__name__}: {e}. "
                                 f"Retrying in {delay:.2f}s...")
                 time.sleep(delay)
@@ -215,7 +221,7 @@ def make_request_with_retries(method, url, **kwargs):
 
     if last_exception:
         raise last_exception
-    return None  # Should not reach here
+    return None
 
 def get_advanced_ai_config(config_name, provider_name="aws"):
     admin_dropbox = get_admin_dropbox_path()
@@ -240,12 +246,15 @@ def get_advanced_ai_config(config_name, provider_name="aws"):
                         clean_key = key
                         if key.startswith(f"{provider_key}_"):
                             clean_key = key[len(provider_key) + 1:]
-                        if clean_key.startswith("image_rekognition_") or clean_key.startswith("video_rekognition_") or clean_key in {
-                            "rekognition_region", "video_rekognition_enabled", "image_rekognition_enabled"
+                        if clean_key.startswith("image_rekognition_") or clean_key.startswith("video_rekognition_") or clean_key.startswith("transcribe_") or clean_key in {
+                            "rekognition_region", "video_rekognition_enabled", "image_rekognition_enabled", "transcribe_enabled"
                         }:
                             out[clean_key] = val
 
-                    for bool_key in ["image_rekognition_enabled", "video_rekognition_enabled"]:
+                    for bool_key in ["image_rekognition_enabled", "video_rekognition_enabled", "transcribe_enabled", 
+                                     "transcribe_speaker_labels", "transcribe_channel_identification", 
+                                     "transcribe_pii_redaction", "transcribe_identify_language", 
+                                     "transcribe_identify_multiple_languages"]:
                         if bool_key in out:
                             v = out[bool_key]
                             out[bool_key] = v if isinstance(v, bool) else str(v).lower() in ("true", "1", "yes", "on")
@@ -266,7 +275,15 @@ def get_advanced_ai_config(config_name, provider_name="aws"):
                             f.upper() if isinstance(f, str) else f for f in feats
                         ]
 
-                    for num_key in ["image_rekognition_labels_min_confidence", "image_rekognition_max_labels"]:
+                    for array_key in ["transcribe_pii_entity_types", "transcribe_subtitle_formats", "transcribe_language_options"]:
+                        if array_key in out:
+                            val = out[array_key]
+                            if isinstance(val, str):
+                                out[array_key] = [x.strip() for x in val.split(",") if x.strip()]
+                            elif not isinstance(val, list):
+                                out[array_key] = []
+
+                    for num_key in ["image_rekognition_labels_min_confidence", "image_rekognition_max_labels", "transcribe_max_speakers"]:
                         if num_key in out and isinstance(out[num_key], str):
                             try:
                                 out[num_key] = float(out[num_key]) if '.' in out[num_key] else int(out[num_key])
@@ -417,7 +434,6 @@ def store_metadata_file(config, repo_guid, file_path, metadata, max_attempts=3):
     metadata_dir = os.path.join(meta_left, meta_right, repo_guid_str, file_path, provider)
     os.makedirs(metadata_dir, exist_ok=True)
 
-    # Full local physical paths
     raw_json = os.path.join(metadata_dir, f"{base}_raw.json")
     norm_json = os.path.join(metadata_dir, f"{base}_norm.json")
 
@@ -429,18 +445,15 @@ def store_metadata_file(config, repo_guid, file_path, metadata, max_attempts=3):
 
     for attempt in range(max_attempts):
         try:
-            # RAW write
             with open(raw_json, "w", encoding="utf-8") as f:
-                json.dump(metadata, f, ensure_ascii=False, indent=4)
+                json.dump(metadata, f, indent=2, default=str, ensure_ascii=False)
             raw_success = True
 
-            # NORMALIZED write
             if not get_aws_video_rek_normalized_metadata(raw_json, norm_json):
                 logging.error("Normalization failed.")
                 norm_success = False
             else:
                 norm_success = True
-
             break
 
         except Exception as e:
@@ -507,7 +520,6 @@ def update_catalog(repo_guid, file_path, upload_path, bucket, max_attempts=5):
             if response.status_code in (200, 201):
                 logging.info("Catalog updated successfully.")
                 return True
-            # --- Handle 404 explicitly ---
             if response.status_code == 404:
                 logging.info("[404 DETECTED] Entering 404 handling block")
                 message = resp_json.get('message', '')
@@ -528,7 +540,6 @@ def update_catalog(repo_guid, file_path, upload_path, bucket, max_attempts=5):
 
         except Exception as e:
             logging.exception(f"[Attempt {attempt+1}] Unexpected exception in update_catalog: {e}")
-        # Default retry delay for non-404 or unhandled cases
         if attempt < max_attempts - 1:
             fallback_delay = 5 + attempt * 2
             logging.debug(f"Sleeping {fallback_delay}s before next attempt")
@@ -567,7 +578,6 @@ def send_extracted_metadata(config, repo_guid, file_path, rawMetadataFilePath, n
         try:
             r = make_request_with_retries("POST", url, headers=headers, json=payload)
             if r and r.status_code in (200, 201):
-                logger.info(f"Extended metadata save call response: {r.status_code} - {r.text}")
                 return True
         except Exception as e:
             if attempt == 2:
@@ -675,7 +685,6 @@ def upload_file_to_s3(config_data, bucket_name, source_path, upload_path, metada
     except (ClientError, EndpointConnectionError, ReadTimeoutError, ConnectionError) as e:
         error_code = e.response['Error']['Code'] if isinstance(e, ClientError) else "Network/Timeout"
         if isinstance(e, ClientError) and e.response['Error']['Code'].startswith('4'):
-            # Client error — don't retry
             logging.error(f"Client error during S3 upload: {e}")
             return {"status": 400, "detail": str(e)}
         logging.error(f"Transient S3 error: {e}")
@@ -801,20 +810,54 @@ def start_video_rekognition_job(s3_uri,access_key,secret_key,features,region,min
             logging.error(f"Failed {feat}: {e}")
     return job_ids
 
-def get_rekognition_job_result(job_id,feature,access_key,secret_key,region):
+def get_rekognition_job_result(job_id,feature,access_key,secret_key,region,max_pages=1000):
     client = boto3.client('rekognition',aws_access_key_id=access_key,aws_secret_access_key=secret_key,region_name=region)
     cfg = VIDEO_FEATURE_MAP.get(feature)
     if not cfg:
         logging.error(f"Unsupported feature: {feature}")
         return None
+    
     try:
         method = getattr(client, cfg["get"])
-        return method(JobId=job_id)
+        result_key = cfg.get("result_key")
+        
+        first_response = method(JobId=job_id)
+        
+        if first_response.get('JobStatus') != 'SUCCEEDED':
+            return first_response
+        
+        if not result_key:
+            return first_response
+        
+        accumulated_results = first_response.get(result_key, [])
+        next_token = first_response.get('NextToken')
+        page_count = 1
+        
+        while next_token and page_count < max_pages:
+            page_count += 1
+            page_response = method(JobId=job_id, NextToken=next_token)
+            accumulated_results.extend(page_response.get(result_key, []))
+            next_token = page_response.get('NextToken')
+            
+            if page_count % 10 == 0:
+                logging.info(f"{feature}: fetched {page_count} pages, {len(accumulated_results)} items")
+        
+        if page_count > 1:
+            logging.info(f"{feature}: completed with {page_count} pages, {len(accumulated_results)} total items")
+        
+        if page_count >= max_pages and next_token:
+            logging.warning(f"{feature}: reached max page limit ({max_pages}), may be incomplete")
+        
+        first_response[result_key] = accumulated_results
+        first_response.pop('NextToken', None)
+        
+        return first_response
+        
     except Exception as e:
         logging.error(f"Error fetching {feature} result: {e}")
         return None
 
-def start_transcription_job(s3_uri, aws_access_key, aws_secret_key, region, language_code="en-US", job_name=None):
+def start_transcription_job(s3_uri, aws_access_key, aws_secret_key, region, config):
     try:
         transcribe = boto3.client(
             'transcribe',
@@ -823,80 +866,110 @@ def start_transcription_job(s3_uri, aws_access_key, aws_secret_key, region, lang
             region_name=region
         )
 
-        if not job_name:
-            import uuid
-            job_name = f"transcribe-{uuid.uuid4()}"
-
-        # Determine media format from file extension
-        file_ext = s3_uri.split('.')[-1].lower()
+        job_name = f"transcribe-{uuid.uuid4()}"
+        file_ext = s3_uri.split('.')[-1].lower().split('?')[0]
         media_format_map = {
-            'mp3': 'mp3',
-            'mp4': 'mp4',
-            'wav': 'wav',
-            'flac': 'flac',
-            'ogg': 'ogg',
-            'amr': 'amr',
-            'webm': 'webm',
-            'm4a': 'mp4'
+            'mp3': 'mp3', 'mp4': 'mp4', 'wav': 'wav', 'flac': 'flac',
+            'ogg': 'ogg', 'amr': 'amr', 'webm': 'webm', 'm4a': 'mp4',
+            'mov': 'mp4', 'avi': 'mp4', 'mkv': 'mp4', 'mxf': 'mp4',
+            'mts': 'mp4', 'm2ts': 'mp4'
         }
         media_format = media_format_map.get(file_ext, 'mp4')
 
-        response = transcribe.start_transcription_job(
-            TranscriptionJobName=job_name,
-            Media={'MediaFileUri': s3_uri},
-            MediaFormat=media_format,
-            LanguageCode=language_code
-        )
+        job_params = {
+            'TranscriptionJobName': job_name,
+            'Media': {'MediaFileUri': s3_uri},
+            'MediaFormat': media_format
+        }
 
+        if config.get('transcribe_identify_language'):
+            job_params['IdentifyLanguage'] = True
+            if config.get('transcribe_language_options'):
+                job_params['LanguageOptions'] = config['transcribe_language_options']
+        elif config.get('transcribe_identify_multiple_languages'):
+            job_params['IdentifyMultipleLanguages'] = True
+            if config.get('transcribe_language_options'):
+                job_params['LanguageOptions'] = config['transcribe_language_options']
+        else:
+            job_params['LanguageCode'] = config.get('transcribe_language_code', 'en-US')
+
+        settings = {}
+        if config.get('transcribe_speaker_labels'):
+            settings['ShowSpeakerLabels'] = True
+            if config.get('transcribe_max_speakers'):
+                settings['MaxSpeakerLabels'] = config['transcribe_max_speakers']
+
+        if config.get('transcribe_channel_identification'):
+            settings['ChannelIdentification'] = True
+
+        if config.get('transcribe_custom_vocabulary'):
+            settings['VocabularyName'] = config['transcribe_custom_vocabulary']
+
+        if config.get('transcribe_vocabulary_filter'):
+            settings['VocabularyFilterName'] = config['transcribe_vocabulary_filter']
+            if config.get('transcribe_vocabulary_filter_method'):
+                settings['VocabularyFilterMethod'] = config['transcribe_vocabulary_filter_method']
+
+        if settings:
+            job_params['Settings'] = settings
+
+        if config.get('transcribe_pii_redaction'):
+            pii_config = {'RedactionType': 'PII'}
+            if config.get('transcribe_pii_output'):
+                pii_config['RedactionOutput'] = config['transcribe_pii_output']
+            if config.get('transcribe_pii_entity_types'):
+                pii_config['PiiEntityTypes'] = config['transcribe_pii_entity_types']
+            job_params['ContentRedaction'] = pii_config
+
+        if config.get('transcribe_subtitle_formats'):
+            job_params['Subtitles'] = {
+                'Formats': config['transcribe_subtitle_formats']
+            }
+
+        if config.get('transcribe_output_bucket'):
+            job_params['OutputBucketName'] = config['transcribe_output_bucket']
+
+        response = transcribe.start_transcription_job(**job_params)
         logging.info(f"Started transcription job: {job_name}")
         return job_name
 
     except Exception as e:
-        logging.error(f"Error starting transcription job: {e}")
+        logging.error(f"Failed to start transcription: {e}")
         return None
 
-def wait_for_transcription_job(job_name, aws_access_key, aws_secret_key, region, max_wait_time=3600, poll_interval=30):
-    transcribe = boto3.client(
-        'transcribe',
-        aws_access_key_id=aws_access_key,
-        aws_secret_access_key=aws_secret_key,
-        region_name=region
-    )
-
-    elapsed_time = 0
-
-    while elapsed_time < max_wait_time:
-        try:
-            response = transcribe.get_transcription_job(TranscriptionJobName=job_name)
-            status = response['TranscriptionJob']['TranscriptionJobStatus']
-
-            if status == 'COMPLETED':
-                transcript_uri = response['TranscriptionJob']['Transcript']['TranscriptFileUri']
-                
-                # Download transcript
-                with urllib.request.urlopen(transcript_uri) as url:
-                    transcript_data = json.loads(url.read().decode())
-                
-                logging.info(f"Transcription job completed: {job_name}")
-                return transcript_data
-
-            elif status == 'FAILED':
-                failure_reason = response['TranscriptionJob'].get('FailureReason', 'Unknown')
-                logging.error(f"Transcription job failed: {failure_reason}")
-                return None
-
-            elif status == 'IN_PROGRESS':
-                logging.debug(f"Transcription job in progress: {job_name}")
-
-        except Exception as e:
-            logging.error(f"Error checking transcription job status: {e}")
-            return None
-
-        time.sleep(poll_interval)
-        elapsed_time += poll_interval
-
-    logging.warning(f"Timeout waiting for transcription job: {job_name}")
-    return None
+def get_transcription_job_result(job_name, aws_access_key, aws_secret_key, region, max_pages=1000):
+    try:
+        transcribe = boto3.client(
+            'transcribe',
+            aws_access_key_id=aws_access_key,
+            aws_secret_access_key=aws_secret_key,
+            region_name=region
+        )
+        response = transcribe.get_transcription_job(TranscriptionJobName=job_name)
+        status = response['TranscriptionJob']['TranscriptionJobStatus']
+        
+        if status == 'COMPLETED':
+            transcript_uri = response['TranscriptionJob']['Transcript']['TranscriptFileUri']
+            with urllib.request.urlopen(transcript_uri) as url:
+                transcript_data = json.loads(url.read().decode())
+            
+            result = {
+                'JobStatus': status,
+                'JobName': job_name,
+                'Transcript': transcript_data,
+                'Metadata': response['TranscriptionJob']
+            }
+            return result
+        elif status in ('FAILED', 'IN_PROGRESS'):
+            return {
+                'JobStatus': status,
+                'JobName': job_name,
+                'FailureReason': response['TranscriptionJob'].get('FailureReason')
+            }
+        return None
+    except Exception as e:
+        logging.error(f"Error getting transcription result: {e}")
+        return None
 
 
 if __name__ == '__main__':
@@ -905,9 +978,9 @@ if __name__ == '__main__':
     parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
     parser.add_argument("-j", "--job-guid", help="Job Guid of SDNA job")
     parser.add_argument("-b", "--bucket-name", help= "Name of Bucket")
-    parser.add_argument("-id", "--asset-id", help="Asset ID for metadata h6operations")
+    parser.add_argument("-id", "--asset-id", help="Asset ID for metadata operations")
     parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
-    parser.add_argument("-sp", "--source-path", required=True, help="Source path of file to look for original upload")
+    parser.add_argument("-sp", "--source-path",  help="Source path of file to look for original upload")
     parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
     parser.add_argument("-up", "--upload-path", help="Path where file will be uploaded to frameIO")
     parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
@@ -944,7 +1017,6 @@ if __name__ == '__main__':
     if args.export_ai_metadata:
         cloud_config_data["export_ai_metadata"] = "true" if args.export_ai_metadata.lower() == "true" else "false"
 
-    # Load advanced AI settings
     provider_name = cloud_config_data.get("provider", "s3")
     advanced_ai_settings = get_advanced_ai_config(args.config_name, provider_name)
     if not advanced_ai_settings:
@@ -957,21 +1029,6 @@ if __name__ == '__main__':
     
     matched_file = args.source_path
     catalog_path = args.catalog_path
-
-    if not os.path.exists(matched_file):
-        logging.error(f"File not found: {matched_file}")
-        sys.exit(4)
-
-    matched_file_size = os.stat(matched_file).st_size
-    file_size_limit = args.size_limit
-    if mode == "original" and file_size_limit:
-        try:
-            size_limit_bytes = float(file_size_limit) * 1024 * 1024
-            if matched_file_size > size_limit_bytes:
-                logging.error(f"File too large: {matched_file_size / (1024 * 1024):.2f} MB > limit of {file_size_limit} MB")
-                sys.exit(4)
-        except Exception as e:
-            logging.warning(f"Could not validate size limit: {e}")
 
     backlink_url = ""
     clean_catalog_path = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1] if args.catalog_path else ""
@@ -996,17 +1053,18 @@ if __name__ == '__main__':
         logging.debug(f"Generated dashboard URL: {backlink_url}")
 
     if args.mode == "send_extracted_metadata" and args.enrich_prefix == "vid":
-        # Validate required arguments (upload_path NOT required)
         if not (args.asset_id and args.repo_guid and args.catalog_path):
             logging.error("asset-id, repo-guid, and catalog-path required in send_extracted_metadata mode for video.")
             sys.exit(1)
 
-        features = advanced_ai_settings.get("video_rekognition_features", [])
-        if not features:
-            logging.error("No video Rekognition features configured.")
+        ai_config = advanced_ai_settings or {}
+        video_features = ai_config.get("video_rekognition_features", []) if ai_config.get("video_rekognition_enabled") else []
+        transcribe_enabled = ai_config.get("transcribe_enabled", False)
+        
+        if not video_features and not transcribe_enabled:
+            logging.error("No video features or transcribe configured.")
             sys.exit(1)
         
-        # Derive tracking directory (same as normal flow)
         meta_path, _ = get_store_paths()
         if not meta_path:
             logging.error("Metadata store path not configured.")
@@ -1022,10 +1080,9 @@ if __name__ == '__main__':
             logical_suffix,
             str(args.repo_guid),
             clean_catalog_path,
-            "aws_rekognition"
+            "aws_analysis"
         )
 
-        # Use asset_id as analysis_id
         analysis_id = args.asset_id
         tracker_path = os.path.join(tracking_dir, f"{analysis_id}_status.json")
 
@@ -1033,113 +1090,168 @@ if __name__ == '__main__':
             logging.error(f"Tracker file not found: {tracker_path}")
             sys.exit(1)
 
-        # Load existing tracker
         with open(tracker_path, 'r') as f:
             tracker = json.load(f)
 
-        # Extract S3 URI from tracker (no CLI args needed)
         s3_uri = tracker.get("asset_s3_uri")
         if not s3_uri:
             logging.error("asset_s3_uri missing in tracker.")
             sys.exit(1)
 
-        logging.info(f"Resuming video analysis: {analysis_id} for {s3_uri}")
+        logging.info(f"Resuming analysis: {analysis_id} for {s3_uri}")
 
-        # AWS config
         region = cloud_config_data.get("rekognition_region", "us-east-1")
-        min_conf = advanced_ai_settings.get("video_rekognition_min_confidence", 80)
+        min_conf = ai_config.get("video_rekognition_min_confidence", 80)
 
-        # --- Phase 1: Retry starting features that previously had job_id = None ---
-        for feat, status in tracker["feature_status"].items():
-            if not status["completed"] and status["job_id"] is None:
-                logging.info(f"Retrying to start feature: {feat} (previously failed to launch)")
-                single_job_ids = start_video_rekognition_job(
-                    s3_uri,
-                    cloud_config_data['access_key_id'],
-                    cloud_config_data['secret_access_key'],
-                    [feat],
-                    region,
-                    min_confidence=min_conf
-                )
-                new_job_id = single_job_ids.get(feat)
-                if new_job_id:
-                    status["job_id"] = new_job_id
-                    logging.info(f"Restarted {feat} with JobId: {new_job_id}")
-                else:
-                    # Still can't start → mark as complete (skipped)
-                    status["completed"] = True
-                    logging.warning(f"Still unable to start {feat}. Permanently skipping.")
-
-        # --- Phase 2: Poll all incomplete jobs ---
-        pending_jobs = {}
-        for feat, status in tracker["feature_status"].items():
-            if not status["completed"] and status["job_id"] is not None:
-                pending_jobs[feat] = status["job_id"]
-
-        if pending_jobs:
-            logging.info(f"Polling {len(pending_jobs)} pending jobs...")
-            start_time = time.time()
-            max_wait = 900  # 15 minutes
-            poll_interval = 30
-
-            while pending_jobs and (time.time() - start_time) < max_wait:
-                for feat in list(pending_jobs.keys()):
-                    job_id = pending_jobs[feat]
-                    result = get_rekognition_job_result(
-                        job_id, feat,
+        if video_features:
+            for feat, status in tracker["video_rekognition_status"].items():
+                if not status["completed"] and status["job_id"] is None:
+                    logging.info(f"Retrying to start feature: {feat}")
+                    single_job_ids = start_video_rekognition_job(
+                        s3_uri,
                         cloud_config_data['access_key_id'],
                         cloud_config_data['secret_access_key'],
-                        region
+                        [feat],
+                        region,
+                        min_confidence=min_conf
                     )
-                    if result:
-                        job_status = result.get('JobStatus')
-                        if job_status == 'SUCCEEDED':
-                            raw_filename = f"{analysis_id}_{feat}_raw.json"
-                            raw_path = os.path.join(tracking_dir, raw_filename)
-                            with open(raw_path, 'w') as rf:
-                                json.dump(result, rf, indent=2)
-                            tracker["feature_status"][feat].update({
-                                "completed": True,
-                                "raw_file": raw_filename
-                            })
-                            del pending_jobs[feat]
-                            logging.info(f"Feature {feat} completed on resume.")
-                        elif job_status in ('FAILED', 'PARTIAL_SUCCESS'):
-                            tracker["feature_status"][feat]["completed"] = True
-                            del pending_jobs[feat]
-                            reason = result.get('FailureReason', 'Unknown')
-                            logging.error(f"Feature {feat} failed on resume: {reason}")
+                    new_job_id = single_job_ids.get(feat)
+                    if new_job_id:
+                        status["job_id"] = new_job_id
+                        logging.info(f"Restarted {feat} with JobId: {new_job_id}")
                     else:
-                        logging.warning(f"Null result for {feat} (JobId: {job_id})")
-                if pending_jobs:
-                    time.sleep(poll_interval)
+                        status["completed"] = True
+                        logging.warning(f"Still unable to start {feat}. Permanently skipping.")
 
-        # --- Phase 3: Update tracker ---
-        all_done = all(
-                (tracker["feature_status"][f]["completed"]
-                 if tracker["feature_status"][f].get("job_id") is not None
-                 else True)
-                for f in features
-            )
-        tracker["all_done"] = all_done
+            pending_jobs = {}
+            for feat, status in tracker["video_rekognition_status"].items():
+                if not status["completed"] and status["job_id"] is not None:
+                    pending_jobs[feat] = status["job_id"]
+
+            if pending_jobs:
+                logging.info(f"Polling {len(pending_jobs)} pending rekognition jobs...")
+                start_time = time.time()
+                max_wait = 900
+                poll_interval = 30
+
+                while pending_jobs and (time.time() - start_time) < max_wait:
+                    for feat in list(pending_jobs.keys()):
+                        job_id = pending_jobs[feat]
+                        result = get_rekognition_job_result(
+                            job_id, feat,
+                            cloud_config_data['access_key_id'],
+                            cloud_config_data['secret_access_key'],
+                            region
+                        )
+                        if result:
+                            job_status = result.get('JobStatus')
+                            if job_status == 'SUCCEEDED':
+                                raw_filename = f"{analysis_id}_{feat}_raw.json"
+                                raw_path = os.path.join(tracking_dir, raw_filename)
+                                with open(raw_path, 'w', encoding="utf-8") as rf:
+                                    json.dump(result, rf, indent=2, default=str, ensure_ascii=False)
+                                tracker["video_rekognition_status"][feat].update({
+                                    "completed": True,
+                                    "raw_file": raw_filename
+                                })
+                                del pending_jobs[feat]
+                                logging.info(f"Feature {feat} completed on resume.")
+                            elif job_status in ('FAILED', 'PARTIAL_SUCCESS'):
+                                tracker["video_rekognition_status"][feat]["completed"] = True
+                                del pending_jobs[feat]
+                                reason = result.get('FailureReason', 'Unknown')
+                                logging.error(f"Feature {feat} failed on resume: {reason}")
+                    if pending_jobs:
+                        time.sleep(poll_interval)
+
+        if transcribe_enabled and tracker.get("transcribe_status"):
+            transcribe_status = tracker["transcribe_status"]
+            if not transcribe_status["completed"]:
+                job_name = transcribe_status.get("job_name")
+                if not job_name:
+                    logging.info("Retrying to start transcribe job")
+                    job_name = start_transcription_job(
+                        s3_uri,
+                        cloud_config_data['access_key_id'],
+                        cloud_config_data['secret_access_key'],
+                        region,
+                        ai_config
+                    )
+                    if job_name:
+                        transcribe_status["job_name"] = job_name
+                        logging.info(f"Restarted transcribe with JobName: {job_name}")
+                    else:
+                        transcribe_status["completed"] = True
+                        logging.warning("Still unable to start transcribe. Permanently skipping.")
+                
+                if job_name and not transcribe_status["completed"]:
+                    logging.info("Polling transcribe job...")
+                    start_time = time.time()
+                    max_wait = 900
+                    poll_interval = 30
+
+                    while (time.time() - start_time) < max_wait:
+                        result = get_transcription_job_result(
+                            job_name,
+                            cloud_config_data['access_key_id'],
+                            cloud_config_data['secret_access_key'],
+                            region
+                        )
+                        if result:
+                            job_status = result.get('JobStatus')
+                            if job_status == 'COMPLETED':
+                                raw_filename = f"{analysis_id}_transcribe_raw.json"
+                                raw_path = os.path.join(tracking_dir, raw_filename)
+                                with open(raw_path, 'w', encoding="utf-8") as rf:
+                                    json.dump(result, rf, indent=2, default=str, ensure_ascii=False)
+                                transcribe_status.update({
+                                    "completed": True,
+                                    "raw_file": raw_filename
+                                })
+                                logging.info("Transcribe completed on resume.")
+                                break
+                            elif job_status == 'FAILED':
+                                transcribe_status["completed"] = True
+                                reason = result.get('FailureReason', 'Unknown')
+                                logging.error(f"Transcribe failed with response: {result}")
+                                logging.error(f"Transcribe failed on resume: {reason}")
+                                break
+                        time.sleep(poll_interval)
+
+        video_all_done = all(
+            (tracker["video_rekognition_status"][f]["completed"]
+             if tracker["video_rekognition_status"][f].get("job_id") is not None
+             else True)
+            for f in video_features
+        ) if video_features else True
+        
+        transcribe_all_done = tracker.get("transcribe_status", {}).get("completed", True) if transcribe_enabled else True
+        
+        tracker["all_done"] = video_all_done and transcribe_all_done
 
         os.makedirs(tracking_dir, exist_ok=True)
-        with open(tracker_path, 'w') as f:
-            json.dump(tracker, f, indent=2)
+        with open(tracker_path, 'w', encoding="utf-8") as f:
+            json.dump(tracker, f, indent=2, default=str, ensure_ascii=False)
 
-        # --- Phase 4: Finalize if all done ---
-        if all_done:
+        if tracker["all_done"]:
             logging.info("All features complete. Building combined metadata...")
-            combined_metadata = {"rekognition_video_analysis": {}}
-            for feat, status in tracker["feature_status"].items():
-                if status["raw_file"]:
-                    raw_path = os.path.join(tracking_dir, status["raw_file"])
-                    with open(raw_path, 'r') as f:
-                        combined_metadata["rekognition_video_analysis"][feat] = json.load(f)
-                else:
-                    combined_metadata["rekognition_video_analysis"][feat] = {}
+            combined_metadata = {}
+            
+            if video_features:
+                combined_metadata["rekognition_video_analysis"] = {}
+                for feat, status in tracker["video_rekognition_status"].items():
+                    if status["raw_file"]:
+                        raw_path = os.path.join(tracking_dir, status["raw_file"])
+                        with open(raw_path, 'r') as f:
+                            normalizer_key = VIDEO_FEATURE_MAP.get(feat, {}).get("normalizer_key", feat.lower())
+                            combined_metadata["rekognition_video_analysis"][normalizer_key] = json.load(f)
+            
+            if transcribe_enabled and tracker.get("transcribe_status", {}).get("raw_file"):
+                transcribe_status = tracker["transcribe_status"]
+                raw_path = os.path.join(tracking_dir, transcribe_status["raw_file"])
+                with open(raw_path, 'r') as f:
+                    combined_metadata["transcribe_results"] = json.load(f)
 
-            # Store via standard pipeline
             raw_return, norm_return = store_metadata_file(
                 cloud_config_data, args.repo_guid, clean_catalog_path, combined_metadata
             )
@@ -1148,7 +1260,6 @@ if __name__ == '__main__':
                 logging.error("Failed to send extracted metadata.")
                 sys.exit(1)
 
-            # Enrich if normalized metadata exists
             if norm_return:
                 try:
                     full_norm_path = os.path.join(physical_root, norm_return)
@@ -1160,11 +1271,26 @@ if __name__ == '__main__':
                 except Exception:
                     logging.exception("Enrichment failed during resume.")
 
-            logging.info("Video analysis resume completed successfully.")
+            logging.info("Analysis resume completed successfully.")
         else:
             logging.info("Not all features completed. Coordinator may retry later.")
 
         sys.exit(0)
+
+    if not os.path.exists(matched_file):
+        logging.error(f"File not found: {matched_file}")
+        sys.exit(4)
+
+    matched_file_size = os.stat(matched_file).st_size
+    file_size_limit = args.size_limit
+    if mode == "original" and file_size_limit:
+        try:
+            size_limit_bytes = float(file_size_limit) * 1024 * 1024
+            if matched_file_size > size_limit_bytes:
+                logging.error(f"File too large: {matched_file_size / (1024 * 1024):.2f} MB > limit of {file_size_limit} MB")
+                sys.exit(4)
+        except Exception as e:
+            logging.warning(f"Could not validate size limit: {e}")
 
     if mode == "analyze_and_embed":
         logging.info("Running in 'analyze_and_embed' mode")
@@ -1173,14 +1299,13 @@ if __name__ == '__main__':
             logging.error("--output-path is required in analyze_and_embed mode")
             sys.exit(1)
 
-        # Load AI config
         ai_config = get_advanced_ai_config(args.config_name, cloud_config_data.get("provider","rekognition")) or {}
         features = ai_config.get("rekognition_features", [
             "LABEL_DETECTION", "FACE_DETECTION", "CONTENT_MODERATION",
             "TEXT_DETECTION", "SAFETY_EQUIPMENT_ANALYSIS", "CELEBRITY_RECOGNITION"
         ])
         region = cloud_config_data.get("region", "us-east-1")
-        MAX_DIRECT_SIZE = 4 * 1024 * 1024  # 4 MB
+        MAX_DIRECT_SIZE = 4 * 1024 * 1024
 
         if matched_file_size <= MAX_DIRECT_SIZE:
             logging.info("File ≤ 4 MB: using direct byte upload to Rekognition")
@@ -1200,7 +1325,6 @@ if __name__ == '__main__':
                 is_s3_uri=False
             )
         else:
-            # Large file: upload to S3 first
             logging.info("File > 4 MB: uploading to S3, then analyzing")
             upload_path = args.upload_path
             response = upload_file_to_s3(cloud_config_data, args.bucket_name, args.source_path, upload_path)
@@ -1218,18 +1342,16 @@ if __name__ == '__main__':
                 is_s3_uri=True
             )
 
-            # Clean up S3 object after successful analysis
             if ai_metadata:
                 if remove_file_from_s3(args.bucket_name, upload_path, cloud_config_data):
                     logging.info("Temporary S3 object deleted after analysis")
                 else:
                     logging.warning("Failed to delete temporary S3 object")
 
-        # Save output
         if ai_metadata:
             try:
                 with open(args.output_path, "w", encoding="utf-8") as f:
-                    json.dump(ai_metadata, f, indent=2, ensure_ascii=False)
+                    json.dump(ai_metadata, f, indent=2, default=str, ensure_ascii=False)
                 logging.info(f"AI metadata saved to {args.output_path}")
             except Exception as e:
                 logging.error(f"Failed to write output file: {e}")
@@ -1282,19 +1404,16 @@ if __name__ == '__main__':
 
     s3_uri = f"s3://{args.bucket_name}/{upload_path.lstrip('/').replace(chr(92), '/')}"
 
-    # ==============================================================================
-    # AWS Rekognition Video Analysis – Normal Flow (with JobId persistence)
-    # ==============================================================================
     if args.enrich_prefix == "vid" and cloud_config_data.get("export_ai_metadata") == "true":
         ai_config = advanced_ai_settings or {}
-        features = ai_config.get("video_rekognition_features", [])
+        video_features = ai_config.get("video_rekognition_features", []) if ai_config.get("video_rekognition_enabled") else []
+        transcribe_enabled = ai_config.get("transcribe_enabled", False)
         
-        if not features:
-            logging.info("No video Rekognition features configured. Skipping.")
+        if not video_features and not transcribe_enabled:
+            logging.info("No video Rekognition features or transcribe configured. Skipping.")
         else:
             clean_catalog_path = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1] if args.catalog_path else "unknown"
             
-            # Derive tracking directory (physical path)
             meta_path, _ = get_store_paths()
             if not meta_path:
                 logging.error("Metadata store path not configured.")
@@ -1310,39 +1429,50 @@ if __name__ == '__main__':
                 logical_suffix,
                 str(args.repo_guid),
                 clean_catalog_path,
-                "aws_rekognition"
+                "aws_analysis"
             )
 
-            # Generate new analysis ID
             analysis_id = str(uuid.uuid4())
             tracker_path = os.path.join(tracking_dir, f"{analysis_id}_status.json")
             asset_file = os.path.basename(args.upload_path) if args.upload_path else "unknown"
 
-            logging.info(f"Starting video analysis (ID: {analysis_id}) for features: {features}")
+            logging.info(f"Starting analysis (ID: {analysis_id}) for video: {video_features}, transcribe: {transcribe_enabled}")
 
-            # Start jobs
             region = cloud_config_data.get("rekognition_region", "us-east-1")
             min_conf = ai_config.get("video_rekognition_min_confidence", 80)
-            job_ids = start_video_rekognition_job(
-                s3_uri,
-                cloud_config_data['access_key_id'],
-                cloud_config_data['secret_access_key'],
-                features,
-                region,
-                min_confidence=min_conf
-            )
-
-            if not job_ids:
-                logging.error("No Rekognition jobs started.")
-                print(f"Metadata extraction failed for asset: {analysis_id}")
-                sys.exit(7)
-
-            # Initialize tracker with job IDs (not yet completed)
-            feature_status = {}
-            for feat in features:
-                job_id = job_ids.get(feat, None)  # May be None if start failed (e.g., IAM deny)
-                feature_status[feat] = {
-                    "job_id": job_id,
+            
+            video_job_ids = {}
+            video_status = {}
+            transcribe_job_name = None
+            transcribe_status = {}
+            
+            if video_features:
+                video_job_ids = start_video_rekognition_job(
+                    s3_uri,
+                    cloud_config_data['access_key_id'],
+                    cloud_config_data['secret_access_key'],
+                    video_features,
+                    region,
+                    min_confidence=min_conf
+                )
+                for feat in video_features:
+                    job_id = video_job_ids.get(feat, None)
+                    video_status[feat] = {
+                        "job_id": job_id,
+                        "completed": False,
+                        "raw_file": None
+                    }
+            
+            if transcribe_enabled:
+                transcribe_job_name = start_transcription_job(
+                    s3_uri,
+                    cloud_config_data['access_key_id'],
+                    cloud_config_data['secret_access_key'],
+                    region,
+                    ai_config
+                )
+                transcribe_status = {
+                    "job_name": transcribe_job_name,
                     "completed": False,
                     "raw_file": None
                 }
@@ -1351,95 +1481,138 @@ if __name__ == '__main__':
                 "analysis_id": analysis_id,
                 "asset_file": asset_file,
                 "asset_s3_uri": s3_uri,
-                "features_requested": features,
-                "feature_status": feature_status,
+                "video_rekognition_status": video_status,
+                "transcribe_status": transcribe_status,
                 "all_done": False
             }
 
-            # Create directory and write tracker IMMEDIATELY (to persist JobIds)
             os.makedirs(tracking_dir, exist_ok=True)
-            with open(tracker_path, 'w') as f:
-                json.dump(tracker, f, indent=2)
+            with open(tracker_path, 'w', encoding="utf-8") as f:
+                json.dump(tracker, f, indent=2, default=str, ensure_ascii=False)
 
-            logging.info(f"Tracker saved with JobIds: {tracker_path}")
+            logging.info(f"Tracker saved: {tracker_path}")
 
-            # Poll for up to 15 minutes (900 seconds)
             start_time = time.time()
             max_wait = 900
             poll_interval = 30
-            completed_results = {}
 
             while (time.time() - start_time) < max_wait:
-                pending = False
-                for feat in features:
-                    status = tracker["feature_status"][feat]
-                    
-                    if status["completed"]:
-                        continue
-                    
-                    if status["raw_file"]:
-                        raw_path = os.path.join(tracking_dir, status["raw_file"])
-                        if os.path.exists(raw_path):
-                            status["completed"] = True
-                            logging.info(f"Feature {feat} already extracted, skipping.")
+                video_pending = False
+                transcribe_pending = False
+                
+                if video_features:
+                    for feat in video_features:
+                        status = tracker["video_rekognition_status"][feat]
+                        
+                        if status["completed"]:
                             continue
+                        
+                        if status["raw_file"]:
+                            raw_path = os.path.join(tracking_dir, status["raw_file"])
+                            if os.path.exists(raw_path):
+                                status["completed"] = True
+                                logging.info(f"Feature {feat} already extracted, skipping.")
+                                continue
+                        
+                        if not status["job_id"]:
+                            continue
+
+                        video_pending = True
+                        result = get_rekognition_job_result(
+                            status["job_id"], feat,
+                            cloud_config_data['access_key_id'],
+                            cloud_config_data['secret_access_key'],
+                            region
+                        )
+                        if result:
+                            job_status = result.get('JobStatus')
+                            if job_status == 'SUCCEEDED':
+                                status["completed"] = True
+                                raw_filename = f"{analysis_id}_{feat}_raw.json"
+                                status["raw_file"] = raw_filename
+                                raw_path = os.path.join(tracking_dir, raw_filename)
+                                with open(raw_path, 'w', encoding="utf-8") as rf:
+                                    json.dump(result, rf, indent=2, default=str, ensure_ascii=False)
+                                logging.info(f"Feature {feat} succeeded.")
+                            elif job_status in ('FAILED', 'PARTIAL_SUCCESS'):
+                                status["completed"] = True
+                                reason = result.get('FailureReason', 'Unknown')
+                                logging.error(f"Feature {feat} failed: {reason}")
+                
+                if transcribe_enabled:
+                    t_status = tracker["transcribe_status"]
                     
-                    if not status["job_id"]:
-                        continue
+                    if not t_status["completed"]:
+                        if t_status["raw_file"]:
+                            raw_path = os.path.join(tracking_dir, t_status["raw_file"])
+                            if os.path.exists(raw_path):
+                                t_status["completed"] = True
+                                logging.info("Transcribe already extracted, skipping.")
+                        elif t_status["job_name"]:
+                            transcribe_pending = True
+                            result = get_transcription_job_result(
+                                t_status["job_name"],
+                                cloud_config_data['access_key_id'],
+                                cloud_config_data['secret_access_key'],
+                                region
+                            )
+                            if result:
+                                job_status = result.get('JobStatus')
+                                if job_status == 'COMPLETED':
+                                    t_status["completed"] = True
+                                    raw_filename = f"{analysis_id}_transcribe_raw.json"
+                                    t_status["raw_file"] = raw_filename
+                                    raw_path = os.path.join(tracking_dir, raw_filename)
+                                    with open(raw_path, 'w', encoding="utf-8") as rf:
+                                        json.dump(result, rf, indent=2, default=str, ensure_ascii=False)
+                                    logging.info("Transcribe succeeded.")
+                                elif job_status == 'FAILED':
+                                    t_status["completed"] = True
+                                    reason = result.get('FailureReason', 'Unknown')
+                                    logging.error(f"Transcribe failed response from AWS: {result}")
 
-                    pending = True
-                    result = get_rekognition_job_result(
-                        status["job_id"], feat,
-                        cloud_config_data['access_key_id'],
-                        cloud_config_data['secret_access_key'],
-                        region
-                    )
-                    if result:
-                        job_status = result.get('JobStatus')
-                        if job_status == 'SUCCEEDED':
-                            completed_results[feat] = result
-                            status["completed"] = True
-                            raw_filename = f"{analysis_id}_{feat}_raw.json"
-                            status["raw_file"] = raw_filename
-                            raw_path = os.path.join(tracking_dir, raw_filename)
-                            with open(raw_path, 'w') as rf:
-                                json.dump(result, rf, indent=2)
-                            logging.info(f"Feature {feat} succeeded.")
-                        elif job_status in ('FAILED', 'PARTIAL_SUCCESS'):
-                            status["completed"] = True
-                            reason = result.get('FailureReason', 'Unknown')
-                            logging.error(f"Feature {feat} failed: {reason}")
-                    else:
-                        logging.warning(f"Null result for {feat} (JobId: {status['job_id']})")
-
-                if not pending:
+                if not video_pending and not transcribe_pending:
                     break
 
                 time.sleep(poll_interval)
 
-            # Update final completion status
-            all_done = all(
-                (tracker["feature_status"][f]["completed"]
-                 if tracker["feature_status"][f].get("job_id") is not None
+            video_all_done = all(
+                (tracker["video_rekognition_status"][f]["completed"]
+                 if tracker["video_rekognition_status"][f].get("job_id") is not None
                  else True)
-                for f in features
-            )
-            tracker["all_done"] = all_done
-
-            with open(tracker_path, 'w') as f:
-                json.dump(tracker, f, indent=2)
-
-            succeeded_features = [f for f in features if tracker["feature_status"][f].get("raw_file") and 
-                                  os.path.exists(os.path.join(tracking_dir, tracker["feature_status"][f]["raw_file"]))]
+                for f in video_features
+            ) if video_features else True
             
-            if succeeded_features:
-                combined_metadata = {"rekognition_video_analysis": {}}
-                for feat in succeeded_features:
-                    raw_file = tracker["feature_status"][feat]["raw_file"]
-                    raw_path = os.path.join(tracking_dir, raw_file)
-                    with open(raw_path, 'r') as f:
-                        combined_metadata["rekognition_video_analysis"][feat] = json.load(f)
+            transcribe_all_done = tracker["transcribe_status"].get("completed", True) if transcribe_enabled else True
+            
+            tracker["all_done"] = video_all_done and transcribe_all_done
 
+            with open(tracker_path, 'w', encoding="utf-8") as f:
+                json.dump(tracker, f, indent=2, default=str, ensure_ascii=False)
+
+            combined_metadata = {}
+            
+            if video_features:
+                video_succeeded = [f for f in video_features if tracker["video_rekognition_status"][f].get("raw_file") and 
+                                   os.path.exists(os.path.join(tracking_dir, tracker["video_rekognition_status"][f]["raw_file"]))]
+                
+                if video_succeeded:
+                    combined_metadata["rekognition_video_analysis"] = {}
+                    for feat in video_succeeded:
+                        raw_file = tracker["video_rekognition_status"][feat]["raw_file"]
+                        raw_path = os.path.join(tracking_dir, raw_file)
+                        normalizer_key = VIDEO_FEATURE_MAP.get(feat, {}).get("normalizer_key", feat.lower())
+                        with open(raw_path, 'r') as f:
+                            combined_metadata["rekognition_video_analysis"][normalizer_key] = json.load(f)
+            
+            if transcribe_enabled and tracker["transcribe_status"].get("raw_file"):
+                t_raw_file = tracker["transcribe_status"]["raw_file"]
+                t_raw_path = os.path.join(tracking_dir, t_raw_file)
+                if os.path.exists(t_raw_path):
+                    with open(t_raw_path, 'r') as f:
+                        combined_metadata["transcribe_results"] = json.load(f)
+
+            if combined_metadata:
                 raw_return, norm_return = store_metadata_file(
                     cloud_config_data, args.repo_guid, clean_catalog_path, combined_metadata
                 )
@@ -1447,7 +1620,7 @@ if __name__ == '__main__':
                 if raw_return:
                     send_extracted_metadata(cloud_config_data, args.repo_guid, clean_catalog_path, raw_return, norm_return)
 
-                if all_done and norm_return:
+                if tracker["all_done"] and norm_return:
                     try:
                         full_norm_path = os.path.join(physical_root, norm_return)
                         enriched, success = transform_normlized_to_enriched(full_norm_path, args.enrich_prefix)
@@ -1458,7 +1631,7 @@ if __name__ == '__main__':
                     except Exception:
                         logging.exception("Enrichment failed.")
 
-            if not all_done:
+            if not tracker["all_done"]:
                 print(f"Metadata extraction failed for asset: {analysis_id}")
                 sys.exit(7)
 
