@@ -31,12 +31,12 @@ IS_LINUX = os.path.isdir("/opt/sdna/bin")
 DNA_CLIENT_SERVICES = LINUX_CONFIG_PATH if IS_LINUX else MAC_CONFIG_PATH
 
 SDNA_EVENT_MAP = {
-    "LABEL_DETECTION": "aws_vid_rekognition_label",
-    "FACE_DETECTION": "aws_vid_rekognition_face",
-    "TEXT_DETECTION": "aws_vid_rekognition_text",
-    "CONTENT_MODERATION": "aws_vid_rekognition_moderation",
-    "CELEBRITY_RECOGNITION": "aws_vid_rekognition_celebrity",
-    "TRANSCRIBE": "aws_transcribe"
+    "LABEL_DETECTION": "labels",
+    "FACE_DETECTION": "faces",
+    "TEXT_DETECTION": "ocr",
+    "CONTENT_MODERATION": "moderation",
+    "CELEBRITY_RECOGNITION": "celebrities",
+    "TRANSCRIBE": "transcript",
 }
 
 VIDEO_FEATURE_MAP = {
