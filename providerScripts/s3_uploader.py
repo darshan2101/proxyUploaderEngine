@@ -788,42 +788,78 @@ def get_image_rekogniton_data(image_input, aws_access_key, aws_secret_key, featu
 def start_video_rekognition_job(s3_uri,access_key,secret_key,features,region,min_confidence=80):
     client = boto3.client('rekognition',aws_access_key_id=access_key,aws_secret_access_key=secret_key,region_name=region)
 
-    job_ids = {}
+    job_results = {}
     parsed = urllib.parse.urlparse(s3_uri)
     bucket = parsed.netloc
     key = parsed.path.lstrip("/")
     video = {'S3Object': {'Bucket': bucket, 'Name': key}}
+    
     for feat in features:
         cfg = VIDEO_FEATURE_MAP.get(feat)
         if not cfg:
             logging.warning(f"Unsupported feature: {feat}")
+            job_results[feat] = {
+                "job_id": None,
+                "error": f"Unsupported feature: {feat}",
+                "error_type": "configuration_error"
+            }
             continue
+        
         try:
             method = getattr(client, cfg["start"])
             kwargs = {"Video": video}
             if cfg.get("supports_min_conf"):
                 kwargs["MinConfidence"] = min_confidence
             response = method(**kwargs)
-            job_ids[feat] = response['JobId']
-            logging.info(f"Started {feat} job: {response['JobId']}")
+            job_id = response['JobId']
+            job_results[feat] = {
+                "job_id": job_id,
+                "error": None,
+                "error_type": None
+            }
+            logging.info(f"Started {feat} job: {job_id}")
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            error_msg = e.response['Error']['Message']
+            job_results[feat] = {
+                "job_id": None,
+                "error": f"[{error_code}] {error_msg}",
+                "error_type": "aws_client_error"
+            }
+            logging.error(f"Failed to start {feat}: [{error_code}] {error_msg}")
         except Exception as e:
-            logging.error(f"Failed {feat}: {e}")
-    return job_ids
+            job_results[feat] = {
+                "job_id": None,
+                "error": str(e),
+                "error_type": "unexpected_error"
+            }
+            logging.error(f"Failed to start {feat}: {e}")
+    
+    return job_results
 
-def get_rekognition_job_result(job_id,feature,access_key,secret_key,region,max_pages=1000):
+def get_rekognition_job_result(job_id, feature, access_key, secret_key, region, max_pages=1000):
     client = boto3.client('rekognition',aws_access_key_id=access_key,aws_secret_access_key=secret_key,region_name=region)
     cfg = VIDEO_FEATURE_MAP.get(feature)
     if not cfg:
         logging.error(f"Unsupported feature: {feature}")
-        return None
+        return {
+            "JobStatus": "FAILED",
+            "error": f"Unsupported feature: {feature}",
+            "error_type": "configuration_error"
+        }
     
     try:
         method = getattr(client, cfg["get"])
         result_key = cfg.get("result_key")
         
         first_response = method(JobId=job_id)
+        job_status = first_response.get('JobStatus')
         
-        if first_response.get('JobStatus') != 'SUCCEEDED':
+        # tracking error from response
+        if job_status == 'FAILED':
+            first_response['error'] = first_response.get('StatusMessage', 'Job failed without specific error message')
+            first_response['error_type'] = 'job_failed'
+        elif job_status != 'SUCCEEDED':
             return first_response
         
         if not result_key:
@@ -853,9 +889,22 @@ def get_rekognition_job_result(job_id,feature,access_key,secret_key,region,max_p
         
         return first_response
         
+    except ClientError as e:
+        error_code = e.response['Error']['Code']
+        error_msg = e.response['Error']['Message']
+        logging.error(f"Error fetching {feature} result: [{error_code}] {error_msg}")
+        return {
+            "JobStatus": "FAILED",
+            "error": f"[{error_code}] {error_msg}",
+            "error_type": "aws_client_error"
+        }
     except Exception as e:
         logging.error(f"Error fetching {feature} result: {e}")
-        return None
+        return {
+            "JobStatus": "FAILED",
+            "error": str(e),
+            "error_type": "unexpected_error"
+        }
 
 def start_transcription_job(s3_uri, aws_access_key, aws_secret_key, region, config):
     try:
@@ -931,11 +980,28 @@ def start_transcription_job(s3_uri, aws_access_key, aws_secret_key, region, conf
 
         response = transcribe.start_transcription_job(**job_params)
         logging.info(f"Started transcription job: {job_name}")
-        return job_name
+        return {
+            "job_name": job_name,
+            "error": None,
+            "error_type": None
+        }
 
+    except ClientError as e:
+        error_code = e.response['Error']['Code']
+        error_msg = e.response['Error']['Message']
+        logging.error(f"Failed to start transcription: [{error_code}] {error_msg}")
+        return {
+            "job_name": None,
+            "error": f"[{error_code}] {error_msg}",
+            "error_type": "aws_client_error"
+        }
     except Exception as e:
         logging.error(f"Failed to start transcription: {e}")
-        return None
+        return {
+            "job_name": None,
+            "error": str(e),
+            "error_type": "unexpected_error"
+        }
 
 def get_transcription_job_result(job_name, aws_access_key, aws_secret_key, region, max_pages=1000):
     try:
@@ -957,19 +1023,50 @@ def get_transcription_job_result(job_name, aws_access_key, aws_secret_key, regio
                 'JobStatus': status,
                 'JobName': job_name,
                 'Transcript': transcript_data,
-                'Metadata': response['TranscriptionJob']
+                'Metadata': response['TranscriptionJob'],
+                'error': None,
+                'error_type': None
             }
             return result
-        elif status in ('FAILED', 'IN_PROGRESS'):
+        elif status == 'FAILED':
+            failure_reason = response['TranscriptionJob'].get('FailureReason', 'Unknown failure reason')
             return {
                 'JobStatus': status,
                 'JobName': job_name,
-                'FailureReason': response['TranscriptionJob'].get('FailureReason')
+                'error': failure_reason,
+                'error_type': 'job_failed'
             }
-        return None
+        elif status == 'IN_PROGRESS':
+            return {
+                'JobStatus': status,
+                'JobName': job_name,
+                'error': None,
+                'error_type': None
+            }
+        return {
+            'JobStatus': status,
+            'JobName': job_name,
+            'error': f"Unexpected status: {status}",
+            'error_type': 'unexpected_status'
+        }
+    except ClientError as e:
+        error_code = e.response['Error']['Code']
+        error_msg = e.response['Error']['Message']
+        logging.error(f"Error getting transcription result: [{error_code}] {error_msg}")
+        return {
+            'JobStatus': 'FAILED',
+            'JobName': job_name,
+            'error': f"[{error_code}] {error_msg}",
+            'error_type': 'aws_client_error'
+        }
     except Exception as e:
         logging.error(f"Error getting transcription result: {e}")
-        return None
+        return {
+            'JobStatus': 'FAILED',
+            'JobName': job_name,
+            'error': str(e),
+            'error_type': 'unexpected_error'
+        }
 
 
 if __name__ == '__main__':
@@ -1107,7 +1204,7 @@ if __name__ == '__main__':
             for feat, status in tracker["video_rekognition_status"].items():
                 if not status["completed"] and status["job_id"] is None:
                     logging.info(f"Retrying to start feature: {feat}")
-                    single_job_ids = start_video_rekognition_job(
+                    single_job_results = start_video_rekognition_job(
                         s3_uri,
                         cloud_config_data['access_key_id'],
                         cloud_config_data['secret_access_key'],
@@ -1115,13 +1212,18 @@ if __name__ == '__main__':
                         region,
                         min_confidence=min_conf
                     )
-                    new_job_id = single_job_ids.get(feat)
+                    result = single_job_results.get(feat, {})
+                    new_job_id = result.get("job_id")
                     if new_job_id:
                         status["job_id"] = new_job_id
+                        status["error"] = None
+                        status["error_type"] = None
                         logging.info(f"Restarted {feat} with JobId: {new_job_id}")
                     else:
                         status["completed"] = True
-                        logging.warning(f"Still unable to start {feat}. Permanently skipping.")
+                        status["error"] = result.get("error", "Failed to start job")
+                        status["error_type"] = result.get("error_type", "unknown")
+                        logging.warning(f"Still unable to start {feat}. Error: {status['error']}")
 
             pending_jobs = {}
             for feat, status in tracker["video_rekognition_status"].items():
@@ -1152,15 +1254,22 @@ if __name__ == '__main__':
                                     json.dump(result, rf, indent=2, default=str, ensure_ascii=False)
                                 tracker["video_rekognition_status"][feat].update({
                                     "completed": True,
-                                    "raw_file": raw_filename
+                                    "raw_file": raw_filename,
+                                    "error": None,
+                                    "error_type": None
                                 })
                                 del pending_jobs[feat]
                                 logging.info(f"Feature {feat} completed on resume.")
                             elif job_status in ('FAILED', 'PARTIAL_SUCCESS'):
-                                tracker["video_rekognition_status"][feat]["completed"] = True
+                                error_msg = result.get('error', result.get('StatusMessage', 'Unknown error'))
+                                error_type = result.get('error_type', 'job_failed')
+                                tracker["video_rekognition_status"][feat].update({
+                                    "completed": True,
+                                    "error": error_msg,
+                                    "error_type": error_type
+                                })
                                 del pending_jobs[feat]
-                                reason = result.get('FailureReason', 'Unknown')
-                                logging.error(f"Feature {feat} failed on resume: {reason}")
+                                logging.error(f"Feature {feat} failed on resume: {error_msg}")
                     if pending_jobs:
                         time.sleep(poll_interval)
 
@@ -1170,19 +1279,24 @@ if __name__ == '__main__':
                 job_name = transcribe_status.get("job_name")
                 if not job_name:
                     logging.info("Retrying to start transcribe job")
-                    job_name = start_transcription_job(
+                    result = start_transcription_job(
                         s3_uri,
                         cloud_config_data['access_key_id'],
                         cloud_config_data['secret_access_key'],
                         region,
                         ai_config
                     )
+                    job_name = result.get("job_name")
                     if job_name:
                         transcribe_status["job_name"] = job_name
+                        transcribe_status["error"] = None
+                        transcribe_status["error_type"] = None
                         logging.info(f"Restarted transcribe with JobName: {job_name}")
                     else:
                         transcribe_status["completed"] = True
-                        logging.warning("Still unable to start transcribe. Permanently skipping.")
+                        transcribe_status["error"] = result.get("error", "Failed to start transcription")
+                        transcribe_status["error_type"] = result.get("error_type", "unknown")
+                        logging.warning(f"Still unable to start transcribe. Error: {transcribe_status['error']}")
                 
                 if job_name and not transcribe_status["completed"]:
                     logging.info("Polling transcribe job...")
@@ -1206,15 +1320,21 @@ if __name__ == '__main__':
                                     json.dump(result, rf, indent=2, default=str, ensure_ascii=False)
                                 transcribe_status.update({
                                     "completed": True,
-                                    "raw_file": raw_filename
+                                    "raw_file": raw_filename,
+                                    "error": None,
+                                    "error_type": None
                                 })
                                 logging.info("Transcribe completed on resume.")
                                 break
                             elif job_status == 'FAILED':
-                                transcribe_status["completed"] = True
-                                reason = result.get('FailureReason', 'Unknown')
-                                logging.error(f"Transcribe failed with response: {result}")
-                                logging.error(f"Transcribe failed on resume: {reason}")
+                                error_msg = result.get('error', result.get('FailureReason', 'Unknown error'))
+                                error_type = result.get('error_type', 'job_failed')
+                                transcribe_status.update({
+                                    "completed": True,
+                                    "error": error_msg,
+                                    "error_type": error_type
+                                })
+                                logging.error(f"Transcribe failed on resume: {error_msg}")
                                 break
                         time.sleep(poll_interval)
 
@@ -1441,13 +1561,11 @@ if __name__ == '__main__':
             region = cloud_config_data.get("rekognition_region", "us-east-1")
             min_conf = ai_config.get("video_rekognition_min_confidence", 80)
             
-            video_job_ids = {}
             video_status = {}
-            transcribe_job_name = None
             transcribe_status = {}
             
             if video_features:
-                video_job_ids = start_video_rekognition_job(
+                video_job_results = start_video_rekognition_job(
                     s3_uri,
                     cloud_config_data['access_key_id'],
                     cloud_config_data['secret_access_key'],
@@ -1456,15 +1574,17 @@ if __name__ == '__main__':
                     min_confidence=min_conf
                 )
                 for feat in video_features:
-                    job_id = video_job_ids.get(feat, None)
+                    result = video_job_results.get(feat, {})
                     video_status[feat] = {
-                        "job_id": job_id,
+                        "job_id": result.get("job_id"),
                         "completed": False,
-                        "raw_file": None
+                        "raw_file": None,
+                        "error": result.get("error"),
+                        "error_type": result.get("error_type")
                     }
             
             if transcribe_enabled:
-                transcribe_job_name = start_transcription_job(
+                result = start_transcription_job(
                     s3_uri,
                     cloud_config_data['access_key_id'],
                     cloud_config_data['secret_access_key'],
@@ -1472,9 +1592,11 @@ if __name__ == '__main__':
                     ai_config
                 )
                 transcribe_status = {
-                    "job_name": transcribe_job_name,
+                    "job_name": result.get("job_name"),
                     "completed": False,
-                    "raw_file": None
+                    "raw_file": None,
+                    "error": result.get("error"),
+                    "error_type": result.get("error_type")
                 }
 
             tracker = {
@@ -1530,14 +1652,19 @@ if __name__ == '__main__':
                                 status["completed"] = True
                                 raw_filename = f"{analysis_id}_{feat}_raw.json"
                                 status["raw_file"] = raw_filename
+                                status["error"] = None
+                                status["error_type"] = None
                                 raw_path = os.path.join(tracking_dir, raw_filename)
                                 with open(raw_path, 'w', encoding="utf-8") as rf:
                                     json.dump(result, rf, indent=2, default=str, ensure_ascii=False)
                                 logging.info(f"Feature {feat} succeeded.")
                             elif job_status in ('FAILED', 'PARTIAL_SUCCESS'):
                                 status["completed"] = True
-                                reason = result.get('FailureReason', 'Unknown')
-                                logging.error(f"Feature {feat} failed: {reason}")
+                                error_msg = result.get('error', result.get('StatusMessage', 'Unknown error'))
+                                error_type = result.get('error_type', 'job_failed')
+                                status["error"] = error_msg
+                                status["error_type"] = error_type
+                                logging.error(f"Feature {feat} failed: {error_msg}")
                 
                 if transcribe_enabled:
                     t_status = tracker["transcribe_status"]
@@ -1562,14 +1689,19 @@ if __name__ == '__main__':
                                     t_status["completed"] = True
                                     raw_filename = f"{analysis_id}_transcribe_raw.json"
                                     t_status["raw_file"] = raw_filename
+                                    t_status["error"] = None
+                                    t_status["error_type"] = None
                                     raw_path = os.path.join(tracking_dir, raw_filename)
                                     with open(raw_path, 'w', encoding="utf-8") as rf:
                                         json.dump(result, rf, indent=2, default=str, ensure_ascii=False)
                                     logging.info("Transcribe succeeded.")
                                 elif job_status == 'FAILED':
                                     t_status["completed"] = True
-                                    reason = result.get('FailureReason', 'Unknown')
-                                    logging.error(f"Transcribe failed response from AWS: {result}")
+                                    error_msg = result.get('error', result.get('FailureReason', 'Unknown error'))
+                                    error_type = result.get('error_type', 'job_failed')
+                                    t_status["error"] = error_msg
+                                    t_status["error_type"] = error_type
+                                    logging.error(f"Transcribe failed: {error_msg}")
 
                 if not video_pending and not transcribe_pending:
                     break
