@@ -26,7 +26,7 @@ import requests
 # CONSTANTS
 # ============================================================================
 
-VALID_MODES = ["proxy", "original", "get_base_target", "send_extracted_metadata", "analyze_and_embed"]
+VALID_MODES = ["proxy", "original", "send_extracted_metadata", "analyze_and_embed"]
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 IS_LINUX = os.path.isdir("/opt/sdna/bin")
@@ -55,15 +55,15 @@ SDNA_EVENT_MAP = {
     "gcp_video_summary": "summary",
     "gcp_video_highlights": "highlights",
     "gcp_video_transcript": "transcript",
-    "gcp_vision_labels": "labels",
-    "gcp_vision_text": "ocr",
-    "gcp_vision_faces": "faces",
 }
 
 # Multipart upload chunk size (32MB for optimal performance)
 MULTIPART_CHUNK_SIZE = 32 * 1024 * 1024
 
 logger = logging.getLogger()
+
+# Global args variable for fail() function
+args = None
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -79,6 +79,12 @@ def setup_logging(level):
     logging.getLogger('google.auth').setLevel(logging.ERROR)
     
     logging.info(f"Log level set to: {level.upper()}")
+
+def fail(msg, code=7):
+    logger.error(msg)
+    if code == 7:
+        print(f"Metadata extraction failed for asset: {getattr(args, 'asset_id', 'unknown')}")
+    sys.exit(code)
 
 def extract_file_name(path):
     return os.path.basename(path)
@@ -258,18 +264,52 @@ def get_advanced_ai_config(config_name, provider_name="gcp"):
                         feats = out["vision_features"]
                         if isinstance(feats, str):
                             feats = [x.strip() for x in feats.split(",") if x.strip()]
-                        out["vision_features"] = [
-                            f.upper() if isinstance(f, str) else f for f in feats
-                        ]
+                        elif not isinstance(feats, list):
+                            logging.warning(f"vision_features has unexpected type: {type(feats)}, converting to list")
+                            feats = [str(feats)]
+                        
+                        # Strip any remaining prefixes from individual feature names
+                        cleaned_features = []
+                        for f in feats:
+                            if isinstance(f, str):
+                                f_clean = f.strip().upper()  # Remove whitespace, uppercase
+                                # Remove common prefixes from feature names
+                                for prefix in ["GOOGLE_VISION_", "GCP_VISION_", "VISION_", "PROVIDER_"]:
+                                    if f_clean.startswith(prefix):
+                                        f_clean = f_clean[len(prefix):]
+                                        break
+                                cleaned_features.append(f_clean)
+                            else:
+                                cleaned_features.append(str(f).upper())
+                        
+                        out["vision_features"] = cleaned_features
+                        logging.debug(f"Normalized vision features: {out['vision_features']}")
 
                     # Normalize Video Intelligence features
                     if "video_intelligence_features" in out:
                         feats = out["video_intelligence_features"]
                         if isinstance(feats, str):
                             feats = [x.strip() for x in feats.split(",") if x.strip()]
-                        out["video_intelligence_features"] = [
-                            f.upper() if isinstance(f, str) else f for f in feats
-                        ]
+                        elif not isinstance(feats, list):
+                            logging.warning(f"video_intelligence_features has unexpected type: {type(feats)}, converting to list")
+                            feats = [str(feats)]
+                        
+                        # Strip any remaining prefixes from individual feature names
+                        cleaned_features = []
+                        for f in feats:
+                            if isinstance(f, str):
+                                f_clean = f.strip().upper()  # Remove whitespace, uppercase
+                                # Remove common prefixes from feature names
+                                for prefix in ["GOOGLE_VIDEO_", "GCP_VIDEO_", "VIDEO_", "PROVIDER_"]:
+                                    if f_clean.startswith(prefix):
+                                        f_clean = f_clean[len(prefix):]
+                                        break
+                                cleaned_features.append(f_clean)
+                            else:
+                                cleaned_features.append(str(f).upper())
+                        
+                        out["video_intelligence_features"] = cleaned_features
+                        logging.debug(f"Normalized video features: {out['video_intelligence_features']}")
 
                     # Normalize speech_contexts
                     if "video_speech_contexts" in out and isinstance(out["video_speech_contexts"], str):
@@ -540,13 +580,12 @@ def send_ai_enriched_metadata(config, repo_guid, file_path, enrichedMetadata, ma
 # ============================================================================
 
 def store_metadata_file(config, repo_guid, file_path, metadata, max_attempts=3):
-    """Store metadata files (raw and normalized) in configured paths"""
     meta_path, proxy_path = get_store_paths()
     if not meta_path:
         logging.error("Metadata Store settings not found.")
         return None, None
 
-    provider = config.get("provider", "gcp_media")
+    provider = config.get("provider", "GCP")
     base = os.path.splitext(os.path.basename(file_path))[0]
     repo_guid_str = str(repo_guid)
 
@@ -1112,8 +1151,11 @@ def retrieve_operation_result(config, operation_name, timeout_minutes=15):
 # ============================================================================
 
 if __name__ == '__main__':
+    # CRITICAL: Random sleep to prevent thundering herd
+    time.sleep(random.uniform(0.0, 0.5))
+    
     parser = argparse.ArgumentParser()
-    parser.add_argument("-m", "--mode", required=True, help="mode of Operation: proxy, original, get_base_target, send_extracted_metadata, analyze_and_embed")
+    parser.add_argument("-m", "--mode", required=True, help="mode of Operation: proxy, original, send_extracted_metadata, analyze_and_embed")
     parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
     parser.add_argument("-j", "--job-guid", help="Job Guid of SDNA job")
     parser.add_argument("-b", "--bucket-name", help="Name of GCS Bucket")
@@ -1127,6 +1169,9 @@ if __name__ == '__main__':
     parser.add_argument("--enrich-prefix", help="Prefix to add for sdnaEventType of AI enrich data")
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")
+    
+    # Parse args and make globally available for fail() function
+    global args
     args = parser.parse_args()
 
     setup_logging(args.log_level)
@@ -1142,7 +1187,7 @@ if __name__ == '__main__':
     cloud_config_data = None
     try:
         if IS_LINUX:
-            parser_cfg = ConfigParser()
+            parser_cfg = ConfigParser(interpolation=None)  # To prevent % interpolation in tokens
             parser_cfg.read(cloud_config_path)
             for section in parser_cfg.sections():
                 if section.lower() == args.config_name.lower():
@@ -1170,24 +1215,32 @@ if __name__ == '__main__':
     logging.info(f"AI Config loaded: vision_enabled={ai_config.get('vision_ai_enabled')}, video_enabled={ai_config.get('video_intelligence_enabled')}")
 
     # ========================================================================
-    # MODE: get_base_target (Retrieve existing operation result)
+    # MODE: send_extracted_metadata (Resume incomplete video analysis)
     # ========================================================================
-    if mode == "get_base_target":
+    if mode == "send_extracted_metadata":
         if not args.asset_id:
-            logging.error("Asset ID (operation name) required for get_base_target mode")
+            logging.error("Asset ID (operation name) required for send_extracted_metadata mode")
             sys.exit(1)
         
         if not args.repo_guid or not args.catalog_path:
-            logging.error("Repository GUID and catalog path required for get_base_target mode")
+            logging.error("Repository GUID and catalog path required for send_extracted_metadata mode")
             sys.exit(1)
         
-        logging.info(f"Retrieving operation result: {args.asset_id}")
+        operation_name = args.asset_id
+        logging.info(f"Resuming analysis for operation: {operation_name}")
+
+        credentials = get_gcp_credentials(cloud_config_data)
+        if not credentials:
+            logging.error("Failed to get GCP credentials")
+            sys.exit(5)
         
+        # Retrieve and poll the operation
         try:
-            serialized = retrieve_operation_result(cloud_config_data, args.asset_id, timeout_minutes=15)
+            serialized = retrieve_operation_result(cloud_config_data, operation_name, timeout_minutes=15)
         except SystemExit as e:
             if e.code == 7:
-                logging.error("Polling failed or timed out")
+                logging.error("Polling failed or timed out on resume")
+                # DON'T delete GCS file - job might still be running
             raise
         
         # Process and store metadata
@@ -1225,57 +1278,14 @@ if __name__ == '__main__':
             else:
                 logging.warning(f"Failed to transform normalized metadata: {enriched_metadata}")
         
-        sys.exit(0)
-
-    # ========================================================================
-    # MODE: send_extracted_metadata (Send pre-existing metadata files)
-    # ========================================================================
-    if mode == "send_extracted_metadata":
-        if not args.repo_guid or not args.catalog_path:
-            logging.error("Repository GUID and catalog path required for send_extracted_metadata mode")
-            sys.exit(1)
+        if args.bucket_name and args.upload_path:
+            upload_prefix = ai_config.get("video_gcs_upload_prefix", "video-intelligence-temp")
+            # Reconstruct the upload path used in first invocation
+            upload_path = args.upload_path.lstrip('/')
+            logging.info(f"Cleaning up GCS file: gs://{args.bucket_name}/{upload_path}")
+            delete_from_gcs(credentials, args.bucket_name, upload_path)
         
-        # This mode assumes metadata files already exist
-        logging.info("Sending previously generated metadata files")
-        
-        clean_path = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
-        
-        # Construct expected metadata paths
-        meta_path, _ = get_store_paths()
-        if "/./" in meta_path:
-            meta_left, meta_right = meta_path.split("/./", 1)
-        else:
-            meta_left, meta_right = meta_path, ""
-        
-        provider = cloud_config_data.get("provider", "gcp_media")
-        base = os.path.splitext(os.path.basename(clean_path))[0]
-        repo_guid_str = str(args.repo_guid)
-        
-        # Check if files exist
-        metadata_dir = os.path.join(meta_left, meta_right, repo_guid_str, clean_path, provider)
-        raw_json = os.path.join(metadata_dir, f"{base}_raw.json")
-        norm_json = os.path.join(metadata_dir, f"{base}_norm.json")
-        
-        raw_return = os.path.join(meta_right, repo_guid_str, clean_path, provider, f"{base}_raw.json") if os.path.exists(raw_json) else None
-        norm_return = os.path.join(meta_right, repo_guid_str, clean_path, provider, f"{base}_norm.json") if os.path.exists(norm_json) else None
-        
-        if not raw_return and not norm_return:
-            logging.error(f"No metadata files found in {metadata_dir}")
-            sys.exit(7)
-        
-        if not send_extracted_metadata(cloud_config_data, args.repo_guid, clean_path, raw_return, norm_return):
-            logging.error("Failed to send extracted metadata")
-            sys.exit(7)
-        
-        logging.info("Extracted metadata sent successfully")
-        
-        # Try to send enriched metadata if normalized exists
-        if norm_return and os.path.exists(norm_json):
-            enriched_metadata, success = transform_normlized_to_enriched(norm_json, args.enrich_prefix)
-            if success:
-                if send_ai_enriched_metadata(cloud_config_data, args.repo_guid, clean_path, enriched_metadata):
-                    logging.info("AI enriched metadata sent successfully")
-        
+        logging.info("Video analysis resumed and completed successfully")
         sys.exit(0)
 
     # ========================================================================
@@ -1420,15 +1430,19 @@ if __name__ == '__main__':
             # Poll for completion (15 minutes timeout)
             try:
                 serialized = poll_video_analysis(operation, timeout_minutes=15)
-            except SystemExit as e:
-                # Clean up GCS file on failure
+                
+                # SUCCESS: Job completed within timeout
+                logging.info("Analysis completed successfully, cleaning up GCS file")
                 delete_from_gcs(credentials, args.bucket_name, upload_path)
+                
+            except SystemExit as e:
                 if e.code == 7:
+                    # TIMEOUT: Job still running
                     logging.error("Analysis polling timed out - job still indexing")
+                    logging.warning("NOT deleting GCS file - job may still be processing")
+                    logging.info(f"Operation name saved to catalog: {operation_name}")
+                    logging.info("Coordinator should retry with send_extracted_metadata mode")
                 raise
-            
-            # Clean up GCS file after successful analysis
-            delete_from_gcs(credentials, args.bucket_name, upload_path)
             
             # Store metadata files
             raw_metadata_path, norm_metadata_path = store_metadata_file(
@@ -1465,9 +1479,9 @@ if __name__ == '__main__':
             sys.exit(0)
             
         except Exception as e:
-            # Clean up GCS file on any error
+            logging.error(f"Unexpected error during processing: {e}")
+            logging.info("Cleaning up GCS file due to unexpected error")
             delete_from_gcs(credentials, args.bucket_name, upload_path)
-            logging.error(f"GCP Video Intelligence processing failed: {e}")
             sys.exit(10)
 
     logging.error(f"Unsupported mode: {mode}")
