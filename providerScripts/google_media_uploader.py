@@ -6,6 +6,7 @@ import argparse
 import logging
 import random
 import time
+import uuid
 from configparser import ConfigParser
 import plistlib
 import base64
@@ -21,15 +22,18 @@ from google.protobuf.json_format import MessageToDict
 from google.oauth2 import service_account
 import requests
 
-# Constants
-VALID_MODES = ["proxy", "original", "analyze_and_embed", "send_extracted_metadata"]
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+
+VALID_MODES = ["proxy", "original", "get_base_target", "send_extracted_metadata", "analyze_and_embed"]
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 IS_LINUX = os.path.isdir("/opt/sdna/bin")
 DNA_CLIENT_SERVICES = LINUX_CONFIG_PATH if IS_LINUX else MAC_CONFIG_PATH
 SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
 
-NORMALIZER_SCRIPT_PATH = "/opt/sdna/bin/gcp_video_intelligence_metadata_normalizer.py"
+NORMALIZER_SCRIPT_PATH = "/opt/sdna/bin/gcp_media_metadata_normalizer.py"
 
 # GCP Video Intelligence feature mapping
 VIDEO_FEATURE_MAP = {
@@ -45,23 +49,15 @@ VIDEO_FEATURE_MAP = {
     "FEATURE_UNSPECIFIED": videointelligence.Feature.FEATURE_UNSPECIFIED
 }
 
-FEATURE_MAP = {
-    "segment_label_annotations": "Labels",
-    "shot_annotations": "Shots",
-    "speech_transcriptions": "Transcriptions",
-    "text_annotations": "Text",
-    "object_annotations": "Objects",
-    "logo_recognition_annotations": "Logos",
-    "face_detection_annotations": "Faces",
-    "person_detection_annotations": "Persons",
-}
-
 SDNA_EVENT_MAP = {
     "gcp_video_labels": "labels",
     "gcp_video_keywords": "keywords",
     "gcp_video_summary": "summary",
     "gcp_video_highlights": "highlights",
     "gcp_video_transcript": "transcript",
+    "gcp_vision_labels": "labels",
+    "gcp_vision_text": "ocr",
+    "gcp_vision_faces": "faces",
 }
 
 # Multipart upload chunk size (32MB for optimal performance)
@@ -69,78 +65,38 @@ MULTIPART_CHUNK_SIZE = 32 * 1024 * 1024
 
 logger = logging.getLogger()
 
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
 def setup_logging(level):
-    logging.basicConfig(
-        level=getattr(logging, level.upper()), 
-        format='%(asctime)s %(levelname)s: %(message)s'
-    )
+    numeric_level = getattr(logging, level.upper(), logging.DEBUG)
+    logging.basicConfig(level=numeric_level, format='%(asctime)s %(levelname)s: %(message)s')
+    
+    # Reduce noise from Google libraries
+    logging.getLogger('google').setLevel(logging.ERROR)
+    logging.getLogger('google.api_core').setLevel(logging.ERROR)
+    logging.getLogger('google.auth').setLevel(logging.ERROR)
+    
+    logging.info(f"Log level set to: {level.upper()}")
 
-def fail(msg, code=7):
-    """Exit with error message and code for coordinator script"""
-    logger.error(msg)
-    if code == 7:
-        # For code 7, include asset/operation ID if available
-        asset_info = getattr(args, 'asset_id', None) or getattr(args, 'source_path', 'unknown')
-        print(f"Metadata extraction failed for asset: {asset_info}")
-    sys.exit(code)
+def extract_file_name(path):
+    return os.path.basename(path)
 
-def get_retry_session():
-    session = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
+def remove_file_name_from_path(path):
+    return os.path.dirname(path)
 
-def make_request_with_retries(method, url, max_retries=3, **kwargs):
-    session = get_retry_session()
-    for attempt in range(max_retries):
-        try:
-            response = session.request(method, url, timeout=(10, 30), **kwargs)
-            if response.status_code == 429:
-                retry_after = int(response.headers.get('Retry-After', 60))
-                wait_time = retry_after + 5
-                logging.warning(f"[429] Rate limited. Waiting {wait_time}s")
-                time.sleep(wait_time)
-                continue
-            if response.status_code < 500:
-                return response
-            logging.warning(f"[SERVER ERROR {response.status_code}] Retrying...")
-        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError, 
-                requests.exceptions.Timeout) as e:
-            if attempt == max_retries - 1:
-                raise
-            delay = [2, 5, 15][attempt] + random.uniform(0, 2)
-            logging.warning(f"[{type(e).__name__}] Retrying in {delay:.1f}s...")
-            time.sleep(delay)
-    return None
-
-def with_retry(fn, retries=3, base_delay=2):
-    for attempt in range(retries):
-        try:
-            return fn()
-        except Exception as e:
-            if attempt == retries - 1:
-                raise
-            delay = base_delay ** attempt + random.uniform(0, 2)
-            logging.warning(f"Retrying in {delay:.1f}s due to: {e}")
-            time.sleep(delay)
-
-def get_config_path():
-    try:
-        if IS_LINUX:
-            parser = ConfigParser()
-            parser.read(DNA_CLIENT_SERVICES)
-            folder = parser.get('General', 'cloudconfigfolder', fallback='').strip()
-        else:
-            with open(DNA_CLIENT_SERVICES, 'rb') as fp:
-                folder = plistlib.load(fp).get("CloudConfigFolder", "").strip()
-        if not folder:
-            logging.error("CloudConfigFolder not found")
-            sys.exit(5)
-        return os.path.join(folder, "cloud_targets.conf")
-    except Exception as e:
-        logging.error(f"Failed to read config: {e}")
-        sys.exit(5)
+def get_cloud_config_path():
+    logging.debug("Determining cloud config path based on platform")
+    if IS_LINUX:
+        parser = ConfigParser()
+        parser.read(DNA_CLIENT_SERVICES)
+        path = parser.get('General', 'cloudconfigfolder', fallback='') + "/cloud_targets.conf"
+    else:
+        with open(DNA_CLIENT_SERVICES, 'rb') as fp:
+            path = plistlib.load(fp)["CloudConfigFolder"] + "/cloud_targets.conf"
+    logging.info(f"Using cloud config path: {path}")
+    return path
 
 def get_link_address_and_port():
     logging.debug(f"Reading server configuration from: {SERVERS_CONF_PATH}")
@@ -171,6 +127,26 @@ def get_link_address_and_port():
     logging.info(f"Server connection details - Address: {ip}, Port: {port}")
     return ip, port
 
+def get_store_paths():
+    metadata_store_path, proxy_store_path = "", ""
+    try:
+        config_path = "/opt/sdna/nginx/ai-config.json" if IS_LINUX else "/Library/Application Support/StorageDNA/nginx/ai-config.json"
+        with open(config_path, 'r') as f:
+            config_data = json.load(f)
+            metadata_store_path = config_data.get("ai_export_shared_drive_path", "")
+            proxy_store_path = config_data.get("ai_proxy_shared_drive_path", "")
+            logging.info(f"Metadata Store Path: {metadata_store_path}, Proxy Store Path: {proxy_store_path}")
+        
+    except Exception as e:
+        logging.error(f"Error reading Metadata Store or Proxy Store settings: {e}")
+        sys.exit(5)
+
+    if not metadata_store_path or not proxy_store_path:
+        logging.info("Store settings not found.")
+        sys.exit(5)
+
+    return metadata_store_path, proxy_store_path
+
 def get_admin_dropbox_path():
     try:
         if IS_LINUX:
@@ -186,34 +162,55 @@ def get_admin_dropbox_path():
         logging.error(f"Error reading admin dropbox path: {e}")
         return None
 
-def get_store_paths():
-    metadata_store_path, proxy_store_path = "", ""
-    try:
-        config_path = "/opt/sdna/nginx/ai-config.json" if IS_LINUX else \
-                      "/Library/Application Support/StorageDNA/nginx/ai-config.json"
-        with open(config_path, 'r') as f:
-            config_data = json.load(f)
-            metadata_store_path = config_data.get("ai_export_shared_drive_path", "")
-            proxy_store_path = config_data.get("ai_proxy_shared_drive_path", "")
-            logging.info(f"Metadata Store Path: {metadata_store_path}, Proxy Store Path: {proxy_store_path}")
-    except Exception as e:
-        logging.error(f"Error reading Metadata Store or Proxy Store settings: {e}")
-        sys.exit(5)
+def get_retry_session(retries=3, backoff_factor_range=(1.0, 2.0)):
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
-    if not metadata_store_path or not proxy_store_path:
-        logging.info("Store settings not found.")
-        sys.exit(5)
+def make_request_with_retries(method, url, **kwargs):
+    session = get_retry_session()
+    last_exception = None
 
-    return metadata_store_path, proxy_store_path
+    for attempt in range(3):
+        try:
+            response = session.request(method, url, timeout=(10, 30), **kwargs)
+            if response.status_code < 500:
+                return response
+            else:
+                logging.warning(f"Received {response.status_code} from {url}. Retrying...")
+        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            last_exception = e
+            if attempt < 2:
+                base_delay = [1, 3, 10][attempt]
+                jitter = random.uniform(0, 1)
+                delay = base_delay + jitter * ([1, 1, 5][attempt])
+                logging.warning(f"Attempt {attempt + 1} failed due to {type(e).__name__}: {e}. "
+                                f"Retrying in {delay:.2f}s...")
+                time.sleep(delay)
+            else:
+                logging.error(f"All retry attempts failed for {url}. Last error: {e}")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Request failed: {e}")
+            raise
 
-def get_advanced_ai_config(config_name, provider_name="google_vision"):
+    if last_exception:
+        raise last_exception
+    return None
+
+# ============================================================================
+# CONFIGURATION LOADING
+# ============================================================================
+
+def get_advanced_ai_config(config_name, provider_name="gcp"):
     """
-    Load AI configuration for both Google Vision and Video Intelligence.
+    Load unified AI configuration for both Google Vision and Video Intelligence.
     Returns normalized config dict with provider-specific settings.
     """
     admin_dropbox = get_admin_dropbox_path()
     if not admin_dropbox:
-        return {}
+        return None
 
     provider_key = provider_name.lower()
 
@@ -232,75 +229,70 @@ def get_advanced_ai_config(config_name, provider_name="google_vision"):
                     
                     # Map input keys to canonical keys (strip optional provider_ prefix)
                     for key, val in raw.items():
-                        clean_key = key[len(provider_key) + 1:] if key.startswith(provider_key + "_") else key
-                        logging.debug(f"DEBUG RAW: key='{key}', clean_key='{clean_key}', val={val}, type={type(val)}")
+                        clean_key = key
+                        if key.startswith(f"{provider_key}_"):
+                            clean_key = key[len(provider_key) + 1:]
                         
-                        # Google Vision config keys
-                        vision_keys = {
-                            "gcp_vision_ai_enabled", "features", "max_results_per_feature",
-                            "language_hints", "web_max_pages", "product_search_index"
-                        }
-                        
-                        # Video Intelligence config keys
-                        video_keys = {
-                            "gcp_video_intelligence_enabled", "features", "gcs_bucket_name",
-                            "gcs_upload_prefix", "language_code", "speech_contexts",
-                            "enable_automatic_punctuation", "enable_speaker_diarization",
-                            "diarization_speaker_count", "max_alternatives", "filter_profanity",
-                            "audio_tracks", "model", "max_file_size_for_inline"
-                        }
-                        
-                        # Accept keys for either provider
-                        if clean_key in vision_keys or clean_key in video_keys:
+                        # Accept keys for both Vision AI and Video Intelligence
+                        if clean_key.startswith("vision_") or clean_key.startswith("video_intelligence_") or \
+                           clean_key.startswith("video_") or clean_key in {
+                            "vision_ai_enabled", "video_intelligence_enabled", 
+                            "vision_features", "video_intelligence_features",
+                            "vision_max_results_per_feature", "video_gcs_upload_prefix",
+                            "video_max_file_size_for_inline", "video_language_code",
+                            "video_enable_automatic_punctuation", "video_enable_speaker_diarization",
+                            "video_filter_profanity", "video_speech_contexts", "video_model"
+                        }:
                             out[clean_key] = val
 
-                    logging.debug(f"Generated config dictionary: {out}")
+                    # Normalize boolean flags
+                    for bool_key in ["vision_ai_enabled", "video_intelligence_enabled", 
+                                     "video_enable_automatic_punctuation", "video_enable_speaker_diarization", 
+                                     "video_filter_profanity"]:
+                        if bool_key in out:
+                            v = out[bool_key]
+                            out[bool_key] = v if isinstance(v, bool) else str(v).lower() in ("true", "1", "yes", "on")
 
-                    # Normalize enabled flags (both providers)
-                    for flag_key in ["gcp_vision_ai_enabled", "gcp_video_intelligence_enabled"]:
-                        if flag_key in out:
-                            v = out[flag_key]
-                            if isinstance(v, bool):
-                                out[flag_key] = v
-                            else:
-                                out[flag_key] = str(v).lower() in ("true", "1", "yes", "on")
-                            logging.info(f"DEBUG: {flag_key} = {out[flag_key]} (type: {type(out[flag_key])})")
-
-                    # Normalize features list (handle both Vision and Video Intelligence)
-                    if "features" in out:
-                        feats = out["features"]
+                    # Normalize Vision features
+                    if "vision_features" in out:
+                        feats = out["vision_features"]
                         if isinstance(feats, str):
                             feats = [x.strip() for x in feats.split(",") if x.strip()]
-                        cleaned_features = []
-                        for f in feats:
-                            if isinstance(f, str):
-                                f_lower = f.lower()
-                                # Strip common redundant prefixes from feature names
-                                for prefix in ["google_vision_", "google_video_intelligence_", 
-                                             "gcp_vision_", "gcp_video_", "provider_", "vision_", "video_"]:
-                                    if f_lower.startswith(prefix):
-                                        f = f[len(prefix):]
-                                        break
-                                cleaned_features.append(f.upper())
-                            else:
-                                cleaned_features.append(f)
-                        out["features"] = cleaned_features
+                        out["vision_features"] = [
+                            f.upper() if isinstance(f, str) else f for f in feats
+                        ]
+
+                    # Normalize Video Intelligence features
+                    if "video_intelligence_features" in out:
+                        feats = out["video_intelligence_features"]
+                        if isinstance(feats, str):
+                            feats = [x.strip() for x in feats.split(",") if x.strip()]
+                        out["video_intelligence_features"] = [
+                            f.upper() if isinstance(f, str) else f for f in feats
+                        ]
+
+                    # Normalize speech_contexts
+                    if "video_speech_contexts" in out and isinstance(out["video_speech_contexts"], str):
+                        try:
+                            out["video_speech_contexts"] = json.loads(out["video_speech_contexts"])
+                        except:
+                            out["video_speech_contexts"] = []
 
                     # Normalize numeric fields
-                    for num_field in ["max_results_per_feature", "max_file_size_for_inline"]:
-                        if num_field in out:
+                    for num_key in ["vision_max_results_per_feature", "video_max_file_size_for_inline"]:
+                        if num_key in out and isinstance(out[num_key], str):
                             try:
-                                out[num_field] = int(out[num_field])
-                            except (ValueError, TypeError):
-                                pass
+                                out[num_key] = float(out[num_key]) if '.' in out[num_key] else int(out[num_key])
+                            except ValueError:
+                                del out[num_key]
 
-                    logging.info(f"Loaded and normalized GCP AI config from: {src}")
+                    logging.info(f"Loaded and normalized advanced AI config from: {src}")
                     return out
 
             except Exception as e:
                 logging.error(f"Failed to load {src}: {e}")
 
-    return {}
+    return None
 
 def get_node_api_key():
     api_key = ""
@@ -348,13 +340,12 @@ def get_gcp_credentials(config):
         return None
 
 # ============================================================================
-# GCS Storage Functions with Multipart Upload Support
+# GCS STORAGE FUNCTIONS
 # ============================================================================
 
 def upload_to_gcs(credentials, bucket_name, source_path, gcs_path, use_multipart=True):
     """
     Upload file to Google Cloud Storage with optional multipart upload for large files.
-    Multipart upload provides better performance and resumability for large files.
     """
     try:
         storage_client = storage.Client(credentials=credentials)
@@ -366,30 +357,23 @@ def upload_to_gcs(credentials, bucket_name, source_path, gcs_path, use_multipart
         
         # Use multipart upload for files larger than chunk size
         if use_multipart and file_size > MULTIPART_CHUNK_SIZE:
-            logging.info(f"Using multipart upload with {MULTIPART_CHUNK_SIZE / 1024 / 1024:.0f}MB chunks")
-            
-            # Configure resumable upload with chunk size
             blob.chunk_size = MULTIPART_CHUNK_SIZE
-            
-            # Upload with progress tracking
-            with open(source_path, 'rb') as f:
-                total_chunks = (file_size + MULTIPART_CHUNK_SIZE - 1) // MULTIPART_CHUNK_SIZE
-                
-                # Use resumable upload
-                blob.upload_from_file(f, rewind=True, checksum='md5')
-                
-            logging.info(f"Multipart upload completed")
-        else:
-            # Standard upload for smaller files
-            blob.upload_from_filename(source_path)
-            logging.info(f"Standard upload completed")
+            logging.debug(f"Using multipart upload with chunk size: {MULTIPART_CHUNK_SIZE / 1024 / 1024:.2f} MB")
+        
+        blob.upload_from_filename(source_path)
         
         gcs_uri = f"gs://{bucket_name}/{gcs_path}"
-        logging.info(f"Successfully uploaded to {gcs_uri}")
+        logging.info(f"Upload successful: {gcs_uri}")
         return gcs_uri
         
+    except google_exceptions.NotFound as e:
+        logging.error(f"Bucket not found: {bucket_name}")
+        return None
+    except google_exceptions.Forbidden as e:
+        logging.error(f"Access denied to bucket: {bucket_name}")
+        return None
     except Exception as e:
-        logging.error(f"Failed to upload to GCS: {e}")
+        logging.error(f"GCS upload failed: {e}")
         return None
 
 def delete_from_gcs(credentials, bucket_name, gcs_path):
@@ -402,24 +386,282 @@ def delete_from_gcs(credentials, bucket_name, gcs_path):
         logging.info(f"Deleted gs://{bucket_name}/{gcs_path}")
         return True
     except Exception as e:
-        logging.error(f"Failed to delete from GCS: {e}")
+        logging.warning(f"Failed to delete GCS file: {e}")
         return False
 
 # ============================================================================
-# Google Vision Functions
+# CATALOG API FUNCTIONS
 # ============================================================================
 
-def serialize_vision_result(response):
-    return MessageToDict(
-        response._pb,
-        preserving_proto_field_name=True,
-        always_print_fields_with_no_presence=True,
+def update_catalog(repo_guid, file_path, operation_name_or_data):
+    """Update catalog with provider data (operation name for video, or bucket info for original upload)"""
+    url = "http://127.0.0.1:5080/catalogs/providerData"
+    node_api_key = get_node_api_key()
+    headers = {
+        "apikey": node_api_key,
+        "Content-Type": "application/json"
+    }
+    
+    # Handle both operation name (string) and full provider data (dict)
+    if isinstance(operation_name_or_data, str):
+        provider_data = {"operation_name": operation_name_or_data}
+    else:
+        provider_data = operation_name_or_data
+    
+    payload = {
+        "repoGuid": repo_guid,
+        "fileName": os.path.basename(file_path),
+        "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
+        "providerName": "gcp_media",
+        "providerData": provider_data
+    }
+    
+    max_attempts = 5
+    for attempt in range(max_attempts):
+        try:
+            logging.debug(f"[Attempt {attempt+1}/{max_attempts}] Starting catalog update request to {url}")
+            response = make_request_with_retries("POST", url, headers=headers, json=payload)
+            if response is None:
+                logging.error(f"[Attempt {attempt+1}] Response is None!")
+                time.sleep(5)
+                continue
+            
+            try:
+                resp_json = response.json() if response.text.strip() else {}
+            except Exception as e:
+                logging.warning(f"Failed to parse response JSON: {e}")
+                resp_json = {}
+            
+            if response.status_code in (200, 201):
+                logging.info("Catalog updated successfully.")
+                return True
+            
+            if response.status_code == 404:
+                logging.info("[404 DETECTED] Entering 404 handling block")
+                message = resp_json.get('message', '')
+                logging.debug(f"[404] Raw message from response: [{repr(message)}]")
+                clean_message = message.strip().lower()
+                logging.debug(f"[404] Cleaned message: [{repr(clean_message)}]")
+
+                if clean_message == "catalog item not found":
+                    wait_time = 60 + (attempt * 10)
+                    logging.warning(f"[404] Known 'not found' case. Waiting {wait_time} seconds before retry...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logging.error(f"[404] Unexpected message: {message}")
+                    break
+            else:
+                logging.warning(f"[Attempt {attempt+1}] Non-404 error status: {response.status_code}")
+
+        except Exception as e:
+            logging.exception(f"[Attempt {attempt+1}] Unexpected exception in update_catalog: {e}")
+        
+        if attempt < max_attempts - 1:
+            fallback_delay = 5 + attempt * 2
+            logging.debug(f"Sleeping {fallback_delay}s before next attempt")
+            time.sleep(fallback_delay)
+
+    return False
+
+def send_extracted_metadata(config, repo_guid, file_path, rawMetadataFilePath, normMetadataFilePath=None, max_attempts=3):
+    """Send extracted metadata paths to catalog API"""
+    url = "http://127.0.0.1:5080/catalogs/extendedMetadata"
+    node_api_key = get_node_api_key()
+    headers = {"apikey": node_api_key, "Content-Type": "application/json"}
+
+    metadata_array = []
+    if normMetadataFilePath is not None:
+        metadata_array.append({
+            "type": "metadataFilePath",
+            "path": normMetadataFilePath
+        })
+    if rawMetadataFilePath is not None:
+        metadata_array.append({
+            "type": "metadataRawJsonFilePath", 
+            "path": rawMetadataFilePath
+        })
+
+    payload = {
+        "repoGuid": repo_guid,
+        "providerName": config.get("provider", "gcp_media"),
+        "sourceLanguage": "Default",
+        "extendedMetadata": [{
+            "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
+            "fileName": os.path.basename(file_path),
+            "metadata": metadata_array
+        }]
+    }
+    
+    for attempt in range(max_attempts):
+        try:
+            r = make_request_with_retries("POST", url, headers=headers, json=payload)
+            if r and r.status_code in (200, 201):
+                return True
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to send metadata after 3 attempts: {e}")
+                raise
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return False
+
+def send_ai_enriched_metadata(config, repo_guid, file_path, enrichedMetadata, max_attempts=3):
+    """Send AI enriched metadata to catalog API"""
+    url = "http://127.0.0.1:5080/catalogs/aiEnrichedMetadata/add"
+    node_api_key = get_node_api_key()
+    headers = {"apikey": node_api_key, "Content-Type": "application/json"}
+    payload = {
+        "repoGuid": repo_guid,
+        "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
+        "fileName": os.path.basename(file_path),
+        "providerName": config.get("provider", "gcp_media"),
+        "sourceLanguage": "Default",
+        "normalizedMetadata": enrichedMetadata
+    }
+
+    for attempt in range(max_attempts):
+        try:
+            r = make_request_with_retries("POST", url, headers=headers, json=payload)
+            if r and r.status_code in (200, 201):
+                return True
+        except Exception as e:
+            if attempt == 2:
+                logging.critical(f"Failed to send metadata after 3 attempts: {e}")
+                raise
+            base_delay = [1, 3, 10][attempt]
+            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
+            time.sleep(delay)
+    return False
+
+# ============================================================================
+# METADATA PROCESSING
+# ============================================================================
+
+def store_metadata_file(config, repo_guid, file_path, metadata, max_attempts=3):
+    """Store metadata files (raw and normalized) in configured paths"""
+    meta_path, proxy_path = get_store_paths()
+    if not meta_path:
+        logging.error("Metadata Store settings not found.")
+        return None, None
+
+    provider = config.get("provider", "gcp_media")
+    base = os.path.splitext(os.path.basename(file_path))[0]
+    repo_guid_str = str(repo_guid)
+
+    # Split meta_path at /./
+    if "/./" in meta_path:
+        meta_left, meta_right = meta_path.split("/./", 1)
+    else:
+        meta_left, meta_right = meta_path, ""
+
+    meta_left = meta_left.rstrip("/")
+
+    # Build physical path
+    metadata_dir = os.path.join(meta_left, meta_right, repo_guid_str, file_path, provider)
+    os.makedirs(metadata_dir, exist_ok=True)
+
+    # Full local physical paths
+    raw_json = os.path.join(metadata_dir, f"{base}_raw.json")
+    norm_json = os.path.join(metadata_dir, f"{base}_norm.json")
+
+    # Returned paths (AFTER /./)
+    raw_return = os.path.join(meta_right, repo_guid_str, file_path, provider, f"{base}_raw.json")
+    norm_return = os.path.join(meta_right, repo_guid_str, file_path, provider, f"{base}_norm.json")
+
+    raw_success = False
+    norm_success = False
+
+    # Write metadata with retry
+    for attempt in range(max_attempts):
+        try:
+            # RAW write
+            with open(raw_json, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2, default=str)
+            raw_success = True
+
+            # NORMALIZED write
+            if not get_normalized_metadata(raw_json, norm_json):
+                logging.error("Normalization failed.")
+                norm_success = False
+            else:
+                norm_success = True
+
+            break
+
+        except Exception as e:
+            logging.warning(f"Metadata write failed (Attempt {attempt+1}): {e}")
+            if attempt < max_attempts - 1:
+                time.sleep([1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt]))
+
+    return (
+        raw_return if raw_success else None,
+        norm_return if norm_success else None
     )
+
+def get_normalized_metadata(raw_json_path, normalized_json_path):
+    """Run normalizer script to convert raw metadata to normalized format"""
+    if not os.path.exists(NORMALIZER_SCRIPT_PATH):
+        logging.error(f"Normalizer script not found: {NORMALIZER_SCRIPT_PATH}")
+        return False
+
+    try:
+        result = subprocess.run(
+            [sys.executable, NORMALIZER_SCRIPT_PATH, raw_json_path, normalized_json_path],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        if result.returncode == 0:
+            logging.info("Metadata normalization successful")
+            return True
+        else:
+            logging.error(f"Normalizer failed: {result.stderr}")
+            return False
+            
+    except subprocess.TimeoutExpired:
+        logging.error("Normalizer timed out")
+        return False
+    except Exception as e:
+        logging.error(f"Error running normalizer: {e}")
+        return False
+
+def transform_normlized_to_enriched(normalized_json_path, enrich_prefix=None):
+    """Transform normalized metadata into enriched format for AI services"""
+    try:
+        with open(normalized_json_path, 'r', encoding='utf-8') as f:
+            normalized_data = json.load(f)
+    except Exception as e:
+        return f"Failed to read normalized metadata: {e}", False
+
+    if not isinstance(normalized_data, dict):
+        return "Normalized metadata is not a dictionary", False
+
+    enriched_metadata = []
+    prefix = enrich_prefix if enrich_prefix else "gcp_media"
+
+    for event_type, event_key in SDNA_EVENT_MAP.items():
+        if event_key in normalized_data and normalized_data[event_key]:
+            enriched_metadata.append({
+                "sdnaEventType": f"{prefix}_{event_key}",
+                "data": normalized_data[event_key]
+            })
+
+    if not enriched_metadata:
+        return "No enrichment data generated", False
+
+    return enriched_metadata, True
+
+# ============================================================================
+# GOOGLE VISION AI (IMAGE ANALYSIS)
+# ============================================================================
 
 def get_vision_feature_list(ai_config):
     """Get list of Vision API features to request"""
     ai_config = ai_config or {}
-    enabled = bool(ai_config.get("gcp_vision_ai_enabled", False))
+    enabled = bool(ai_config.get("vision_ai_enabled", False))
     if not enabled:
         logging.info("GCP Vision AI not enabled in ai_config; skipping feature extraction")
         return []
@@ -440,13 +682,13 @@ def get_vision_feature_list(ai_config):
         "PRODUCT_SEARCH": vision.Feature.Type.PRODUCT_SEARCH
     }
 
-    requested_features = ai_config.get("features", [])
+    requested_features = ai_config.get("vision_features", [])
     # Empty list → use all features
     if isinstance(requested_features, list) and len(requested_features) == 0:
         requested_features = list(feature_map.keys())
 
     features = []
-    max_results = ai_config.get("max_results_per_feature", 100)
+    max_results = ai_config.get("vision_max_results_per_feature", 100)
     for feat_name in requested_features:
         if feat_name in feature_map:
             features.append(vision.Feature(type_=feature_map[feat_name], max_results=max_results))
@@ -564,7 +806,7 @@ def analyze_image_gcp(config, image_data, ai_config, max_retries=3):
     return merged_result
 
 # ============================================================================
-# Video Intelligence Functions
+# GOOGLE VIDEO INTELLIGENCE
 # ============================================================================
 
 def merge_annotation_results(annotation_results):
@@ -599,7 +841,6 @@ def merge_annotation_results(annotation_results):
             if field in result and result[field]:
                 if field not in merged:
                     merged[field] = []
-                # Only add non-empty items
                 merged[field].extend(result[field])
         
         # Merge object fields (take non-empty one)
@@ -624,12 +865,12 @@ def merge_annotation_results(annotation_results):
 def get_video_feature_list(ai_config):
     """Get list of Video Intelligence features to request"""
     ai_config = ai_config or {}
-    enabled = bool(ai_config.get("gcp_video_intelligence_enabled", False))
+    enabled = bool(ai_config.get("video_intelligence_enabled", False))
     if not enabled:
         logging.info("GCP Video Intelligence not enabled in ai_config; skipping feature extraction")
         return []
 
-    requested_features = ai_config.get("features", [])
+    requested_features = ai_config.get("video_intelligence_features", [])
     
     # Empty list means use all features
     if isinstance(requested_features, list) and len(requested_features) == 0:
@@ -655,37 +896,37 @@ def build_video_context(ai_config, features):
     # Speech transcription config
     if videointelligence.Feature.SPEECH_TRANSCRIPTION in features:
         speech_config = videointelligence.SpeechTranscriptionConfig()
-        speech_config.language_code = ai_config.get("language_code", "en-US")
+        speech_config.language_code = ai_config.get("video_language_code", "en-US")
         
         # Set automatic punctuation if requested
-        if ai_config.get("enable_automatic_punctuation", False):
+        if ai_config.get("video_enable_automatic_punctuation", False):
             speech_config.enable_automatic_punctuation = True
         
         # Set speaker diarization if requested
-        if ai_config.get("enable_speaker_diarization", False):
+        if ai_config.get("video_enable_speaker_diarization", False):
             speech_config.enable_speaker_diarization = True
             # Optionally set speaker count
-            speaker_count = ai_config.get("diarization_speaker_count")
+            speaker_count = ai_config.get("video_diarization_speaker_count")
             if speaker_count:
                 speech_config.diarization_speaker_count = int(speaker_count)
         
         # Set max alternatives if specified
-        max_alternatives = ai_config.get("max_alternatives")
+        max_alternatives = ai_config.get("video_max_alternatives")
         if max_alternatives:
             speech_config.max_alternatives = int(max_alternatives)
         
         # Set filter profanity if requested
-        if ai_config.get("filter_profanity", False):
+        if ai_config.get("video_filter_profanity", False):
             speech_config.filter_profanity = True
         
         # Add audio tracks if specified
-        audio_tracks = ai_config.get("audio_tracks", [])
+        audio_tracks = ai_config.get("video_audio_tracks", [])
         if audio_tracks:
             for track in audio_tracks:
                 speech_config.audio_tracks.append(int(track))
         
         # Add speech contexts if provided
-        speech_contexts = ai_config.get("speech_contexts", [])
+        speech_contexts = ai_config.get("video_speech_contexts", [])
         if speech_contexts:
             for ctx in speech_contexts:
                 speech_context = videointelligence.SpeechContext()
@@ -715,90 +956,30 @@ def build_video_context(ai_config, features):
     # Text detection config
     if videointelligence.Feature.TEXT_DETECTION in features:
         text_config = videointelligence.TextDetectionConfig()
-        text_config.language_hints.append(ai_config.get("language_code", "en-US"))
+        text_config.language_hints.append(ai_config.get("video_language_code", "en-US"))
         video_context.text_detection_config = text_config
     
     # Object tracking config
     if videointelligence.Feature.OBJECT_TRACKING in features:
         object_config = videointelligence.ObjectTrackingConfig()
-        object_config.model = ai_config.get("model", "builtin/stable")
+        object_config.model = ai_config.get("video_model", "builtin/stable")
         video_context.object_tracking_config = object_config
     
     return video_context
-
-def store_metadata_file(config, repo_guid, file_path, metadata, max_attempts=3):
-    """Store metadata files (raw and normalized) in configured paths"""
-    meta_path, proxy_path = get_store_paths()
-    if not meta_path:
-        logging.error("Metadata Store settings not found.")
-        return None, None
-
-    provider = config.get("provider", "gcp_video_intelligence")
-    base = os.path.splitext(os.path.basename(file_path))[0]
-    repo_guid_str = str(repo_guid)
-
-    # Split meta_path at /./
-    if "/./" in meta_path:
-        meta_left, meta_right = meta_path.split("/./", 1)
-    else:
-        meta_left, meta_right = meta_path, ""
-
-    meta_left = meta_left.rstrip("/")
-
-    # Build PHYSICAL PATH (local disk path) meta_left/meta_right/repo_guid/file_path/provider
-    metadata_dir = os.path.join(meta_left, meta_right, repo_guid_str, file_path, provider)
-    os.makedirs(metadata_dir, exist_ok=True)
-
-    # Full local physical paths
-    raw_json = os.path.join(metadata_dir, f"{base}_raw.json")
-    norm_json = os.path.join(metadata_dir, f"{base}_norm.json")
-
-    # Returned paths (AFTER /./) meta_right/repo_guid/file_path/provider/file.json
-    raw_return = os.path.join(meta_right, repo_guid_str, file_path, provider, f"{base}_raw.json")
-    norm_return = os.path.join(meta_right, repo_guid_str, file_path, provider, f"{base}_norm.json")
-
-    raw_success = False
-    norm_success = False
-
-    # Write metadata with retry
-    for attempt in range(max_attempts):
-        try:
-            # RAW write
-            with open(raw_json, "w", encoding="utf-8") as f:
-                json.dump(metadata, f, ensure_ascii=False, indent=4)
-            raw_success = True
-
-            # NORMALIZED write
-            if not get_normalized_metadata(raw_json, norm_json):
-                logging.error("Normalization failed.")
-                norm_success = False
-            else:
-                norm_success = True
-
-            break  # No need for more retries
-
-        except Exception as e:
-            logging.warning(f"Metadata write failed (Attempt {attempt+1}): {e}")
-            if attempt < max_attempts - 1:
-                time.sleep([1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt]))
-
-    # Return results
-    return (
-        raw_return if raw_success else None,
-        norm_return if norm_success else None
-    )
 
 def start_video_analysis(config, video_path_or_uri, ai_config, use_gcs_uri=False, max_retries=3):
     """Start video analysis job and return operation handle"""
     credentials = get_gcp_credentials(config)
     if not credentials:
-        fail("Failed to get GCP credentials", 5)
+        logging.error("Failed to get GCP credentials")
+        sys.exit(5)
     
     video_client = videointelligence.VideoIntelligenceServiceClient(credentials=credentials)
     features = get_video_feature_list(ai_config)
     
     if not features:
-        fail("No valid features configured for analysis", 1)
+        logging.error("No valid features configured for analysis")
+        sys.exit(1)
     
     # Prepare input
     request = {
@@ -811,10 +992,11 @@ def start_video_analysis(config, video_path_or_uri, ai_config, use_gcs_uri=False
         logging.info(f"Using GCS URI: {video_path_or_uri}")
     else:
         file_size = os.path.getsize(video_path_or_uri)
-        max_inline = ai_config.get("max_file_size_for_inline", 10 * 1024 * 1024)
+        max_inline = ai_config.get("video_max_file_size_for_inline", 10 * 1024 * 1024)
         
         if file_size > max_inline:
-            fail(f"File too large ({file_size} bytes). Upload to GCS first.", 4)
+            logging.error(f"File too large ({file_size} bytes). Upload to GCS first.")
+            sys.exit(4)
         
         with open(video_path_or_uri, "rb") as f:
             request["input_content"] = f.read()
@@ -829,19 +1011,22 @@ def start_video_analysis(config, video_path_or_uri, ai_config, use_gcs_uri=False
             
         except (google_exceptions.ResourceExhausted, google_exceptions.RetryError) as e:
             if attempt == max_retries - 1:
-                fail(f"Failed after {max_retries} attempts: {e}", 10)
+                logging.error(f"Failed after {max_retries} attempts: {e}")
+                sys.exit(10)
             wait = (attempt + 1) * 10 + random.uniform(0, 5)
             logging.warning(f"Quota error, retrying in {wait:.1f}s...")
             time.sleep(wait)
             
         except Exception as e:
             if attempt == max_retries - 1:
-                fail(f"Failed to start analysis: {e}", 10)
+                logging.error(f"Failed to start analysis: {e}")
+                sys.exit(10)
             delay = (2 ** attempt) + random.uniform(0, 2)
             logging.warning(f"Retrying in {delay:.1f}s...")
             time.sleep(delay)
     
-    fail("Failed to start video analysis", 10)
+    logging.error("Failed to start video analysis")
+    sys.exit(10)
 
 def poll_video_analysis(operation, timeout_minutes=15):
     """
@@ -872,10 +1057,6 @@ def poll_video_analysis(operation, timeout_minutes=15):
                     logging.info(f"Merging {len(annotations)} annotation results...")
                     serialized["annotation_results"] = [merge_annotation_results(annotations)]
                 
-                # Log detected features
-                if annotations:
-                    log_detected_features(annotations[0])
-                
                 logging.info(f"Analysis completed in {elapsed}s")
                 return serialized
             
@@ -897,276 +1078,113 @@ def poll_video_analysis(operation, timeout_minutes=15):
     # Timeout reached - job still running, exit with code 7 and operation name
     operation_name = operation.operation.name
     logging.error(f"Timeout after {timeout_minutes}m - job still indexing")
-    logging.info(f"Operation name: {operation_name}")
-    fail(operation_name, 7)
+    print(f"Metadata extraction failed for asset: {operation_name}")
+    sys.exit(7)
 
-def log_detected_features(video_result):
-    """Log summary of detected features in video result"""
-    features = []
-    
-    feature_map = {
-        "segment_label_annotations": "Labels",
-        "shot_annotations": "Shots",
-        "explicit_annotation": "Explicit Content",
-        "speech_transcriptions": "Transcriptions",
-        "text_annotations": "Text",
-        "object_annotations": "Objects",
-        "logo_recognition_annotations": "Logos",
-        "face_detection_annotations": "Faces",
-        "person_detection_annotations": "Persons"
-    }
-    
-    for key, label in feature_map.items():
-        value = video_result.get(key)
-        if value:
-            count = len(value) if isinstance(value, list) else ""
-            features.append(f"{label}: {count}".strip(": "))
-    
-    if features:
-        logging.info(f"Detected: {', '.join(features)}")
-
-# ============================================================================
-# Metadata Conversion and Enrichment Functions
-# ============================================================================
-
-def get_normalized_metadata(raw_metadata_file_path, norm_metadata_file_path):
-    """Call normalizer script to convert raw metadata to normalized format"""
-    if not os.path.exists(NORMALIZER_SCRIPT_PATH):
-        logging.error(f"Normalizer script not found: {NORMALIZER_SCRIPT_PATH}")
-        return False
+def retrieve_operation_result(config, operation_name, timeout_minutes=15):
+    """Retrieve and poll an existing operation by name"""
+    credentials = get_gcp_credentials(config)
+    if not credentials:
+        logging.error("Failed to get GCP credentials")
+        sys.exit(5)
     
     try:
-        process = subprocess.run(
-            ["python3", NORMALIZER_SCRIPT_PATH, "-i", raw_metadata_file_path, "-o", norm_metadata_file_path],
-            check=True
+        operations_client = operations_v1.OperationsClient(
+            channel=videointelligence.VideoIntelligenceServiceClient(credentials=credentials).transport.operations_client.transport.channel
         )
-        if process.returncode == 0:
-            return True
-        else:
-            logging.error(f"Normalizer script failed with return code: {process.returncode}")
-            return False
+        
+        operation = gapic_operation.Operation(
+            operation=operations_client.get_operation(name=operation_name),
+            refresh=operations_client.get_operation,
+            cancel=operations_client.cancel_operation,
+            result_type=videointelligence.AnnotateVideoResponse
+        )
+        
+        logging.info(f"Retrieved operation: {operation_name}")
+        return poll_video_analysis(operation, timeout_minutes)
+        
     except Exception as e:
-        logging.error(f"Error normalizing metadata: {e}")
-        return False
-    
-def transform_normlized_to_enriched(norm_metadata_file_path, enrich_prefix):
-    """
-    Transform normalized metadata to enriched format with prefix.
-    enrich_prefix: "vid" for video, or other custom prefix from --enrich-prefix arg
-    """
-    try:
-        with open(norm_metadata_file_path, "r") as f:
-            data = json.load(f)
-        result = []
-        for event_type, detections in data.items():
-            sdna_event_type = SDNA_EVENT_MAP.get(event_type, 'unknown')
-            for detection in detections:
-                occurrences = detection.get("occurrences", [])
-                event_obj = {
-                    "eventType": event_type,
-                    "sdnaEventType": sdna_event_type,
-                    "sdnaEventTypePrefix": enrich_prefix,
-                    "eventValue": detection.get("value", ""),
-                    "totalOccurrences": len(occurrences),
-                    "eventOccurence": occurrences
-                }
-                result.append(event_obj)
-        return result, True
-    except Exception as e:
-        return f"Error during transformation: {e}", False
+        logging.error(f"Failed to retrieve operation: {e}")
+        sys.exit(10)
 
 # ============================================================================
-# Catalog and Metadata Update Functions
+# MAIN EXECUTION
 # ============================================================================
 
-def update_catalog(repo_guid, file_path, media_uri, max_attempts=3):
-    """Update catalog with provider data (operation name or asset ID)"""
-    url = "http://127.0.0.1:5080/catalogs/providerData"
-    node_api_key = get_node_api_key()
-    headers = {
-        "apikey": node_api_key,
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "repoGuid": repo_guid,
-        "fileName": os.path.basename(file_path),
-        "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
-        "providerName": cloud_config_data.get("provider", "gcp_media_intelligence"),
-        "providerData": {
-            "assetId": media_uri
-        }
-    }
-
-    for attempt in range(max_attempts):
-        try:
-            response = make_request_with_retries("POST", url, headers=headers, json=payload)
-            if response and response.status_code in (200, 201):
-                logging.info(f"Catalog updated successfully: {response.text}")
-                return True
-            else:
-                logging.warning(f"Catalog update failed (status {response.status_code if response else 'No response'}): {response.text if response else ''}")
-        except Exception as e:
-            logging.warning(f"Catalog update attempt {attempt + 1} failed: {e}")
-        if attempt < max_attempts - 1:
-            delay = [1, 3, 10][attempt] + random.uniform(0, 1)
-            time.sleep(delay)
-    logging.error("Catalog update failed after retries.")
-    return False
-
-def send_extracted_metadata(config, repo_guid, file_path, rawMetadataFilePath, normMetadataFilePath=None, max_attempts=3):
-    """Send extracted metadata paths to catalog"""
-    url = "http://127.0.0.1:5080/catalogs/extendedMetadata"
-    node_api_key = get_node_api_key()
-    headers = {"apikey": node_api_key, "Content-Type": "application/json"}
-    payload = {
-        "repoGuid": repo_guid,
-        "providerName": config.get("provider", "gcp_media_intelligence"),
-        "sourceLanguage": "Default",
-        "extendedMetadata": [{
-            "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
-            "fileName": os.path.basename(file_path)
-        }]
-    }
-    if rawMetadataFilePath is not None:
-        payload["extendedMetadata"][0]["metadataRawJsonFilePath"] = rawMetadataFilePath
-    if normMetadataFilePath is not None:
-        payload["extendedMetadata"][0]["metadataFilePath"] = normMetadataFilePath
-    for attempt in range(max_attempts):
-        try:
-            r = make_request_with_retries("POST", url, headers=headers, json=payload)
-            if r and r.status_code in (200, 201):
-                return True
-        except Exception as e:
-            if attempt == 2:
-                logging.critical(f"Failed to send metadata after 3 attempts: {e}")
-                raise
-            base_delay = [1, 3, 10][attempt]
-            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
-            time.sleep(delay)
-    return False
-
-def send_ai_enriched_metadata(config, repo_guid, file_path, enrichedMetadata, max_attempts=3):
-    """Send AI enriched metadata to catalog"""
-    url = "http://127.0.0.1:5080/catalogs/aiEnrichedMetadata"
-    node_api_key = get_node_api_key()
-    headers = {"apikey": node_api_key, "Content-Type": "application/json"}
-    payload = {
-        "repoGuid": repo_guid,
-        "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
-        "fileName": os.path.basename(file_path),
-        "providerName": config.get("provider", "gcp_media_intelligence"),
-        "sourceLanguage": "Default",
-        "normalizedMetadata": enrichedMetadata
-    }
-
-    for attempt in range(max_attempts):
-        try:
-            r = make_request_with_retries("POST", url, headers=headers, json=payload)
-            if r and r.status_code in (200, 201):
-                return True
-        except Exception as e:
-            if attempt == 2:
-                logging.critical(f"Failed to send metadata after 3 attempts: {e}")
-                raise
-            base_delay = [1, 3, 10][attempt]
-            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
-            time.sleep(delay)
-    return False
-
-# ============================================================================
-# Main Entry Point
-# ============================================================================
-
-if __name__ == "__main__":
-    time.sleep(random.uniform(0.0, 0.5))
-
-    parser = argparse.ArgumentParser(description="GCP Media Intelligence - Unified Vision & Video Processing")
-    parser.add_argument("-m", "--mode", required=True, choices=VALID_MODES,
-                       help="Processing mode: proxy, original, analyze_and_embed, send_extracted_metadata")
-    parser.add_argument("-c", "--config-name", required=True, help="Cloud configuration name")
-    parser.add_argument("-sp", "--source-path", help="Source file path (image or video)")
-    parser.add_argument("-b", "--bucket-name", help="GCS bucket name for video upload")
-    parser.add_argument("-up", "--upload-path", help="Path where file will be uploaded in GCS bucket")
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-m", "--mode", required=True, help="mode of Operation: proxy, original, get_base_target, send_extracted_metadata, analyze_and_embed")
+    parser.add_argument("-c", "--config-name", required=True, help="name of cloud configuration")
+    parser.add_argument("-j", "--job-guid", help="Job Guid of SDNA job")
+    parser.add_argument("-b", "--bucket-name", help="Name of GCS Bucket")
+    parser.add_argument("-id", "--asset-id", help="Asset ID or operation name for metadata operations")
     parser.add_argument("-cp", "--catalog-path", help="Path where catalog resides")
-    parser.add_argument("-mp", "--metadata-file", help="Path where property bag for file resides")
-    parser.add_argument("-o", "--output-path", help="Temporary output path for analysis and embedding JSON (Vision mode)")
+    parser.add_argument("-sp", "--source-path", help="Source path of file to look for upload")
+    parser.add_argument("-up", "--upload-path", help="Path where file will be uploaded to GCS")
+    parser.add_argument("-sl", "--size-limit", help="source file size limit for original file upload")
     parser.add_argument("-r", "--repo-guid", help="Repository GUID for catalog update")
-    parser.add_argument("-j", "--job-guid", help="Job GUID of SDNA job")
-    parser.add_argument("-a", "--asset-id", help="Operation name for polling or asset ID for error tracking")
-    parser.add_argument("-sl", "--size-limit", help="Source file size limit for original file upload")
-    parser.add_argument("--enrich-prefix", default="vid", 
-                       help="Prefix for sdnaEventType of AI enrich data (e.g., 'vid' for video)")
+    parser.add_argument("-o", "--output-path", help="Path where output will be saved")
+    parser.add_argument("--enrich-prefix", help="Prefix to add for sdnaEventType of AI enrich data")
+    parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without uploading")
     parser.add_argument("--log-level", default="debug", help="Logging level")
-    parser.add_argument("--controller-address", help="Link IP/Hostname Port")
-    parser.add_argument("--export-ai-metadata", help="Export AI metadata")
-    parser.add_argument("--dry-run", action="store_true", help="Dry run mode")
     args = parser.parse_args()
 
     setup_logging(args.log_level)
-    
-    # Load cloud configuration
-    config_path = get_config_path()
-    cloud_config = ConfigParser(interpolation=None)
-    cloud_config.read(config_path)
-    
-    if args.config_name not in cloud_config:
-        fail(f"Config '{args.config_name}' not found in {config_path}", 1)
-    
-    cloud_config_data = dict(cloud_config[args.config_name])
 
-    if not cloud_config_data.get("token"):
-        fail("Missing 'token' (GCP service account JSON) in cloud config", 5)
+    mode = args.mode
+    if mode not in VALID_MODES:
+        logging.error(f"Only allowed modes: {VALID_MODES}")
+        sys.exit(1)
 
-    # Load AI configuration
-    ai_config = get_advanced_ai_config(
-        args.config_name, 
-        cloud_config_data.get("provider", "google_vision")
-    )
-
-    # ========================================================================
-    # MODE: send_extracted_metadata
-    # ========================================================================
-    if args.mode == "send_extracted_metadata":
-        """
-        This mode handles retrying jobs that couldn't get data saved via node calls.
-        It resumes polling for a previously started video analysis operation.
-        """
-        if not (args.asset_id and args.repo_guid and args.catalog_path):
-            fail("Asset ID (operation name), Repo GUID, and Catalog path required for send_extracted_metadata mode", 1)
+    cloud_config_path = get_cloud_config_path()
+    
+    # Load cloud config
+    cloud_config_data = None
+    try:
+        if IS_LINUX:
+            parser_cfg = ConfigParser()
+            parser_cfg.read(cloud_config_path)
+            for section in parser_cfg.sections():
+                if section.lower() == args.config_name.lower():
+                    cloud_config_data = dict(parser_cfg.items(section))
+                    cloud_config_data['name'] = section
+                    break
+        else:
+            with open(cloud_config_path, 'rb') as fp:
+                plist_data = plistlib.load(fp)
+                for config in plist_data:
+                    if config.get('name', '').lower() == args.config_name.lower():
+                        cloud_config_data = config
+                        break
         
-        logging.info(f"Resuming analysis with operation name: {args.asset_id}")
-        
-        # Determine if this is video mode based on enrich_prefix
-        is_video_mode = args.enrich_prefix.lower() == "vid"
-        
-        if not is_video_mode:
-            fail("send_extracted_metadata mode only supported for video intelligence (enrich-prefix=vid)", 1)
-        
-        # Recreate operation object from name
-        credentials = get_gcp_credentials(cloud_config_data)
-        if not credentials:
-            fail("Failed to get GCP credentials", 5)
-        
-        video_client = videointelligence.VideoIntelligenceServiceClient(credentials=credentials)
-        
-        # Get operation by name
-        try:
-            operations_client = operations_v1.OperationsClient(video_client.transport.channel)
-            operation = operations_client.get_operation(args.asset_id)
+        if not cloud_config_data:
+            logging.error(f"Configuration '{args.config_name}' not found")
+            sys.exit(5)
             
-            # Wrap in LRO operation object
-            operation = gapic_operation.from_gapic(
-                operation,
-                operations_client,
-                videointelligence.AnnotateVideoResponse,
-                metadata_type=videointelligence.AnnotateVideoProgress
-            )
-        except Exception as e:
-            fail(f"Failed to retrieve operation {args.asset_id}: {e}", 10)
+    except Exception as e:
+        logging.error(f"Error loading cloud config: {e}")
+        sys.exit(5)
+
+    # Load advanced AI config
+    ai_config = get_advanced_ai_config(args.config_name, "gcp") or {}
+    logging.info(f"AI Config loaded: vision_enabled={ai_config.get('vision_ai_enabled')}, video_enabled={ai_config.get('video_intelligence_enabled')}")
+
+    # ========================================================================
+    # MODE: get_base_target (Retrieve existing operation result)
+    # ========================================================================
+    if mode == "get_base_target":
+        if not args.asset_id:
+            logging.error("Asset ID (operation name) required for get_base_target mode")
+            sys.exit(1)
         
-        # Poll for completion (15 minutes timeout, exit with code 7 if still running)
+        if not args.repo_guid or not args.catalog_path:
+            logging.error("Repository GUID and catalog path required for get_base_target mode")
+            sys.exit(1)
+        
+        logging.info(f"Retrieving operation result: {args.asset_id}")
+        
         try:
-            serialized = poll_video_analysis(operation, timeout_minutes=15)
+            serialized = retrieve_operation_result(cloud_config_data, args.asset_id, timeout_minutes=15)
         except SystemExit as e:
             if e.code == 7:
                 logging.error("Polling failed or timed out")
@@ -1181,14 +1199,23 @@ if __name__ == "__main__":
         
         if not send_extracted_metadata(cloud_config_data, args.repo_guid, clean_path, 
                                        raw_metadata_path, norm_metadata_path):
-            fail("Failed to send extracted metadata", 7)
+            logging.error("Failed to send extracted metadata")
+            sys.exit(7)
         
         logging.info("Extracted metadata sent successfully")
         
         # Generate and send AI enriched metadata if normalization succeeded
         if norm_metadata_path is not None:
+            # Get physical root to construct full path
+            meta_path, _ = get_store_paths()
+            if "/./" in meta_path:
+                physical_root = meta_path.split("/./")[0]
+            else:
+                physical_root = meta_path
+            
+            full_norm_path = os.path.join(physical_root, norm_metadata_path)
             enriched_metadata, success = transform_normlized_to_enriched(
-                norm_metadata_path, args.enrich_prefix
+                full_norm_path, args.enrich_prefix
             )
             if success:
                 if send_ai_enriched_metadata(cloud_config_data, args.repo_guid, clean_path, enriched_metadata):
@@ -1201,14 +1228,67 @@ if __name__ == "__main__":
         sys.exit(0)
 
     # ========================================================================
+    # MODE: send_extracted_metadata (Send pre-existing metadata files)
+    # ========================================================================
+    if mode == "send_extracted_metadata":
+        if not args.repo_guid or not args.catalog_path:
+            logging.error("Repository GUID and catalog path required for send_extracted_metadata mode")
+            sys.exit(1)
+        
+        # This mode assumes metadata files already exist
+        logging.info("Sending previously generated metadata files")
+        
+        clean_path = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
+        
+        # Construct expected metadata paths
+        meta_path, _ = get_store_paths()
+        if "/./" in meta_path:
+            meta_left, meta_right = meta_path.split("/./", 1)
+        else:
+            meta_left, meta_right = meta_path, ""
+        
+        provider = cloud_config_data.get("provider", "gcp_media")
+        base = os.path.splitext(os.path.basename(clean_path))[0]
+        repo_guid_str = str(args.repo_guid)
+        
+        # Check if files exist
+        metadata_dir = os.path.join(meta_left, meta_right, repo_guid_str, clean_path, provider)
+        raw_json = os.path.join(metadata_dir, f"{base}_raw.json")
+        norm_json = os.path.join(metadata_dir, f"{base}_norm.json")
+        
+        raw_return = os.path.join(meta_right, repo_guid_str, clean_path, provider, f"{base}_raw.json") if os.path.exists(raw_json) else None
+        norm_return = os.path.join(meta_right, repo_guid_str, clean_path, provider, f"{base}_norm.json") if os.path.exists(norm_json) else None
+        
+        if not raw_return and not norm_return:
+            logging.error(f"No metadata files found in {metadata_dir}")
+            sys.exit(7)
+        
+        if not send_extracted_metadata(cloud_config_data, args.repo_guid, clean_path, raw_return, norm_return):
+            logging.error("Failed to send extracted metadata")
+            sys.exit(7)
+        
+        logging.info("Extracted metadata sent successfully")
+        
+        # Try to send enriched metadata if normalized exists
+        if norm_return and os.path.exists(norm_json):
+            enriched_metadata, success = transform_normlized_to_enriched(norm_json, args.enrich_prefix)
+            if success:
+                if send_ai_enriched_metadata(cloud_config_data, args.repo_guid, clean_path, enriched_metadata):
+                    logging.info("AI enriched metadata sent successfully")
+        
+        sys.exit(0)
+
+    # ========================================================================
     # MODE: analyze_and_embed (Google Vision - Image Analysis)
     # ========================================================================
-    if args.mode == "analyze_and_embed":
+    if mode == "analyze_and_embed":
         if not args.source_path:
-            fail("Source path required for analyze_and_embed mode", 1)
+            logging.error("Source path required for analyze_and_embed mode")
+            sys.exit(1)
         
         if not os.path.isfile(args.source_path):
-            fail(f"Image not found: {args.source_path}", 4)
+            logging.error(f"Image not found: {args.source_path}")
+            sys.exit(4)
 
         if args.dry_run:
             logging.info(f"[DRY RUN] Config: {args.config_name}")
@@ -1223,45 +1303,74 @@ if __name__ == "__main__":
         # Analyze with Google Vision
         analysis = analyze_image_gcp(cloud_config_data, image_data, ai_config)
         if not analysis:
-            fail("GCP Vision analysis failed", 10)
+            logging.error("GCP Vision analysis failed")
+            sys.exit(10)
 
-        # Prepare output metadata
+        # Prepare output metadata (keeping structure similar to S3 uploader)
         ai_metadata = {
-            "analysis": analysis,
-            "embedding": [],
-            "embedding_length": 0,
+            "vision_analysis": analysis,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
         }
 
-        # Save to output path
+        # Store metadata if repo_guid and catalog_path provided
+        if args.repo_guid and args.catalog_path:
+            clean_path = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
+            raw_metadata_path, norm_metadata_path = store_metadata_file(
+                cloud_config_data, args.repo_guid, clean_path, ai_metadata
+            )
+            
+            if send_extracted_metadata(cloud_config_data, args.repo_guid, clean_path, 
+                                       raw_metadata_path, norm_metadata_path):
+                logging.info("Extracted metadata sent successfully")
+                
+                # Send enriched metadata
+                if norm_metadata_path:
+                    meta_path, _ = get_store_paths()
+                    if "/./" in meta_path:
+                        physical_root = meta_path.split("/./")[0]
+                    else:
+                        physical_root = meta_path
+                    
+                    full_norm_path = os.path.join(physical_root, norm_metadata_path)
+                    enriched_metadata, success = transform_normlized_to_enriched(
+                        full_norm_path, args.enrich_prefix
+                    )
+                    if success:
+                        send_ai_enriched_metadata(cloud_config_data, args.repo_guid, clean_path, enriched_metadata)
+
+        # Save to output path if specified
         if args.output_path:
             try:
                 with open(args.output_path, "w", encoding="utf-8") as f:
-                    json.dump(ai_metadata, f, indent=2, ensure_ascii=False)
+                    json.dump(ai_metadata, f, indent=2, ensure_ascii=False, default=str)
                 logging.info(f"Output written to {args.output_path}")
             except Exception as e:
-                fail(f"Failed to write output: {e}", 15)
+                logging.error(f"Failed to write output: {e}")
+                sys.exit(15)
 
         logging.info("GCP Vision processing completed")
         sys.exit(0)
 
     # ========================================================================
-    # MODE: proxy and original (Video Intelligence)
+    # MODE: proxy and original (Video Intelligence - Upload and Analyze)
     # ========================================================================
-    if args.mode in ["proxy", "original"]:
+    if mode in ["proxy", "original"]:
         if not args.source_path:
-            fail("Source path required for proxy/original mode", 1)
+            logging.error("Source path required for proxy/original mode")
+            sys.exit(1)
         
         if not os.path.isfile(args.source_path):
-            fail(f"Video file not found: {args.source_path}", 4)
+            logging.error(f"Video file not found: {args.source_path}")
+            sys.exit(4)
         
         # Check file size limit for original mode
-        if args.mode == "original" and args.size_limit:
+        if mode == "original" and args.size_limit:
             try:
                 limit_bytes = float(args.size_limit) * 1024 * 1024
                 file_size = os.path.getsize(args.source_path)
                 if file_size > limit_bytes:
-                    fail(f"File too large: {file_size / 1024 / 1024:.2f} MB > {args.size_limit} MB", 4)
+                    logging.error(f"File too large: {file_size / 1024 / 1024:.2f} MB > {args.size_limit} MB")
+                    sys.exit(4)
             except ValueError:
                 logging.warning(f"Invalid size limit: {args.size_limit}")
 
@@ -1277,20 +1386,24 @@ if __name__ == "__main__":
 
         # Upload to GCS
         if not args.bucket_name:
-            fail("Bucket name required for GCP Video Intelligence analysis", 1)
+            logging.error("Bucket name required for GCP Video Intelligence analysis")
+            sys.exit(1)
         
         credentials = get_gcp_credentials(cloud_config_data)
         if not credentials:
-            fail("Failed to get GCP credentials", 5)
+            logging.error("Failed to get GCP credentials")
+            sys.exit(5)
         
-        upload_path = args.upload_path.lstrip('/') if args.upload_path else f"temp/{os.path.basename(args.source_path)}"
+        upload_prefix = ai_config.get("video_gcs_upload_prefix", "video-intelligence-temp")
+        upload_path = args.upload_path.lstrip('/') if args.upload_path else f"{upload_prefix}/{uuid.uuid4()}/{os.path.basename(args.source_path)}"
         
         logging.info(f"Uploading video to gs://{args.bucket_name}/{upload_path}")
         
         # Use multipart upload for better performance on large files
         gcs_uri = upload_to_gcs(credentials, args.bucket_name, args.source_path, upload_path, use_multipart=True)
         if not gcs_uri:
-            fail(f"Failed to upload video to GCS", 10)
+            logging.error(f"Failed to upload video to GCS")
+            sys.exit(10)
         
         logging.info(f"Video uploaded: {gcs_uri}")
 
@@ -1312,7 +1425,6 @@ if __name__ == "__main__":
                 delete_from_gcs(credentials, args.bucket_name, upload_path)
                 if e.code == 7:
                     logging.error("Analysis polling timed out - job still indexing")
-                    # Operation name is already in the fail message
                 raise
             
             # Clean up GCS file after successful analysis
@@ -1324,14 +1436,22 @@ if __name__ == "__main__":
             )
             
             if not send_extracted_metadata(cloud_config_data, args.repo_guid, clean_catalog_path, raw_metadata_path, norm_metadata_path):
-                fail("Failed to send extracted metadata", 7)
+                logging.error("Failed to send extracted metadata")
+                sys.exit(7)
             
             logging.info("Extracted metadata sent successfully")
             
             # Generate and send AI enriched metadata if normalization succeeded
             if norm_metadata_path:
+                meta_path, _ = get_store_paths()
+                if "/./" in meta_path:
+                    physical_root = meta_path.split("/./")[0]
+                else:
+                    physical_root = meta_path
+                
+                full_norm_path = os.path.join(physical_root, norm_metadata_path)
                 enriched_metadata, success = transform_normlized_to_enriched(
-                    norm_metadata_path, args.enrich_prefix
+                    full_norm_path, args.enrich_prefix
                 )
                 if success:
                     if send_ai_enriched_metadata(cloud_config_data, args.repo_guid, clean_catalog_path, enriched_metadata):
@@ -1347,4 +1467,8 @@ if __name__ == "__main__":
         except Exception as e:
             # Clean up GCS file on any error
             delete_from_gcs(credentials, args.bucket_name, upload_path)
-            fail(f"GCP Video Intelligence processing failed: {e}", 10) 
+            logging.error(f"GCP Video Intelligence processing failed: {e}")
+            sys.exit(10)
+
+    logging.error(f"Unsupported mode: {mode}")
+    sys.exit(1)
