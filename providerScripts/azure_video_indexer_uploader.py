@@ -145,9 +145,12 @@ def extract_file_name(path):
 def remove_file_name_from_path(path):
     return os.path.dirname(path)
 
-def fail(msg, code=7):
+def fail(msg, code=7, asset_id=None):
     logger.error(msg)
-    print(f"Metadata extraction failed for asset: {args.asset_id}")
+    if asset_id:
+        print(f"Metadata extraction failed for asset: {asset_id}")
+    else:
+        print(f"Operation failed: {msg}")
     sys.exit(code)
 
 def get_link_address_and_port():
@@ -949,6 +952,10 @@ class VideoIndexerClient:
 
                 if response.status_code in (200, 201):
                     video_id = response.json().get("id")
+                    if not video_id:
+                        raise RuntimeError(
+                            f"Upload API returned {response.status_code} but no 'id' in response: {response.text}"
+                        )
                     logger.info(f"✅ Upload successful. Video ID: {video_id}")
                     return video_id
                 elif 400 <= response.status_code < 500:
@@ -1370,7 +1377,6 @@ class VideoIndexerClient:
         for attempt in range(max_attempts):
             try:
                 r = make_request_with_retries("POST", url, headers=headers, json=payload)
-                print(f"send_extracted_metadata response: {r.text if r is not None else 'No response'}")
                 if r and r.status_code in (200, 201):
                     return True
             except Exception as e:
@@ -1479,7 +1485,7 @@ if __name__ == "__main__":
 
     if args.mode == "send_extracted_metadata":
         if not all([args.asset_id, args.repo_guid, args.catalog_path]):
-            fail("Asset ID, Repo GUID, and Catalog path required.", 1)
+            fail("Asset ID, Repo GUID, and Catalog path required.", 1, args.asset_id)
 
         catalog_path_clean = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
         advanced_ai_config = get_advanced_ai_config(args.config_name, "azurevi") or {}
@@ -1494,7 +1500,7 @@ if __name__ == "__main__":
             translation_languages
         )
         if not ai_metadata:
-            fail("No AI metadata returned.")
+            fail("No AI metadata returned.", 7, args.asset_id)
         raw_paths, norm_paths = client.store_metadata_file(args.repo_guid, catalog_path_clean, ai_metadata)
         for raw_return, lang_code in raw_paths:
             norm_return = next((p for p, lc in norm_paths if lc == lang_code), None)
@@ -1505,7 +1511,7 @@ if __name__ == "__main__":
                 norm_return,
                 language_code=lang_code
             ):
-                fail("Failed to send extracted metadata.")
+                fail("Failed to send extracted metadata.", 7, args.asset_id)
 
         logger.info("Extracted metadata sent successfully.")
 
@@ -1771,7 +1777,7 @@ if __name__ == "__main__":
                     translation_languages
                 )
                 if not ai_metadata:
-                    fail("No AI metadata returned.")
+                    fail("No AI metadata returned.", 7, video_id)
 
                 raw_paths, norm_paths = client.store_metadata_file(args.repo_guid, catalog_path_clean, ai_metadata)
                 for raw_return, lang_code in raw_paths:
@@ -1783,7 +1789,7 @@ if __name__ == "__main__":
                         norm_return,
                         language_code=lang_code
                     ):
-                        fail("Failed to send extracted metadata.")
+                        fail("Failed to send extracted metadata.", 7, video_id)
 
                 logger.info("Extracted metadata sent successfully.")
 
@@ -1808,7 +1814,7 @@ if __name__ == "__main__":
                     logger.info("Normalized metadata not present — skipping AI enrichment.")
 
             except Exception as e:
-                fail(f"Error extracting/sending AI metadata: {e}")
+                fail(f"Error extracting/sending AI metadata: {e}", 7, video_id)
 
         # Clean up blob if used
         if use_blob and blob_config and blob_name:
