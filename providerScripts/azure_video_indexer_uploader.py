@@ -45,7 +45,7 @@ SDNA_EVENT_MAP = {
     "azure_video_ocr" : "ocr",
     "azure_video_keywords" : "keywords",
     "azure_video_topics" : "topics",
-    "azure_video_labels" : "lables",
+    "azure_video_labels" : "labels",
     "azure_video_brands" : "brands",
     "azure_video_named_locations" : "locations",
     "azure_video_named_people" : "celebrities",
@@ -1344,22 +1344,33 @@ class VideoIndexerClient:
         url = "http://127.0.0.1:5080/catalogs/extendedMetadata"
         node_api_key = get_node_api_key()
         headers = {"apikey": node_api_key, "Content-Type": "application/json"}
+
+        metadata_array = []
+        if normMetadataFilePath is not None:
+            metadata_array.append({
+                "type": "metadataFilePath",
+                "path": normMetadataFilePath
+            })
+        if rawMetadataFilePath is not None:
+            metadata_array.append({
+                "type": "metadataRawJsonFilePath", 
+                "path": rawMetadataFilePath
+            })
+
         payload = {
             "repoGuid": repo_guid,
             "providerName": section.get("provider", "AZUREVI"),
             "sourceLanguage": LANGUAGE_CODE_MAP.get(language_code, "Default") if language_code is not None else "Default",
             "extendedMetadata": [{
                 "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
-                "fileName": os.path.basename(file_path)
+                "fileName": os.path.basename(file_path),
+                "metadata": metadata_array
             }]
         }
-        if rawMetadataFilePath is not None:
-            payload["extendedMetadata"][0]["metadataRawJsonFilePath"] = rawMetadataFilePath
-        if normMetadataFilePath is not None:
-            payload["extendedMetadata"][0]["metadataFilePath"] = normMetadataFilePath
         for attempt in range(max_attempts):
             try:
                 r = make_request_with_retries("POST", url, headers=headers, json=payload)
+                print(f"send_extracted_metadata response: {r.text if r is not None else 'No response'}")
                 if r and r.status_code in (200, 201):
                     return True
             except Exception as e:
@@ -1372,7 +1383,7 @@ class VideoIndexerClient:
         return False
 
     def send_ai_enriched_metadata(self, repo_guid, file_path, enrichedMetadata, language_code=None, max_attempts=3):
-        url = "http://127.0.0.1:5080/catalogs/aiEnrichedMetadata"
+        url = "http://127.0.0.1:5080/catalogs/aiEnrichedMetadata/add"
         node_api_key = get_node_api_key()
         headers = {"apikey": node_api_key, "Content-Type": "application/json"}
         payload = {
