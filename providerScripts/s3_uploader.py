@@ -691,8 +691,30 @@ def upload_file_to_s3(config_data, bucket_name, source_path, upload_path, metada
         return {"status": 500, "detail": f"Transient S3 failure: {str(e)}"}
 
     except Exception as e:
+        error_str = str(e)
+        # Fallback: if upload failed due to non-ASCII characters in metadata, retry without metadata
+        if sanitized_metadata and "Non ascii characters found in S3 metadata" in error_str:
+            logging.warning(
+                f"Upload failed due to non-ASCII characters in S3 metadata: {e}. "
+                f"Retrying upload without metadata..."
+            )
+            try:
+                s3.upload_file(
+                    Filename=source_path,
+                    Bucket=bucket_name,
+                    Key=upload_path,
+                    ExtraArgs={}
+                )
+                logging.info(
+                    f"Successfully uploaded {source_path} to s3://{bucket_name}/{upload_path} "
+                    f"(without metadata due to non-ASCII characters)"
+                )
+                return {"status": 200, "detail": "Uploaded asset successfully (metadata skipped due to non-ASCII characters)"}
+            except Exception as fallback_e:
+                logging.error(f"Fallback upload without metadata also failed: {fallback_e}")
+                return {"status": 500, "detail": str(fallback_e)}
         logging.error(f"Unexpected error during S3 upload: {e}")
-        return {"status": 500, "detail": str(e)}
+        return {"status": 500, "detail": error_str}
 
 def remove_file_from_s3(bucket_name, file_key, config_data):
     from botocore.config import Config
