@@ -31,12 +31,12 @@ IS_LINUX = os.path.isdir("/opt/sdna/bin")
 DNA_CLIENT_SERVICES = LINUX_CONFIG_PATH if IS_LINUX else MAC_CONFIG_PATH
 
 SDNA_EVENT_MAP = {
-    "LABEL_DETECTION": "labels",
-    "FACE_DETECTION": "faces",
-    "TEXT_DETECTION": "ocr",
-    "CONTENT_MODERATION": "moderation",
-    "CELEBRITY_RECOGNITION": "celebrities",
-    "TRANSCRIBE": "transcript",
+    "aws_rek_detect_labels": "labels",
+    "aws_rek_detect_faces": "faces",
+    "aws_rek_detect_text": "ocr",
+    "aws_rek_detect_moderation_labels": "moderation",
+    "aws_rek_recognize_celebrities": "celebrities",
+    "aws_transcript": "transcript",
 }
 
 VIDEO_FEATURE_MAP = {
@@ -1524,7 +1524,7 @@ if __name__ == '__main__':
 
     s3_uri = f"s3://{args.bucket_name}/{upload_path.lstrip('/').replace(chr(92), '/')}"
 
-    if args.enrich_prefix == "vid" and cloud_config_data.get("export_ai_metadata") == "true":
+    if args.enrich_prefix in ("vid", "aud") and cloud_config_data.get("export_ai_metadata") == "true":
         ai_config = advanced_ai_settings or {}
         video_features = ai_config.get("video_rekognition_features", []) if ai_config.get("video_rekognition_enabled") else []
         transcribe_enabled = ai_config.get("transcribe_enabled", False)
