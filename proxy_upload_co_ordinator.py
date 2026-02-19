@@ -4,6 +4,7 @@ import os
 import re
 import posixpath
 import subprocess
+import unicodedata
 import logging
 import time
 import json
@@ -26,8 +27,9 @@ DEBUG_TO_FILE = True
 
 PROXY_GENERATION_HOST = "http://127.0.0.1:8000"
 PROVIDERS_SUPPORTING_GET_BASE_TARGET = ["frameio" , "frameio_v2", "frameio_v4", "tessact", "overcasthq", "trint", "twelvelabs", "box", "box_v4", "googledrive", "iconik"]
-PATH_BASED_PROVIDERS = ["cloud", "AWS", "axel_ai"]
-ACCOUNT_BASED_PROVIDERS = ["azure_vision", "AZURE", "AZUREVI"]
+PATH_BASED_PROVIDERS = ["cloud", "AWS", "axel_ai", "gcp"]
+ACCOUNT_BASED_PROVIDERS = ["azure_vision", "AZURE", "AZUREVI", "whisper_ai", "gcp"]
+AI_ENRICH_SUPPORTED_PROVIDERS = ["AZUREVI", "twelvelabs", "rubicx", "whisper_ai", "AWS", "gcp"]
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
@@ -57,17 +59,57 @@ PROVIDER_SCRIPTS = {
     "momentslab": "momentslab_uploader.py",
     "rubicx": "rubicx_uploader.py",
     "azure_vision": "azure_vision_uploader.py",
-    "google_vision": "google_vision_uploader.py"
+    "google_vision": "google_vision_uploader.py",
+    "gcp": "google_media_uploader.py",
+    "whisper_ai": "whisper_ai_uploader.py"
 }
 
 NORMALIZER_SCRIPTS = {
     "azure_vision": "azure_vision_metadata_normalizer.py",
     "AWS": "rekognition_metadata_normalizer.py",
-    "google_vision": "google_vision_metadata_normalizer.py"
+    "google_vision": "google_vision_metadata_normalizer.py",
+    "gcp": "google_media_metadata_normalizer.py",
 }
 
 # New upload modes
 UPLOAD_TYPES = ["video_proxy", "video_proxy_sample_scene_change", "video_sample_faces", "video_sample_interval", "audio_proxy", "sprite_sheet"]
+
+SDNA_EVENT_MAP = {
+    # Azure Vision
+    "azure_vision_tags" : "tags",
+    "azure_vision_objects" : "objects",
+    "azure_vision_faces" : "faces",
+    "azure_vision_categories" : "categories",
+    "azure_vision_description" : "description",
+    "azure_vision_brand" : "brands",
+    "azure_vision_landmarks" : "landmarks",
+   
+    # AWS Rekognition
+    "aws_rek_detect_labels" : "labels",
+    "aws_rek_detect_faces" : "faces",
+    "aws_rek_detect_moderation_labels" : "moderation",
+    "aws_rek_detect_text" : "ocr",
+    "aws_rek_detect_protective_equipment" : "protective_equipment",
+    "aws_rek_recognize_celebrities" : "celebrities",
+   
+    # GCP vision
+    "gcp_vision_label_annotations" : "labels",
+    "gcp_vision_object_annotations" : "objects",
+    "gcp_vision_text_annotations" : "ocr",
+    "gcp_vision_face_annotations" : "faces",
+    "gcp_vision_safe_search_annotation" : "safe_search",
+    "gcp_vision_image_properties_annotation" : "image_color",
+    "gcp_vision_web_detection" : "web_detection",
+}
+
+EVENT_TYPE_PROXY_VALUE_MAP = {
+    "video_proxy": "vid",
+    "video_proxy_sample_scene_change": "frm",
+    "video_sample_faces": "img",
+    "video_sample_interval": "vid",
+    "audio_proxy": "aud",
+    "sprite_sheet": "img"
+}
 
 pc = ProcessCentralHelper()
 
@@ -318,8 +360,6 @@ def resolve_base_upload_id(logging_path,script_path, cloud_config_name, upload_p
         return upload_path
 
 def parse_scene_detection_filename(filename):
-    print(f"Parsing filename: {filename}")
-
     # ---------- PRIMARY FORMAT ----------
     # Supports:
     #   Scene-001_Sub-01_00-00-00.000.jpg
@@ -331,7 +371,6 @@ def parse_scene_detection_filename(filename):
         scene_no = match.group(1)
         subscene_no = match.group(2) if match.group(2) else "1"
         timestamp = match.group(3)
-        print(f"Matched primary format: scene_no={scene_no}, subscene_no={subscene_no}, timestamp={timestamp}")
         return scene_no, subscene_no, timestamp
 
     # ---------- FALLBACK FORMAT ----------
@@ -452,60 +491,67 @@ def is_spreadsheet_file(file_path):
     image_extensions = {'.jpg', '.jpeg', '.png'}
     return os.path.splitext(file_path)[1].lower() in image_extensions
 
+def normalize_unicode(text):
+    return unicodedata.normalize('NFC', text) if isinstance(text, str) else text    
+
 # Locates proxy file by filename pattern inside a directory tree
 def resolve_proxy_file(proxy_dir, original_source_path, pattern, log_path):
     base_dir = Path(proxy_dir)
     source_file = Path(original_source_path).resolve()
+    
+    # Extract base name from pattern and normalize
+    search_base = pattern.replace('*.*', '').strip()
+    normalized_search_base = normalize_unicode(search_base)
 
     debug_print(log_path,f"[resolve_proxy_file] proxy_dir={proxy_dir} | pattern={pattern} | original_source={original_source_path}")
 
-    # 1. Flat search (non-recursive) in proxy_dir
-    flat_matches = [f.resolve() for f in base_dir.glob(pattern) if f.is_file()]
+    def matches(filepath):
+        if not filepath.is_file():
+            return False
+        normalized_name = normalize_unicode(filepath.name)
+        normalized_stem = normalize_unicode(filepath.stem)
+        return (normalized_name.startswith(normalized_search_base) or 
+                normalized_stem.startswith(normalized_search_base))
+
+    # 1. Flat search
+    flat_matches = [f.resolve() for f in base_dir.iterdir() if matches(f) and f.resolve() != source_file]
     debug_print(log_path, f"[FLAT] Candidates: {flat_matches}")
-    for candidate in flat_matches:
-        if candidate != source_file:
-            debug_print(log_path, f"[FLAT] Using proxy file for upload: {candidate}")
-            return str(candidate)
+    if flat_matches:
+        debug_print(log_path, f"[FLAT] Using proxy file for upload: {flat_matches[0]}")
+        return str(flat_matches[0])
 
     # 2. Mirror structure search
     try:
         relative_subpath = Path(*Path(original_source_path).parts[1:]).parent
         mirror_path = base_dir / relative_subpath
         if mirror_path.exists():
-            mirror_matches = [f.resolve() for f in mirror_path.glob(pattern) if f.is_file()]
+            mirror_matches = [f.resolve() for f in mirror_path.iterdir() if matches(f) and f.resolve() != source_file]
             debug_print(log_path, f"[MIRROR] Candidates in {mirror_path}: {mirror_matches}")
-            for candidate in mirror_matches:
-                if candidate != source_file:
-                    debug_print(log_path, f"[MIRROR] Using proxy file for upload: {candidate}")
-                    return str(candidate)
+            if mirror_matches:
+                debug_print(log_path, f"[MIRROR] Using proxy file for upload: {mirror_matches[0]}")
+                return str(mirror_matches[0])
     except Exception as e:
         debug_print(log_path, f"[ERROR] Mirror structure exception: {e}")
 
     # 3. Segment-stripping search
     path_segments = Path(original_source_path).parts
-    for i in range(1, len(path_segments) - 1):  # Exclude last (filename)
+    for i in range(1, len(path_segments) - 1):
         sub_path = Path(*path_segments[i:-1])
         search_path = base_dir / sub_path
         if search_path.exists():
-            strip_matches = [f.resolve() for f in search_path.glob(pattern) if f.is_file()]
-            debug_print(log_path, f"[SEGMENT STRIP i={i}] Candidates in {search_path}: {strip_matches}")
-            for candidate in strip_matches:
-                if candidate != source_file:
-                    debug_print(log_path, f"[SEGMENT STRIP] Using proxy file for upload: {candidate}")
-                    return str(candidate)
+            strip_matches = [f.resolve() for f in search_path.iterdir() if matches(f) and f.resolve() != source_file]
+            if strip_matches:
+                debug_print(log_path, f"[SEGMENT STRIP i={i}] Candidates in {search_path}: {strip_matches}")
+                debug_print(log_path, f"[SEGMENT STRIP] Using proxy file for upload: {strip_matches[0]}")
+                return str(strip_matches[0])
 
-    # 4. Fallback: rglob (recursive) inside proxy_dir only
-    fallback_matches = sorted([
-        f.resolve() for f in base_dir.rglob(pattern)
-        if f.is_file() and f.resolve() != source_file
-    ])
+    # 4. Fallback: rglob
+    fallback_matches = [f.resolve() for f in base_dir.rglob('*') if matches(f) and f.resolve() != source_file]
     debug_print(log_path, f"[FALLBACK RGLOB] Candidates: {fallback_matches}")
     if fallback_matches:
-        resolved_path = fallback_matches[0]
-        debug_print(log_path, f"[FALLBACK RGLOB] Using proxy file for upload: {resolved_path}")
-        return str(resolved_path)
+        debug_print(log_path, f"[FALLBACK RGLOB] Using proxy file for upload: {fallback_matches[0]}")
+        return str(fallback_matches[0])
 
-    # Nothing found
     debug_print(log_path, "[MISS] No proxy file found for this pattern.")
     return None
 
@@ -605,6 +651,8 @@ def upload_asset(record, config, dry_run=False, upload_path_id=None, override_so
         cmd += ["--controller-address", config["controller_address"]]
     if config.get("provider") in PATH_BASED_PROVIDERS:
         cmd += ["--bucket-name", config["bucket"]]
+    if config.get("provider") in AI_ENRICH_SUPPORTED_PROVIDERS:
+        cmd += ["--enrich-prefix", EVENT_TYPE_PROXY_VALUE_MAP.get(config.get("upload_type"))]
     if dry_run:
         cmd.append("--dry-run")
     if upload_path_id:
@@ -995,6 +1043,8 @@ def retry_ai_metadata_failures(config):
                 cmd.append("--resolved-upload-id")
             if metadata_path and os.path.exists(metadata_path):
                 cmd += ["--metadata-file", metadata_path]
+            if config.get("provider") in AI_ENRICH_SUPPORTED_PROVIDERS:
+                cmd += ["--enrich-prefix", EVENT_TYPE_PROXY_VALUE_MAP.get(config.get("upload_type"))]            
             if config.get("export"):
                 cmd += ["--export-ai-metadata", str(config["export"])]
 
@@ -1032,6 +1082,10 @@ def process_ai_proxy_lookup(config):
         proxy_root = os.path.join(left.rstrip("/"), right, repo_guid)
     else:
         proxy_root = os.path.join(proxy_store_base.rstrip("/"), repo_guid)
+
+    if not os.path.isdir(proxy_root):
+        debug_print(logging_path, f"[AI PROXY] Skipping lookup — directory not found: {proxy_root}")
+        return 0, 0
 
     debug_print(logging_path, f"[AI PROXY] Using proxy root: {proxy_root}")
 
@@ -1108,7 +1162,7 @@ def process_ai_proxy_lookup(config):
     debug_print(logging_path, f"[AI PROXY SUMMARY] Success: {success_count}, Failed: {len(failed_records)}")
     return success_count, len(failed_records)
 
-def normalize_json(config, raw_json_path, norm_json_path):
+def normalize_json(config, raw_json_path, norm_json_path, azure_vision_version=None):
     provider = config.get("provider")
     if not provider:
         logging.error("No provider specified for normalization.")
@@ -1122,10 +1176,10 @@ def normalize_json(config, raw_json_path, norm_json_path):
         logging.error(f"Normalizer script not found: {script_path}")
         return False
     try:
-        proc = subprocess.run(
-            ["python3", script_path, "-i", raw_json_path, "-o", norm_json_path],
-            capture_output=True, text=True
-        )
+        cmd = ["python3", script_path, "-i", raw_json_path, "-o", norm_json_path]
+        if provider == "azure_vision" and azure_vision_version:
+            cmd.extend(["--version", azure_vision_version])
+        proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode == 0:
             logging.info(f"Normalized JSON saved to {norm_json_path}")
             return True
@@ -1138,18 +1192,29 @@ def save_extended_metadata(config, file_path, rawMetadataFilePath, normMetadataF
     url = "http://127.0.0.1:5080/catalogs/extendedMetadata"
     node_api_key = get_node_api_key()
     headers = {"apikey": node_api_key, "Content-Type": "application/json"}
+
+    metadata_array = []
+    if normMetadataFilePath is not None:
+        metadata_array.append({
+            "type": "metadataFilePath",
+            "path": normMetadataFilePath
+        })
+    if rawMetadataFilePath is not None:
+        metadata_array.append({
+            "type": "metadataRawJsonFilePath", 
+            "path": rawMetadataFilePath
+        })
+
     payload = {
         "repoGuid": config["repo_guid"],
         "providerName": provider if provider is not None else config.get("provider"),
+        "sourceLanguage": "Default",
         "extendedMetadata": [{
             "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
-            "fileName": os.path.basename(file_path)
+            "fileName": os.path.basename(file_path),
+            "metadata": metadata_array
         }]
     }
-    if rawMetadataFilePath is not None:
-        payload["extendedMetadata"][0]["metadataRawJsonFilePath"] = rawMetadataFilePath
-    if normMetadataFilePath is not None:
-        payload["extendedMetadata"][0]["metadataFilePath"] = normMetadataFilePath
     for attempt in range(max_attempts):
         try:
             r = requests.request("POST", url, headers=headers, json=payload)
@@ -1164,27 +1229,30 @@ def save_extended_metadata(config, file_path, rawMetadataFilePath, normMetadataF
             time.sleep(delay)
     return False  
 
-def transform_normlized_to_enriched(norm_metadata_file_path):
+def transform_normlized_to_enriched(norm_metadata_file_path, filetype_prefix):
     try:
         with open(norm_metadata_file_path, "r") as f:
             data = json.load(f)
         result = []
         for event_type, detections in data.items():
+            sdna_event_type = SDNA_EVENT_MAP.get(event_type, 'unknown')
             for detection in detections:
+                occurrences = detection.get("occurrences", [])
                 event_obj = {
                     "eventType": event_type,
+                    "sdnaEventType": sdna_event_type,
+                    "sdnaEventTypePrefix": filetype_prefix,
                     "eventValue": detection.get("value", ""),
-                    "totalOccurrences": len(detection.get("occurrences", [])),
-                    "eventOccurence": detection.get("occurrences", [])
+                    "totalOccurrences": len(occurrences),
+                    "eventOccurence": occurrences
                 }
                 result.append(event_obj)
-       
         return result, True
     except Exception as e:
         return f"Error during transformation: {e}", False
 
 def send_ai_enriched_metadata(config, repo_guid, file_path, enrichedMetadata, max_attempts=3):
-    url = "http://127.0.0.1:5080/catalogs/aiEnrichedMetadata"
+    url = "http://127.0.0.1:5080/catalogs/aiEnrichedMetadata/add"
     node_api_key = get_node_api_key()
     headers = {"apikey": node_api_key, "Content-Type": "application/json"}
     payload = {
@@ -1192,12 +1260,14 @@ def send_ai_enriched_metadata(config, repo_guid, file_path, enrichedMetadata, ma
         "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
         "fileName": os.path.basename(file_path),
         "providerName": config.get("provider"),
+        "sourceLanguage": "Default",
         "normalizedMetadata": enrichedMetadata
     }
 
     for attempt in range(max_attempts):
         try:
             r = make_request_with_retries("POST", url, headers=headers, json=payload)
+            print(f"Response from AI enriched save call")
             if r and r.status_code in (200, 201):
                 return True
         except Exception as e:
@@ -1346,10 +1416,20 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
             #     safe_frame_threads
             # )
             frame_extraction_thread_count = 2
+            azure_vision_version = "4.0"
+
             if isinstance(advanced_config, dict):
-                proposed = advanced_config.get("frame_extraction_thread_count")
-                if isinstance(proposed, int) and proposed > 0:
-                    frame_extraction_thread_count = min(proposed, os.cpu_count() *2) 
+                # Thread count
+                threads = advanced_config.get("frame_extraction_thread_count")
+                if isinstance(threads, int) and threads > 0:
+                    frame_extraction_thread_count = min(threads, os.cpu_count() * 2)
+
+                # Azure version (proposed wins, fallback otherwise)
+                azure_vision_version = (
+                    advanced_config.get("api_version")
+                    if advanced_config.get("api_version") in {"3.2", "4.0"}
+                    else advanced_config.get("azure_vision_api_version", "4.0")
+                )
 
             proxy_files = proxy_map.get(base_source_path) if proxy_map else None
             if not proxy_files or not isinstance(proxy_files, list):
@@ -1532,7 +1612,7 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
                         raw_success = True
 
                         # NORMALIZED write
-                        if not normalize_json(config, raw_json, norm_json):
+                        if not normalize_json(config, raw_json, norm_json, azure_vision_version):
                             logging.error("Normalization failed.")
                             norm_success = False
                         else:
@@ -1552,13 +1632,19 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
                         
                         if norm_success:
                             try:
-                                enriched, enrich_success = transform_normlized_to_enriched(norm_json)
-                                if enrich_success and send_ai_enriched_metadata(config ,args.repo_guid, catalog_path_clean, enriched):
-                                    logging.info("AI enriched metadata sent successfully.")
-                                else:
-                                    logging.error("AI enriched metadata send failed — skipping.")
+                                enriched, enrich_success = transform_normlized_to_enriched(norm_json, upload_type)
                             except Exception:
-                                logging.warning("AI enriched metadata transform failed — skipping.")
+                                logging.exception("AI enriched metadata transform failed — skipping.")
+                                return
+
+                            if enrich_success:
+                                try:
+                                    if send_ai_enriched_metadata(config, repo_guid, catalog_path_clean, enriched):
+                                        logging.info("AI enriched metadata sent successfully.")
+                                    else:
+                                        logging.error("AI enriched metadata send failed — skipping.")
+                                except Exception:
+                                    logging.exception("AI enriched metadata send crashed — skipping.")
                         else:
                             logging.info("Normalized metadata not present — skipping AI enrichment.")                        
                         
@@ -1656,9 +1742,12 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
             # Handle upload failure
             else:
                 stderr_cleaned = result.stderr.replace("\n", " ").replace("\r", " ").strip() if result and result.stderr else "Unknown Error"
+                file_size = os.path.getsize(resolved_path) if os.path.exists(resolved_path) else 0
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 debug_print(config["logging_path"], f"[UPLOAD FAILURE] {resolved_path}\n{stderr_cleaned}")
                 write_csv_row(issues_log, ["Error", resolved_path, timestamp, stderr_cleaned])
+                progressDetails["processedFiles"] += 1
+                progressDetails["processedBytes"] += file_size
                 # try:
                 #     if os.path.exists(catalog_path):
                 #         os.remove(catalog_path)
@@ -1911,7 +2000,11 @@ def process_csv_and_upload(config, dry_run=False):
     # PROCESS AI METADATA RETRIES
     # ================================
     if has_metadata_work:
+        progressDetails["status"] = "Processing AI Metadata Retries"
+        send_progress(progressDetails, config["repo_guid"])
         meta_success, meta_failure = retry_ai_metadata_failures(config)
+        progressDetails["status"] = "AI Metadata Retries Complete"
+        send_progress(progressDetails, config["repo_guid"])
     else:
         meta_success = meta_failure = 0
 
@@ -1976,6 +2069,8 @@ if __name__ == '__main__':
         request_data["export"] = True
         
     request_data["ai_proxy_store_enabled"] = True if str(request_data.get("ai_proxy_store_enabled","")).lower() in ("1","true","yes") else False
+
+    request_data["delete_after_export"] = True if str(request_data.get("delete_after_export","")).lower() in ("1","true","yes") else False
 
     if mode in ("original"):
         optional_keys.append("original_file_size_limit")
