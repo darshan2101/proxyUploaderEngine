@@ -1065,18 +1065,32 @@ def retry_ai_metadata_failures(config):
     debug_print(config["logging_path"], f"[AI METADATA RETRY SUMMARY] Total: {total_records}, Success: {success_count}, Failed: {failure_count}")
     return success_count, failure_count
 
-def process_ai_proxy_lookup(config):
-    if not config.get("ai_proxy_store_enabled"):
-        return 0, 0
-
+def process_ai_proxy_lookup(config, has_pending_work_override=False):
     repo_guid = config["repo_guid"]
     logging_path = config["logging_path"]
+    
+    # Check internal pending work if not passed from caller
+    if not has_pending_work_override:
+        has_pending_work_override = has_ai_proxy_lookup_pending_work(repo_guid)
+    
+    is_enabled = config.get("ai_proxy_store_enabled", False)
+    
+    # DEBUG: Log entry decision
+    debug_print(logging_path, f"[AI PROXY DECISION] Enabled: {is_enabled}, Has Pending Work: {has_pending_work_override}")
+    
+    # CONDITION 2 & 3 FIX: Allow execution if Enabled OR if Pending Work exists
+    if not is_enabled and not has_pending_work_override:
+        debug_print(logging_path, "[AI PROXY] Skipping lookup: Disabled and no pending work.")
+        return 0, 0
+
+    debug_print(logging_path, "[AI PROXY] Starting AI Proxy Lookup process.")
+    
     _, proxy_store_base = get_store_paths()
     if not proxy_store_base:
         debug_print(logging_path, "[AI PROXY] Proxy store path not configured.")
         return 0, 0
 
-    # Resolve physical proxy root: split on /./ and rejoin
+    # Resolve physical proxy root
     if "/./" in proxy_store_base:
         left, right = proxy_store_base.split("/./", 1)
         proxy_root = os.path.join(left.rstrip("/"), right, repo_guid)
@@ -1085,21 +1099,33 @@ def process_ai_proxy_lookup(config):
 
     if not os.path.isdir(proxy_root):
         debug_print(logging_path, f"[AI PROXY] Skipping lookup — directory not found: {proxy_root}")
+        # If directory missing but pending work exists, we record failure
+        if has_pending_work_override:
+            debug_print(logging_path, "[AI PROXY] WARNING: Pending work exists but store directory missing.")
         return 0, 0
 
     debug_print(logging_path, f"[AI PROXY] Using proxy root: {proxy_root}")
 
-    # Determine records: retry only from pending file if exists
+    # Determine records
     retry_records = load_ai_proxy_failures(repo_guid, logging_path)
     current_records = []
-    if not config.get("ai_proxy_lookup_only", False):
+    
+    # CONDITION 3 FIX: If NOT enabled, do NOT load current_records (CSV), only process pending (retry_records)
+    # If Enabled, load current records unless 'ai_proxy_lookup_only' is explicitly set
+    should_load_current = is_enabled and not config.get("ai_proxy_lookup_only", False)
+    
+    if should_load_current:
+        debug_print(logging_path, "[AI PROXY] Loading current records from CSV (Enabled=True).")
         exts = config.get("extensions", [])
         file_size_limit = config.get("original_file_size_limit") if config.get("mode") == "original" else None
-        current_records = read_csv_records(config["files_list"], logging_path)
+        current_records = read_csv_records(config["files_list"], logging_path, exts, file_size_limit)
+    else:
+        debug_print(logging_path, "[AI PROXY] Skipping current CSV records (Enabled=False or Lookup Only).")
 
-    # Deduplicate by base source path (normalize /./)
+    # Deduplicate by base source path
     seen = set()
     combined = []
+    # Prioritize retry records if duplicates exist
     for rec in retry_records + current_records:
         base = os.path.join(*rec[0].split("/./")) if "/./" in rec[0] else rec[0]
         if base not in seen:
@@ -1837,21 +1863,32 @@ def process_csv_and_upload(config, dry_run=False):
     has_metadata_work = has_pending_metadata_work(repo_guid)
     has_ai_proxy_lookup_work = has_ai_proxy_lookup_pending_work(repo_guid)
 
+    debug_print(logging_path, f"[WORKLOAD CHECK] Upload: {has_upload_work}, Metadata: {has_metadata_work}, AI Proxy Pending: {has_ai_proxy_lookup_work}")
+    debug_print(logging_path, f"[CONFIG CHECK] AI Proxy Enabled: {config.get('ai_proxy_store_enabled', False)}, Provider: '{config.get('provider', '')}'")
+
     # ================================
-    # PROCESS AI PROXY LOOKUP (if enabled)
+    # PROCESS AI PROXY LOOKUP (if enabled OR pending work exists)
     # ================================
     ai_proxy_success = ai_proxy_failure = 0
 
+    # CONDITION 2 & 3: Enter block if Enabled OR if Pending Work exists
     if config.get("ai_proxy_store_enabled", False) or has_ai_proxy_lookup_work:
-        pc.update_run(7,"Starting AI Proxy Lookup phase.", "Processing")
+        debug_print(logging_path, "[AI PROXY BLOCK] Entering AI Proxy Lookup phase.")
+        pc.update_run(7, "Starting AI Proxy Lookup phase.", "Processing")
         progressDetails["status"] = "AI Proxy Lookup"
         send_progress(progressDetails, config["repo_guid"])
-        ai_proxy_success, ai_proxy_failure = process_ai_proxy_lookup(config)
-        pc.update_run(10,"AI Proxy Lookup phase completed.", "Processing")
+        
+        # Pass has_ai_proxy_lookup_work to ensure function knows about pending records
+        ai_proxy_success, ai_proxy_failure = process_ai_proxy_lookup(config, has_pending_work_override=has_ai_proxy_lookup_work)
+        
+        pc.update_run(10, "AI Proxy Lookup phase completed.", "Processing")
+        debug_print(logging_path, f"[AI PROXY BLOCK] Completed. Success: {ai_proxy_success}, Failure: {ai_proxy_failure}")
+    else:
+        debug_print(logging_path, "[AI PROXY BLOCK] Skipping AI Proxy Lookup (Disabled and no pending work).")
 
-    # Early exit if ONLY proxy lookup is requested
-    if config.get("ai_proxy_store_enabled") == True and config.get("provider") == "":
-        debug_print(logging_path, "[AI PROXY ONLY MODE] Skipping upload and metadata stages.")
+    # Early exit if ONLY proxy lookup is requested (CONDITION 1)
+    if config.get("ai_proxy_store_enabled") == True and (not config.get("provider") or config.get("provider") == " "):
+        debug_print(logging_path, "[AI PROXY ONLY MODE] Provider empty/unregistered. Skipping upload and metadata stages.")
         progressDetails["status"] = "Complete"
         send_progress(progressDetails, repo_guid)
         debug_print(config["logging_path"], f"Upload summary: {ai_proxy_success} succeeded, {ai_proxy_failure} failed")
