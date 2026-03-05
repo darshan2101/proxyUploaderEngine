@@ -11,13 +11,14 @@ import json
 import sys
 import random
 import argparse
+import ijson
+import plistlib
+import requests
 from datetime import datetime
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from configparser import ConfigParser
-import plistlib
-import requests
 from process_central_helper import ProcessCentralHelper
 
 
@@ -37,6 +38,7 @@ SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/b
 # Detect platform
 IS_LINUX = os.path.isdir("/opt/sdna/bin")
 DNA_CLIENT_SERVICES = LINUX_CONFIG_PATH if IS_LINUX else MAC_CONFIG_PATH
+_SESSION = None
 
 # Mapping provider names to their respective upload scripts
 PROVIDER_SCRIPTS = {
@@ -248,19 +250,24 @@ def get_advanced_ai_config(config_name, provider):
         except Exception as e:
             logging.error(f"Failed to load sample: {e}")
     return {}
-        
+
 def get_retry_session():
-    session = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
+    global _SESSION
+    if _SESSION is None:
+        _SESSION = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=1,   # loopback needs only 1
+            pool_maxsize=1,       # no parallelism benefit locally
+            max_retries=0         # handled manually
+        )
+        _SESSION.mount("http://", adapter)
+    return _SESSION
 
 def make_request_with_retries(method, url, max_retries=3, **kwargs):
     session = get_retry_session()
     for attempt in range(max_retries):
         try:
-            response = session.request(method, url, timeout=(10, 30), **kwargs)
+            response = session.request(method, url, timeout=(5, 120), **kwargs)
             if response.status_code == 429:
                 retry_after = int(response.headers.get('Retry-After', 60))
                 wait_time = retry_after + 5
@@ -289,12 +296,10 @@ def get_store_paths():
             logging.info(f"Metadata Store Path: {metadata_store_path}, Proxy Store Path: {proxy_store_path}")
         
     except Exception as e:
-        logging.error(f"Error reading Metadata Store or Proxy Store settings: {e}")
-        sys.exit(5)
+        print(f"Error reading Metadata Store or Proxy Store settings: {e}")
 
     if not metadata_store_path or not proxy_store_path:
-        logging.info("Store settings not found.")
-        sys.exit(5)
+        print("Store settings not found.")
 
     return metadata_store_path, proxy_store_path   
 
@@ -1065,18 +1070,32 @@ def retry_ai_metadata_failures(config):
     debug_print(config["logging_path"], f"[AI METADATA RETRY SUMMARY] Total: {total_records}, Success: {success_count}, Failed: {failure_count}")
     return success_count, failure_count
 
-def process_ai_proxy_lookup(config):
-    if not config.get("ai_proxy_store_enabled"):
-        return 0, 0
-
+def process_ai_proxy_lookup(config, has_pending_work_override=False):
     repo_guid = config["repo_guid"]
     logging_path = config["logging_path"]
+    
+    # Check internal pending work if not passed from caller
+    if not has_pending_work_override:
+        has_pending_work_override = has_ai_proxy_lookup_pending_work(repo_guid)
+    
+    is_enabled = config.get("ai_proxy_store_enabled", False)
+    
+    # DEBUG: Log entry decision
+    debug_print(logging_path, f"[AI PROXY DECISION] Enabled: {is_enabled}, Has Pending Work: {has_pending_work_override}")
+    
+    # CONDITION 2 & 3 FIX: Allow execution if Enabled OR if Pending Work exists
+    if not is_enabled and not has_pending_work_override:
+        debug_print(logging_path, "[AI PROXY] Skipping lookup: Disabled and no pending work.")
+        return 0, 0
+
+    debug_print(logging_path, "[AI PROXY] Starting AI Proxy Lookup process.")
+    
     _, proxy_store_base = get_store_paths()
     if not proxy_store_base:
         debug_print(logging_path, "[AI PROXY] Proxy store path not configured.")
         return 0, 0
 
-    # Resolve physical proxy root: split on /./ and rejoin
+    # Resolve physical proxy root
     if "/./" in proxy_store_base:
         left, right = proxy_store_base.split("/./", 1)
         proxy_root = os.path.join(left.rstrip("/"), right, repo_guid)
@@ -1085,21 +1104,33 @@ def process_ai_proxy_lookup(config):
 
     if not os.path.isdir(proxy_root):
         debug_print(logging_path, f"[AI PROXY] Skipping lookup — directory not found: {proxy_root}")
+        # If directory missing but pending work exists, we record failure
+        if has_pending_work_override:
+            debug_print(logging_path, "[AI PROXY] WARNING: Pending work exists but store directory missing.")
         return 0, 0
 
     debug_print(logging_path, f"[AI PROXY] Using proxy root: {proxy_root}")
 
-    # Determine records: retry only from pending file if exists
+    # Determine records
     retry_records = load_ai_proxy_failures(repo_guid, logging_path)
     current_records = []
-    if not config.get("ai_proxy_lookup_only", False):
+
+    # CONDITION 3 FIX: If NOT enabled, do NOT load current_records (CSV), only process pending (retry_records)
+    # If Enabled, load current records unless 'ai_proxy_lookup_only' is explicitly set
+    should_load_current = is_enabled and not config.get("ai_proxy_lookup_only", False)
+
+    if should_load_current:
+        debug_print(logging_path, "[AI PROXY] Loading current records from CSV (Enabled=True).")
         exts = config.get("extensions", [])
         file_size_limit = config.get("original_file_size_limit") if config.get("mode") == "original" else None
-        current_records = read_csv_records(config["files_list"], logging_path)
+        current_records = read_csv_records(config["files_list"], logging_path, exts, file_size_limit)
+    else:
+        debug_print(logging_path, "[AI PROXY] Skipping current CSV records (Enabled=False or Lookup Only).")
 
-    # Deduplicate by base source path (normalize /./)
+    # Deduplicate by base source path
     seen = set()
     combined = []
+    # Prioritize retry records if duplicates exist
     for rec in retry_records + current_records:
         base = os.path.join(*rec[0].split("/./")) if "/./" in rec[0] else rec[0]
         if base not in seen:
@@ -1229,55 +1260,77 @@ def save_extended_metadata(config, file_path, rawMetadataFilePath, normMetadataF
             time.sleep(delay)
     return False  
 
-def transform_normlized_to_enriched(norm_metadata_file_path, filetype_prefix):
+def transform_normalized_to_enriched(norm_metadata_file_path, filetype_prefix="vid"):
     try:
-        with open(norm_metadata_file_path, "r") as f:
-            data = json.load(f)
-        result = []
-        for event_type, detections in data.items():
-            sdna_event_type = SDNA_EVENT_MAP.get(event_type, 'unknown')
-            for detection in detections:
-                occurrences = detection.get("occurrences", [])
-                event_obj = {
-                    "eventType": event_type,
-                    "sdnaEventType": sdna_event_type,
-                    "sdnaEventTypePrefix": filetype_prefix,
-                    "eventValue": detection.get("value", ""),
-                    "totalOccurrences": len(occurrences),
-                    "eventOccurence": occurrences
-                }
-                result.append(event_obj)
-        return result, True
-    except Exception as e:
-        return f"Error during transformation: {e}", False
+        file_size = os.path.getsize(norm_metadata_file_path)
+        if file_size < 10 * 1024 * 1024:           # <10MB: 1MB chunks
+            chunk_size_bytes = 1 * 1024 * 1024
+        elif file_size < 100 * 1024 * 1024:        # 10–100MB: 4MB chunks
+            chunk_size_bytes = 4 * 1024 * 1024
+        elif file_size < 512 * 1024 * 1024:        # 100MB–512MB: 8MB chunks
+            chunk_size_bytes = 8 * 1024 * 1024
+        else:                                       # >512MB (GB scale): 16MB chunks
+            chunk_size_bytes = 16 * 1024 * 1024
 
-def send_ai_enriched_metadata(config, repo_guid, file_path, enrichedMetadata, max_attempts=3):
+        with open(norm_metadata_file_path, "rb") as f:
+            for event_type, detections in ijson.kvitems(f, ""):
+                if not isinstance(detections, list):
+                    continue
+                sdna_event_type = SDNA_EVENT_MAP.get(event_type, "unknown")
+                chunk, chunk_bytes = [], 0
+                for detection in detections:
+                    occurrences = detection.get("occurrences", [])
+                    record = {
+                        "eventType": event_type,
+                        "sdnaEventType": sdna_event_type,
+                        "sdnaEventTypePrefix": filetype_prefix,
+                        "eventValue": detection.get("value", ""),
+                        "totalOccurrences": len(occurrences),
+                        "eventOccurence": occurrences,
+                    }
+                    chunk.append(record)
+                    chunk_bytes += len(json.dumps(record).encode())
+                    if chunk_bytes >= chunk_size_bytes:
+                        yield chunk, True
+                        chunk, chunk_bytes = [], 0
+                if chunk:
+                    yield chunk, True
+    except Exception as e:
+        yield f"Error during transformation: {e}", False
+
+def send_ai_enriched_metadata(config, repo_guid, file_path, enriched_metadata_chunks, max_attempts=3):
     url = "http://127.0.0.1:5080/catalogs/aiEnrichedMetadata/add"
-    node_api_key = get_node_api_key()
-    headers = {"apikey": node_api_key, "Content-Type": "application/json"}
-    payload = {
+    headers = {"apikey": get_node_api_key(), "Content-Type": "application/json"}
+    base_payload = {
         "repoGuid": repo_guid,
         "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
         "fileName": os.path.basename(file_path),
         "providerName": config.get("provider"),
         "sourceLanguage": "Default",
-        "normalizedMetadata": enrichedMetadata
     }
+    delays = [(1, 1), (3, 1), (10, 5)]
+    all_succeeded = True
 
-    for attempt in range(max_attempts):
-        try:
-            r = make_request_with_retries("POST", url, headers=headers, json=payload)
-            print(f"Response from AI enriched save call")
-            if r and r.status_code in (200, 201):
-                return True
-        except Exception as e:
-            if attempt == 2:
-                logging.critical(f"Failed to send metadata after 3 attempts: {e}")
-                raise
-            base_delay = [1, 3, 10][attempt]
-            delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
-            time.sleep(delay)
-    return False
+    for chunk, ok in enriched_metadata_chunks:
+        if not ok:
+            logging.error(f"Skipping bad chunk: {chunk}")
+            all_succeeded = False
+            continue
+        for attempt in range(max_attempts):
+            try:
+                r = make_request_with_retries("POST", url, headers=headers, json={**base_payload, "normalizedMetadata": chunk})
+                logging.info(f"Chunk POST response: {r.text if r is not None else 'No response'}")
+                if r and r.status_code in (200, 201):
+                    break
+            except Exception as e:
+                if attempt == max_attempts - 1:
+                    logging.critical(f"Failed to send chunk after {max_attempts} attempts: {e}")
+                    all_succeeded = False
+                    break
+                base_delay, jitter = delays[attempt]
+                time.sleep(base_delay + random.uniform(0, jitter))
+
+    return all_succeeded
 
 def upload_worker(record, config, resolved_ids, progressDetails, transferred_log, issues_log, client_log, proxy_map=None):
     try:
@@ -1316,7 +1369,7 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
 
             if config.get("provider") == "twelvelabs":
                 upload_path_id = resolved_ids.get(logical_base)
-            elif config["provider"] not in PROVIDERS_SUPPORTING_GET_BASE_TARGET:
+            elif config.get("provider") not in PROVIDERS_SUPPORTING_GET_BASE_TARGET:
                 upload_path_id = None
             else:
                 upload_path_id = resolved_ids.get(normalized_folder_key, list(resolved_ids.values())[0])
@@ -1452,6 +1505,7 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
 
             meta_left = meta_left.rstrip("/")            
             # Build metadata directory as a Path
+            provider = config.get("provider", "")
             metadata_dir = Path(os.path.join(meta_left, meta_right, repo_guid, catalog_path_clean, provider))
             metadata_dir.mkdir(parents=True, exist_ok=True)
             base = os.path.splitext(os.path.basename(base_source_path))[0]
@@ -1624,30 +1678,23 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
                         logging.warning(f"Metadata write failed (Attempt {attempt+1}): {e}")
                         if attempt < 2:
                             time.sleep([1, 3, 10][attempt] + random.uniform(0, [1, 1, 5][attempt]))
-                            
+
                 # save data to metaxtend with save_extended_metadata call
                 if raw_success or norm_success:
                     try:
                         save_extended_metadata(config,catalog_path_clean,raw_return if raw_success else None,norm_return if norm_success else None)
-                        
+
                         if norm_success:
                             try:
-                                enriched, enrich_success = transform_normlized_to_enriched(norm_json, upload_type)
+                                if send_ai_enriched_metadata(config, repo_guid, catalog_path_clean,
+                                        transform_normalized_to_enriched(norm_json, upload_type)):
+                                    logging.info("AI enriched metadata sent successfully.")
+                                else:
+                                    logging.error("AI enriched metadata send failed — skipping.")
                             except Exception:
-                                logging.exception("AI enriched metadata transform failed — skipping.")
-                                return
-
-                            if enrich_success:
-                                try:
-                                    if send_ai_enriched_metadata(config, repo_guid, catalog_path_clean, enriched):
-                                        logging.info("AI enriched metadata sent successfully.")
-                                    else:
-                                        logging.error("AI enriched metadata send failed — skipping.")
-                                except Exception:
-                                    logging.exception("AI enriched metadata send crashed — skipping.")
+                                logging.exception("AI enriched metadata send crashed — skipping.")
                         else:
-                            logging.info("Normalized metadata not present — skipping AI enrichment.")                        
-                        
+                            logging.info("Normalized metadata not present — skipping AI enrichment.")
                     except Exception as e:
                         logging.error(f"Failed to save extended metadata for {base_source_path}: {e}")
             else:
@@ -1837,21 +1884,30 @@ def process_csv_and_upload(config, dry_run=False):
     has_metadata_work = has_pending_metadata_work(repo_guid)
     has_ai_proxy_lookup_work = has_ai_proxy_lookup_pending_work(repo_guid)
 
+    debug_print(logging_path, f"[WORKLOAD CHECK] Upload: {has_upload_work}, Metadata: {has_metadata_work}, AI Proxy Pending: {has_ai_proxy_lookup_work}")
+    debug_print(logging_path, f"[CONFIG CHECK] AI Proxy Enabled: {config.get('ai_proxy_store_enabled', False)}, Provider: '{config.get('provider', '')}'")
     # ================================
-    # PROCESS AI PROXY LOOKUP (if enabled)
+    # PROCESS AI PROXY LOOKUP (if enabled OR pending work exists)
     # ================================
     ai_proxy_success = ai_proxy_failure = 0
 
+    # CONDITION 2 & 3: Enter block if Enabled OR if Pending Work exists
     if config.get("ai_proxy_store_enabled", False) or has_ai_proxy_lookup_work:
-        pc.update_run(7,"Starting AI Proxy Lookup phase.", "Processing")
+        debug_print(logging_path, "[AI PROXY BLOCK] Entering AI Proxy Lookup phase.")
+        pc.update_run(7, "Starting AI Proxy Lookup phase.", "Processing")
         progressDetails["status"] = "AI Proxy Lookup"
         send_progress(progressDetails, config["repo_guid"])
-        ai_proxy_success, ai_proxy_failure = process_ai_proxy_lookup(config)
-        pc.update_run(10,"AI Proxy Lookup phase completed.", "Processing")
+        # Pass has_ai_proxy_lookup_work to ensure function knows about pending records
+        ai_proxy_success, ai_proxy_failure = process_ai_proxy_lookup(config, has_pending_work_override=has_ai_proxy_lookup_work)
+        
+        pc.update_run(10, "AI Proxy Lookup phase completed.", "Processing")
+        debug_print(logging_path, f"[AI PROXY BLOCK] Completed. Success: {ai_proxy_success}, Failure: {ai_proxy_failure}")
+    else:
+        debug_print(logging_path, "[AI PROXY BLOCK] Skipping AI Proxy Lookup (Disabled and no pending work).")
 
-    # Early exit if ONLY proxy lookup is requested
-    if config.get("ai_proxy_store_enabled") == True and config.get("provider") == "":
-        debug_print(logging_path, "[AI PROXY ONLY MODE] Skipping upload and metadata stages.")
+    # Early exit if ONLY proxy lookup is requested (CONDITION 1)
+    if config.get("ai_proxy_store_enabled") == True and (not config.get("provider") or config.get("provider") == " "):
+        debug_print(logging_path, "[AI PROXY ONLY MODE] Provider empty/unregistered. Skipping upload and metadata stages.")
         progressDetails["status"] = "Complete"
         send_progress(progressDetails, repo_guid)
         debug_print(config["logging_path"], f"Upload summary: {ai_proxy_success} succeeded, {ai_proxy_failure} failed")
