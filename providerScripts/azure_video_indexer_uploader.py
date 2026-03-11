@@ -8,6 +8,8 @@ import plistlib
 import urllib.parse
 import time
 import random
+import ijson
+import decimal
 from requests.adapters import HTTPAdapter
 from requests.exceptions import RequestException, SSLError, ConnectionError, Timeout
 import plistlib
@@ -147,7 +149,7 @@ def remove_file_name_from_path(path):
 
 def fail(msg, code=7, asset_id=None):
     logger.error(msg)
-    if asset_id:
+    if asset_id and code == 7:
         print(f"Metadata extraction failed for asset: {asset_id}")
     else:
         print(f"Operation failed: {msg}")
@@ -375,13 +377,16 @@ def get_store_paths():
 
     return metadata_store_path, proxy_store_path
 
-def get_retry_session(retries=3, backoff_factor_range=(1.0, 2.0)):
-    session = requests.Session()
-    # handling retry delays manually via backoff in the range
-    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
+def get_retry_session():
+    _SESSION = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=10,
+        pool_maxsize=10,
+        max_retries=3
+    )
+    _SESSION.mount("http://", adapter)
+    _SESSION.mount("https://", adapter)
+    return _SESSION
 
 def make_request_with_retries(method, url, **kwargs):
     session = get_retry_session()
@@ -474,30 +479,43 @@ def get_azurevi_normalized_metadata(raw_metadata_file_path, norm_metadata_file_p
         logging.error(f"Error normalizing metadata: {e}")
         return False
 
-def transform_normalized_to_enriched(norm_metadata_file_path, filetype_prefix, language_code):
+def transform_normalized_to_enriched(norm_metadata_file_path, filetype_prefix="vid"):
     try:
-        logging.debug(f"Transforming normalized metadata from: {norm_metadata_file_path}, Filetype Prefix: {filetype_prefix}, Language Code: {language_code}")
-        with open(norm_metadata_file_path, "r") as f:
-            data = json.load(f)
-        result = []
-        for event_type, detections in data.items():
-            sdna_event_type = SDNA_EVENT_MAP.get(event_type, 'unknown')
- 
-            for detection in detections:
-                occurrences = detection.get("occurrences", [])
- 
-                event_obj = {
-                    "eventType": event_type,
-                    "sdnaEventTypePrefix": filetype_prefix,
-                    "sdnaEventType": sdna_event_type,
-                    "eventValue": detection.get("value", ""),
-                    "totalOccurrences": len(occurrences),
-                    "eventOccurence": occurrences
-                }
-                result.append(event_obj)
-        return result, True
+        file_size = os.path.getsize(norm_metadata_file_path)
+        if file_size < 10 * 1024 * 1024:           # <10MB: 1MB chunks
+            chunk_size_bytes = 1 * 1024 * 1024
+        elif file_size < 100 * 1024 * 1024:        # 10–100MB: 4MB chunks
+            chunk_size_bytes = 4 * 1024 * 1024
+        elif file_size < 512 * 1024 * 1024:        # 100MB–512MB: 8MB chunks
+            chunk_size_bytes = 8 * 1024 * 1024
+        else:                                       # >512MB (GB scale): 16MB chunks
+            chunk_size_bytes = 16 * 1024 * 1024
+
+        with open(norm_metadata_file_path, "rb") as f:
+            for event_type, detections in ijson.kvitems(f, ""):
+                if not isinstance(detections, list):
+                    continue
+                sdna_event_type = SDNA_EVENT_MAP.get(event_type, "unknown")
+                chunk, chunk_bytes = [], 0
+                for detection in detections:
+                    occurrences = detection.get("occurrences", [])
+                    record = {
+                        "eventType": event_type,
+                        "sdnaEventType": sdna_event_type,
+                        "sdnaEventTypePrefix": filetype_prefix,
+                        "eventValue": detection.get("value", ""),
+                        "totalOccurrences": len(occurrences),
+                        "eventOccurence": occurrences,
+                    }
+                    chunk.append(record)
+                    chunk_bytes += len(json.dumps(record).encode())
+                    if chunk_bytes >= chunk_size_bytes:
+                        yield chunk, True
+                        chunk, chunk_bytes = [], 0
+                if chunk:
+                    yield chunk, True
     except Exception as e:
-        return f"Error during transformation: {e}", False
+        yield f"Error during transformation: {e}", False
 
 
 
@@ -1388,34 +1406,47 @@ class VideoIndexerClient:
                 time.sleep(delay)
         return False
 
-    def send_ai_enriched_metadata(self, repo_guid, file_path, enrichedMetadata, language_code=None, max_attempts=3):
+    def send_ai_enriched_metadata(self, repo_guid, file_path, enriched_metadata_chunks, language_code=None, max_attempts=3):
         url = "http://127.0.0.1:5080/catalogs/aiEnrichedMetadata/add"
         node_api_key = get_node_api_key()
         headers = {"apikey": node_api_key, "Content-Type": "application/json"}
-        payload = {
+        base_payload = {
             "repoGuid": repo_guid,
             "fullPath": file_path if file_path.startswith("/") else f"/{file_path}",
             "fileName": os.path.basename(file_path),
-            "sourceLanguage": LANGUAGE_CODE_MAP.get(language_code, "Default") if language_code is not None else "Default",
             "providerName": section.get("provider", "AZUREVI"),
-            "normalizedMetadata": enrichedMetadata
+            "sourceLanguage": LANGUAGE_CODE_MAP.get(language_code, "Default"),
         }
+        delays = [(1, 1), (3, 1), (10, 5)]
+        all_succeeded = True
 
-        for attempt in range(max_attempts):
-            try:
-                r = make_request_with_retries("POST", url, headers=headers, json=payload)
-                if r is not None and r.status_code in (200, 201):
-                    return True
-                else:
-                    logging.debug(f"send_ai_enriched_metadata response: {r.text if r is not None else 'No response'}")
-            except Exception as e:
-                if attempt == 2:
-                    logging.critical(f"Failed to send metadata after 3 attempts: {e}")
-                    raise
-                base_delay = [1, 3, 10][attempt]
-                delay = base_delay + random.uniform(0, [1, 1, 5][attempt])
-                time.sleep(delay)
-        return False
+        for chunk, ok in enriched_metadata_chunks:
+            if not ok:
+                logging.error(f"Skipping bad chunk: {chunk}")
+                all_succeeded = False
+                continue
+            for attempt in range(max_attempts):
+                try:
+                    # custom default handler to ensure Decimal objects from ijson are serialized as numbers
+                    payload = {**base_payload, "normalizedMetadata": chunk}
+                    r = make_request_with_retries(
+                        "POST", 
+                        url, 
+                        headers=headers, 
+                        json=json.loads(json.dumps(payload, default=lambda x: float(x) if isinstance(x, decimal.Decimal) else str(x)))
+                    )
+                    logging.info(f"Chunk POST response: {r.text if r is not None else 'No response'}")
+                    if r and r.status_code in (200, 201):
+                        break
+                except Exception as e:
+                    if attempt == max_attempts - 1:
+                        logging.critical(f"Failed to send chunk after {max_attempts} attempts: {e}")
+                        all_succeeded = False
+                        break
+                    base_delay, jitter = delays[attempt]
+                    time.sleep(base_delay + random.uniform(0, jitter))
+
+        return all_succeeded
 
 # =============================
 # Main Execution
@@ -1525,15 +1556,14 @@ if __name__ == "__main__":
                         meta_path.split("/./")[0] if "/./" in meta_path else meta_path,
                         norm_return
                     )
-                    logger.debug(f"Attempting to transform: {norm_metadata_file_path}")
-                    enriched, success = transform_normalized_to_enriched(norm_metadata_file_path, filetype_prefix, lang_code)
-                    if not success:
-                        logger.error(f"Transformation failed for {lang_code or 'default'}: {enriched}")
-                        continue
-                    if client.send_ai_enriched_metadata(args.repo_guid, catalog_path_clean, enriched, lang_code):
-                        logger.info(f"AI enriched metadata sent successfully for {lang_code or 'default'}.")
-                    else:
-                        logger.warning(f"AI enriched metadata send failed for {lang_code or 'default'} — skipping.")
+                    try:
+                        if client.send_ai_enriched_metadata(args.repo_guid, catalog_path_clean,
+                                transform_normalized_to_enriched(norm_metadata_file_path, filetype_prefix), lang_code):
+                            logging.info("AI enriched metadata sent successfully.")
+                        else:
+                            logging.error("AI enriched metadata send failed — skipping.")
+                    except Exception:
+                        logging.exception("AI enriched metadata send crashed — skipping.")                    
                 except Exception as e:
                     logger.exception(f"AI enriched metadata transform/send failed for {lang_code or 'default'}: {e}")
         else:
@@ -1759,12 +1789,15 @@ if __name__ == "__main__":
         status = "Processed" if conflict_mode == "skip" else "Unknown"
         # Only poll if it's a new upload or reindex was not enough
         if conflict_mode != "skip" or is_new == True:
-            status = client.wait_for_index_async(video_id, timeout_sec=3600)
+            status = client.wait_for_index_async(video_id, timeout_sec=900)
             if status != "Processed":
                 logger.warning(f"Indexing did not complete within 1 hour. Status: {status}. Proceeding as if successful...")
 
         client.update_catalog(repo_guid, args.catalog_path.replace("\\", "/").split("/1/", 1)[-1], video_id)
         print(f"VideoID={video_id}")
+
+        if status != "Processed":
+            fail(f"Indexing did not complete within 15 minutes. Status: {status}.", 7, video_id)
 
         catalog_path_clean = args.catalog_path.replace("\\", "/").split("/1/", 1)[-1]
         if section.get("export_ai_metadata") == "true" and status == "Processed" and is_new == True:
@@ -1803,13 +1836,17 @@ if __name__ == "__main__":
                                 meta_path.split("/./")[0] if "/./" in meta_path else meta_path,
                                 norm_return
                             )
-                            enriched, success = transform_normalized_to_enriched(norm_metadata_file_path, filetype_prefix, lang_code)
-                            if success and client.send_ai_enriched_metadata(args.repo_guid, catalog_path_clean, enriched, lang_code):
-                                logger.info(f"AI enriched metadata sent successfully for {lang_code or 'default'}.")
-                            else:
-                                logger.warning(f"AI enriched metadata send failed for {lang_code or 'default'} — skipping.")
-                        except Exception:
+                            try:
+                                if client.send_ai_enriched_metadata(args.repo_guid, catalog_path_clean,
+                                        transform_normalized_to_enriched(norm_metadata_file_path, filetype_prefix, lang_code)):
+                                    logger.info("AI enriched metadata sent successfully.")
+                                else:
+                                    logger.error("AI enriched metadata send failed — skipping.")
+                            except Exception:
+                                logger.exception("AI enriched metadata send crashed — skipping.")
+                        except Exception:   
                             logger.exception(f"AI enriched metadata transform failed for {lang_code or 'default'} — skipping.")
+                            fail(f"AI enriched metadata transform failed for {lang_code or 'default'} — skipping.", 7, video_id)
                 else:
                     logger.info("Normalized metadata not present — skipping AI enrichment.")
 
@@ -1822,10 +1859,9 @@ if __name__ == "__main__":
                 logger.info("Temporary blob cleaned up.")
             else:
                 logger.warning("Blob cleanup failed — manual cleanup may be required.")
+                fail("Blob cleanup failed — manual cleanup may be required.", 1)
 
         sys.exit(0)
 
     except Exception as e:
-        logger.critical(f"Operation failed: {e}")
-        print(f"Error: {str(e)}")
-        sys.exit(1)
+        fail(f"Operation failed: {e}", 1)
