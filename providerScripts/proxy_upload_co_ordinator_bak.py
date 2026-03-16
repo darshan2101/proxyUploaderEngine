@@ -15,6 +15,7 @@ import ijson
 import plistlib
 import requests
 from datetime import datetime
+from decimal import Decimal
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -29,8 +30,8 @@ DEBUG_TO_FILE = True
 PROXY_GENERATION_HOST = "http://127.0.0.1:8000"
 PROVIDERS_SUPPORTING_GET_BASE_TARGET = ["frameio" , "frameio_v2", "frameio_v4", "tessact", "overcasthq", "trint", "twelvelabs", "box", "box_v4", "googledrive", "iconik"]
 PATH_BASED_PROVIDERS = ["cloud", "AWS", "axel_ai", "gcp"]
-ACCOUNT_BASED_PROVIDERS = ["azure_vision", "AZURE", "AZUREVI", "whisper_ai", "gcp"]
-AI_ENRICH_SUPPORTED_PROVIDERS = ["AZUREVI", "twelvelabs", "rubicx", "whisper_ai", "AWS", "gcp"]
+ACCOUNT_BASED_PROVIDERS = ["azure_vision", "AZURE", "AZUREVI", "whisper_ai", "assembly_ai", "gcp"]
+AI_ENRICH_SUPPORTED_PROVIDERS = ["AZUREVI", "twelvelabs", "rubicx", "whisper_ai", "assembly_ai", "AWS", "gcp"]
 LINUX_CONFIG_PATH = "/etc/StorageDNA/DNAClientServices.conf"
 MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
@@ -63,7 +64,8 @@ PROVIDER_SCRIPTS = {
     "azure_vision": "azure_vision_uploader.py",
     "google_vision": "google_vision_uploader.py",
     "gcp": "google_media_uploader.py",
-    "whisper_ai": "whisper_ai_uploader.py"
+    "whisper_ai": "whisper_ai_uploader.py",
+    "assembly_ai": "assemblyai_uploader.py"
 }
 
 NORMALIZER_SCRIPTS = {
@@ -707,6 +709,21 @@ def prepare_log_files(config):
             csv.writer(f).writerow(["Status","Filename", "Size", "Detail"] if "issues" not in log else ["Status", "Filename","Timestamp", "Issue"])
     return transferred_log, issues_log, client_log
 
+def write_all_files_to_issues(files_list, issues_log, reason):
+    if not issues_log or not files_list or not os.path.exists(files_list):
+        return
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(files_list, 'r') as f:
+            reader = csv.reader(f, delimiter='|')
+            for row in reader:
+                if len(row) >= 2:
+                    source_path = row[0]
+                    base = os.path.join(*source_path.split("/./")) if "/./" in source_path else source_path
+                    write_csv_row(issues_log, ["Error", os.path.basename(base), timestamp, reason])
+    except Exception:
+        pass
+
 def read_csv_records(csv_path, logging_path, extensions = [], file_size_limit = None):
     debug_print(logging_path, "[STEP] Reading records from CSV...")
     records = []
@@ -1261,42 +1278,101 @@ def save_extended_metadata(config, file_path, rawMetadataFilePath, normMetadataF
     return False  
 
 def transform_normalized_to_enriched(norm_metadata_file_path, filetype_prefix="vid"):
+    # ── Guard: file must exist and be readable ──────────────────────────────
+    if not norm_metadata_file_path:
+        logger.error("norm_metadata_file_path is None or empty — aborting transformation")
+        return  # generator yields nothing; caller must handle empty iteration
+
+    if not os.path.isfile(norm_metadata_file_path):
+        logger.error("File not found: %s", norm_metadata_file_path)
+        return
+
     try:
         file_size = os.path.getsize(norm_metadata_file_path)
-        if file_size < 10 * 1024 * 1024:           # <10MB: 1MB chunks
-            chunk_size_bytes = 1 * 1024 * 1024
-        elif file_size < 100 * 1024 * 1024:        # 10–100MB: 4MB chunks
-            chunk_size_bytes = 4 * 1024 * 1024
-        elif file_size < 512 * 1024 * 1024:        # 100MB–512MB: 8MB chunks
-            chunk_size_bytes = 8 * 1024 * 1024
-        else:                                       # >512MB (GB scale): 16MB chunks
-            chunk_size_bytes = 16 * 1024 * 1024
+    except OSError as e:
+        logger.error("Cannot stat file %s: %s", norm_metadata_file_path, e)
+        return
 
-        with open(norm_metadata_file_path, "rb") as f:
-            for event_type, detections in ijson.kvitems(f, ""):
-                if not isinstance(detections, list):
+    if file_size == 0:
+        logger.warning("File is empty, nothing to transform: %s", norm_metadata_file_path)
+        return
+
+    # ── Chunk sizing ────────────────────────────────────────────────────────
+    if file_size < 10 * 1024 * 1024:           # <10 MB  → 1 MB chunks
+        chunk_size_bytes = 1 * 1024 * 1024
+    elif file_size < 100 * 1024 * 1024:        # 10–100 MB → 4 MB chunks
+        chunk_size_bytes = 4 * 1024 * 1024
+    elif file_size < 512 * 1024 * 1024:        # 100–512 MB → 8 MB chunks
+        chunk_size_bytes = 8 * 1024 * 1024
+    else:                                       # >512 MB → 16 MB chunks
+        chunk_size_bytes = 16 * 1024 * 1024
+
+    # ── Streaming parse ─────────────────────────────────────────────────────
+    try:
+        f = open(norm_metadata_file_path, "rb")
+    except OSError as e:
+        logger.error("Cannot open file %s: %s", norm_metadata_file_path, e)
+        return
+
+    try:
+        chunk, chunk_bytes = [], 0
+
+        for event_type, detections in ijson.kvitems(f, ""):
+            if not isinstance(detections, list):
+                logger.debug("Skipping non-list value for key '%s'", event_type)
+                continue
+
+            sdna_event_type = SDNA_EVENT_MAP.get(event_type, "unknown")
+
+            for detection in detections:
+                if not isinstance(detection, dict):
+                    logger.warning("Unexpected detection type %s under '%s' — skipped",
+                                   type(detection).__name__, event_type)
                     continue
-                sdna_event_type = SDNA_EVENT_MAP.get(event_type, "unknown")
-                chunk, chunk_bytes = [], 0
-                for detection in detections:
-                    occurrences = detection.get("occurrences", [])
-                    record = {
-                        "eventType": event_type,
-                        "sdnaEventType": sdna_event_type,
-                        "sdnaEventTypePrefix": filetype_prefix,
-                        "eventValue": detection.get("value", ""),
-                        "totalOccurrences": len(occurrences),
-                        "eventOccurence": occurrences,
-                    }
-                    chunk.append(record)
-                    chunk_bytes += len(json.dumps(record).encode())
-                    if chunk_bytes >= chunk_size_bytes:
-                        yield chunk, True
-                        chunk, chunk_bytes = [], 0
-                if chunk:
+
+                occurrences = detection.get("occurrences", [])
+                if not isinstance(occurrences, list):
+                    logger.warning("'occurrences' is not a list for event '%s' — defaulting to []",
+                                   event_type)
+                    occurrences = []
+
+                record = _json_safe({
+                    "eventType":             event_type,
+                    "sdnaEventType":         sdna_event_type,
+                    "sdnaEventTypePrefix":   filetype_prefix,
+                    "eventValue":            detection.get("value", ""),
+                    "totalOccurrences":      len(occurrences),
+                    "eventOccurence":        occurrences,
+                })
+
+                # Accurate byte size — measure the sanitised record
+                try:
+                    record_bytes = len(json.dumps(record).encode("utf-8"))
+                except (TypeError, ValueError) as e:
+                    logger.warning("Record for event '%s' is not serializable after sanitisation "
+                                   "(skipping record): %s", event_type, e)
+                    continue
+
+                chunk.append(record)
+                chunk_bytes += record_bytes
+
+                if chunk_bytes >= chunk_size_bytes:
                     yield chunk, True
+                    chunk, chunk_bytes = [], 0
+
+        if chunk:
+            yield chunk, True
+
+    except ijson.common.IncompleteJSONError as e:
+        logger.error("Truncated/malformed JSON in %s: %s", norm_metadata_file_path, e)
+        if chunk:
+            logger.warning("Yielding partial chunk (%d records) before parse failure", len(chunk))
+            yield chunk, True
     except Exception as e:
-        yield f"Error during transformation: {e}", False
+        logger.exception("Unexpected error while transforming %s", norm_metadata_file_path)
+        raise
+    finally:
+        f.close()
 
 def send_ai_enriched_metadata(config, repo_guid, file_path, enriched_metadata_chunks, max_attempts=3):
     url = "http://127.0.0.1:5080/catalogs/aiEnrichedMetadata/add"
@@ -1431,8 +1507,16 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
                         write_csv_row(transferred_log, ["Success", resolved_path, file_size, ""])
                     if client_log:
                         write_csv_row(client_log, ["Success", resolved_path, file_size, "Client"])
+                elif result and result.returncode == 7:
+                    file_size = os.path.getsize(resolved_path) if os.path.exists(resolved_path) else 0
+                    total_uploaded_size += file_size
+                    success_count += 1
+                    if transferred_log:
+                        write_csv_row(transferred_log, ["Success (AI metadata failed)", resolved_path, file_size, ""])
+                    if issues_log:
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        write_csv_row(issues_log, ["Warning", resolved_path, timestamp, "Metadata extraction failed"])
                 else:
-                    # Handle upload failure
                     stderr_cleaned = result.stderr.replace("\n", " ").replace("\r", " ").strip() if result and result.stderr else "Unknown Error"
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     debug_print(config["logging_path"], f"[UPLOAD FAILURE] {resolved_path}\n{stderr_cleaned}")
@@ -1687,7 +1771,7 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
                         if norm_success:
                             try:
                                 if send_ai_enriched_metadata(config, repo_guid, catalog_path_clean,
-                                        transform_normalized_to_enriched(norm_json, upload_type)):
+                                        transform_normalized_to_enriched(norm_json, EVENT_TYPE_PROXY_VALUE_MAP.get(config.get("upload_type")), "vid")):
                                     logging.info("AI enriched metadata sent successfully.")
                                 else:
                                     logging.error("AI enriched metadata send failed — skipping.")
@@ -1706,12 +1790,24 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
 
             if processed == 0:
                 debug_print(config["logging_path"], f"[SCENE BASED EXTRACTION FAILURE] {base_source_path} | No frames succeeded")
+                if issues_log:
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    write_csv_row(issues_log, ["Error", base_source_path, timestamp, "No frames succeeded"])
                 return {"status": "failure", "file": base_source_path, "error": "No frames succeeded", "record": record}
             elif failed:
                 debug_print(config["logging_path"], f"[SCENE BASED EXTRACTION PARTIAL SUCCESS] {base_source_path} | Failed frames: {len(failed)}")
+                if transferred_log:
+                    write_csv_row(transferred_log, ["Partial Success", base_source_path, total_processed_bytes, f"Processed {processed}, Failed {len(failed)}"])
+                if issues_log:
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    write_csv_row(issues_log, ["Warning", base_source_path, timestamp, f"{len(failed)} frames failed out of {processed + len(failed)}"])
                 return {"status": "partial_success", "file": base_source_path, "output": str(raw_json), "processed": processed, "failed": len(failed), "record": record}
             else:
                 debug_print(config["logging_path"], f"[SCENE BASED EXTRACTION SUCCESS] {base_source_path}")
+                if transferred_log:
+                    write_csv_row(transferred_log, ["Success", base_source_path, total_processed_bytes, ""])
+                if client_log:
+                    write_csv_row(client_log, ["Success", base_source_path, total_processed_bytes, ""])
                 return {"status": "success", "file": base_source_path, "output": str(raw_json), "processed": processed, "record": record}
 
         else:
@@ -1777,6 +1873,9 @@ def upload_worker(record, config, resolved_ids, progressDetails, transferred_log
                         progressDetails["processedBytes"] += file_size
                         if transferred_log:
                             write_csv_row(transferred_log, ["Success (AI metadata failed)", resolved_path, file_size, asset_id])
+                        if issues_log:
+                            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            write_csv_row(issues_log, ["Warning", resolved_path, timestamp, f"Metadata extraction failed for asset: {asset_id}"])
                         return {"status": "success_ai_metadata_failed", "file": resolved_path, "asset_id": asset_id}
                 except Exception as e:
                     # If we can't extract asset_id, treat as full failure
@@ -2145,7 +2244,14 @@ if __name__ == '__main__':
 
     for key in required_keys:
         if key not in request_data:
-            print(f"Missing required field in config: {key}")
+            reason = f"Missing required field in config: {key}"
+            print(reason)
+            if args.log_prefix and request_data.get("files_list"):
+                os.makedirs(os.path.dirname(args.log_prefix), exist_ok=True)
+                issues_log = f"{args.log_prefix}-uploader-issues.csv"
+                with open(issues_log, "w", newline="") as f:
+                    csv.writer(f).writerow(["Status", "Filename", "Timestamp", "Issue"])
+                write_all_files_to_issues(request_data["files_list"], issues_log, reason)
             sys.exit(1)
     for key in optional_keys:
         if key in request_data:
@@ -2159,7 +2265,14 @@ if __name__ == '__main__':
     provider = request_data.get("provider")
     script_path = PROVIDER_SCRIPTS.get(provider)
     if provider and str(provider).strip() and not script_path:
-        print(f"No script path found for provider: {provider}")
+        reason = f"No script path found for provider: {provider}"
+        print(reason)
+        if args.log_prefix and request_data.get("files_list"):
+            os.makedirs(os.path.dirname(args.log_prefix), exist_ok=True)
+            issues_log = f"{args.log_prefix}-uploader-issues.csv"
+            with open(issues_log, "w", newline="") as f:
+                csv.writer(f).writerow(["Status", "Filename", "Timestamp", "Issue"])
+            write_all_files_to_issues(request_data["files_list"], issues_log, reason)
         sys.exit(1)
 
     
