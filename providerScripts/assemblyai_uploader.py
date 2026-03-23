@@ -27,7 +27,14 @@ MAC_CONFIG_PATH = "/Library/Preferences/com.storagedna.DNAClientServices.plist"
 SERVERS_CONF_PATH = "/etc/StorageDNA/Servers.conf" if os.path.isdir("/opt/sdna/bin") else "/Library/Preferences/com.storagedna.Servers.plist"
 IS_LINUX = os.path.isdir("/opt/sdna/bin")
 DNA_CLIENT_SERVICES = LINUX_CONFIG_PATH if IS_LINUX else MAC_CONFIG_PATH
-NORMALIZER_SCRIPT_PATH = "/opt/sdna/bin/assemblyai_metadata_normalizer.py"
+
+# Resolve normalizer path
+DEFAULT_NORMALIZER = "/opt/sdna/bin/assemblyai_metadata_normalizer.py"
+if os.path.exists(DEFAULT_NORMALIZER):
+    NORMALIZER_SCRIPT_PATH = DEFAULT_NORMALIZER
+else:
+    # Fallback to local directory
+    NORMALIZER_SCRIPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assemblyai_metadata_normalizer.py")
 
 SDNA_EVENT_MAP = {
     "assembly_transcript": "transcript",
@@ -100,8 +107,8 @@ def validate_transcribe_payload(payload: Dict[str, Any]) -> None:
         errors.append("Enable only one of summarization or auto_chapters")
 
     # 2) Paired parameters: summary_model and summary_type
-    has_summary_model = "summary_model" in payload and payload["summary_model"]
-    has_summary_type = "summary_type" in payload and payload["summary_type"]
+    has_summary_model = bool(payload.get("summary_model"))
+    has_summary_type = bool(payload.get("summary_type"))
     if has_summary_model ^ has_summary_type:
         errors.append("Both summary_model and summary_type must be provided together")
 
@@ -115,7 +122,7 @@ def validate_transcribe_payload(payload: Dict[str, Any]) -> None:
         errors.append("prompt is only supported with Universal-3-Pro (include it in speech_models)")
     if ("temperature" in payload and payload["temperature"] is not None) and not uses_u3p:
         errors.append("temperature is only supported with Universal-3-Pro (include it in speech_models)")
-
+    
     # keyterms_prompt capacity differs by model
     if "keyterms_prompt" in payload and payload["keyterms_prompt"]:
         terms = payload["keyterms_prompt"]
@@ -162,8 +169,8 @@ def validate_transcribe_payload(payload: Dict[str, Any]) -> None:
     start = payload.get("audio_start_from")
     end = payload.get("audio_end_at")
     if start is not None or end is not None:
-        if not isinstance(start, int) or not isinstance(end, int):
-            errors.append("audio_start_from and audio_end_at must both be integers (milliseconds)")
+        if not (isinstance(start, int) and isinstance(end, int)):
+            errors.append("audio_start_from and audio_end_at must both be provided together as integers (milliseconds)")
         else:
             if start < 0 or end < 0:
                 errors.append("audio_start_from and audio_end_at must be >= 0")
@@ -176,7 +183,20 @@ def validate_transcribe_payload(payload: Dict[str, Any]) -> None:
         if quality is not None and str(quality).lower() not in {"mp3", "wav"}:
             errors.append("redact_pii_audio_quality must be 'mp3' (default) or 'wav' when redact_pii_audio is enabled")
 
-    # 7) Deprecated/no-op safeguards
+    # 7) Speech Understanding / Speaker ID
+    if "speech_understanding" in payload:
+        su = payload["speech_understanding"].get("request", {})
+        if "speaker_identification" in su:
+            ident = su["speaker_identification"]
+            if ident.get("speaker_type") == "role":
+                if not ident.get("known_values"):
+                    errors.append("If speaker_type is 'role', must provide known_values array")
+                else:
+                    for val in ident["known_values"]:
+                        if len(str(val)) > 35:
+                            errors.append(f"known_values entry '{val}' exceeds 35 character limit")
+
+    # 8) Deprecated/no-op safeguards
     for deprecated in ("custom_topics", "topics"):
         if deprecated in payload and payload[deprecated]:
             errors.append(f"{deprecated} has no effect and should not be used")
@@ -221,17 +241,24 @@ def make_request_with_retries(method, url, max_retries=MAX_RETRIES, stream=False
     for attempt in range(max_retries):
         try:
             response = session.request(method, url, timeout=(10, 30), stream=stream, **kwargs)
-            if response.status_code < 500:
+            # 429 (Rate Limit) should be retried, 5xx (Server Error) should be retried
+            if response.status_code < 500 and response.status_code != 429:
                 return response
+            
+            logger.warning(f"Request to {url} returned {response.status_code}. Attempt {attempt + 1}/{max_retries}...")
+            
             if attempt == max_retries - 1:
                 return response
-            time.sleep(5)
+            
+            # Backoff before retry
+            wait_time = [5, 15, 30][attempt % 3] + random.uniform(0, 5)
+            time.sleep(wait_time)
         except Exception as e:
             last_error = e
             if attempt == max_retries - 1:
                 logger.error(f"Request failed after {max_retries} attempts: {e}")
                 return None
-            time.sleep([2, 5, 15][attempt] + random.uniform(0, 2))
+            time.sleep([5, 15, 30][attempt % 3] + random.uniform(0, 5))
     return None
 
 
@@ -408,7 +435,6 @@ def get_normalized_metadata(raw_metadata_file_path, norm_metadata_file_path, lan
         if language:
             cmd.extend(["-l", language])
             
-        # We must capture stderr to understand why the script is returning 1
         process = subprocess.run(
             cmd,
             capture_output=True,
@@ -469,7 +495,6 @@ def transform_normlized_to_enriched(norm_metadata_file_path, filetype_prefix):
                             d.get("occurrences", [])
                         )
                         chunk.append(record)
-                        # Handle Decimal types from ijson by converting them during sizing
                         record_str = json.dumps(record, default=lambda x: float(x) if isinstance(x, decimal.Decimal) else str(x))
                         chunk_bytes += len(record_str.encode())
                         if chunk_bytes >= chunk_size_bytes:
@@ -505,7 +530,6 @@ def send_ai_enriched_metadata(config, repo_guid, file_path, enriched_metadata_ch
             continue
         for attempt in range(max_attempts):
             try:
-                # Use a custom default handler to ensure Decimal objects from ijson are serialized as numbers
                 payload = {**base_payload, "normalizedMetadata": chunk}
                 r = make_request_with_retries(
                     "POST", 
@@ -557,7 +581,7 @@ class AssemblyAiProcessor:
             logger.error(f"Failed to upload file to AssemblyAI: {e}")
             return None
 
-    def build_transcript_payload(self, audio_url, is_translation=False, target_language=None):
+    def build_transcript_payload(self, audio_url):
         payload = {"audio_url": audio_url}
 
         def get_lang_detection():
@@ -567,7 +591,6 @@ class AssemblyAiProcessor:
                 return self.config.get("language_detection", False)
             return False
         
-        # Default to the most powerful pre-recorded models: universal-3-pro with universal-2 as fallback
         payload["speech_models"] = self.config.get("speech_models", ["universal-3-pro", "universal-2"])
         
         if "language_code" in self.config and not get_lang_detection():
@@ -577,7 +600,6 @@ class AssemblyAiProcessor:
             lang_cfg = self.config["language_detection"]
             if isinstance(lang_cfg, dict):
                 payload["language_detection"] = lang_cfg.get("language_detection", False)
-                # If language detection is on but no specific array provided, run in 'auto mode' across all languages for code-switching
                 if "language_detection_options" in lang_cfg:
                     payload["language_detection_options"] = lang_cfg["language_detection_options"]
                 elif payload["language_detection"]:
@@ -593,17 +615,14 @@ class AssemblyAiProcessor:
                         "expected_languages": ["all"]
                     }
         
-        # Audio bounds and formatting limits 
         for param in ["audio_end_at", "audio_start_from", "speech_threshold", "temperature", "prompt"]:
             if param in self.config:
                 payload[param] = self.config[param]
                 
-        # Keyterms Arrays
         for array_param in ["keyterms_prompt", "language_codes"]:
             if array_param in self.config:
                 payload[array_param] = self.config[array_param]
 
-        # Webhook routing
         for wh_param in ["webhook_url", "webhook_auth_header_name", "webhook_auth_header_value"]:
              if wh_param in self.config:
                  payload[wh_param] = self.config[wh_param]
@@ -617,7 +636,6 @@ class AssemblyAiProcessor:
             if "custom_spelling" in fmt: payload["custom_spelling"] = fmt["custom_spelling"]
             if "multichannel" in fmt: payload["multichannel"] = fmt["multichannel"]
             
-        # PII Redaction
         if "redact_pii" in self.config:
             p_redact = self.config["redact_pii"]
             if isinstance(p_redact, dict):
@@ -630,7 +648,7 @@ class AssemblyAiProcessor:
             else:
                  payload["redact_pii"] = bool(p_redact)
                  
-        if "audio_intelligence" in self.config and not is_translation:
+        if "audio_intelligence" in self.config:
             ai = self.config["audio_intelligence"]
             if "speaker_labels" in ai: payload["speaker_labels"] = ai["speaker_labels"]
             if "speakers_expected" in ai and ai.get("speakers_expected"): payload["speakers_expected"] = ai["speakers_expected"]
@@ -641,56 +659,46 @@ class AssemblyAiProcessor:
             if "iab_categories" in ai: payload["iab_categories"] = ai["iab_categories"]
             if "auto_highlights" in ai: payload["auto_highlights"] = ai["auto_highlights"]
             
-        if "summarization" in self.config and not is_translation:
+        if "summarization" in self.config:
             summ = self.config["summarization"]
             if "summarization" in summ: payload["summarization"] = summ["summarization"]
             if "summary_model" in summ: payload["summary_model"] = summ["summary_model"]
             if "summary_type" in summ: payload["summary_type"] = summ["summary_type"]
             
-        if "content_safety" in self.config and not is_translation:
+        if "content_safety" in self.config:
             cs = self.config["content_safety"]
             if "content_safety" in cs: payload["content_safety"] = cs["content_safety"]
             if "content_safety_confidence" in cs: payload["content_safety_confidence"] = cs["content_safety_confidence"]
 
-        if is_translation and target_language:
-            # AssemblyAI requests target translation under speech_understanding
-            payload["speech_understanding"] = {
-                "request": {
-                    "translation": {
-                        "target_languages": [target_language],
-                        "match_original_utterance": True
-                    }
-                }
-            }
-            # Adding secondary fields if provided in root speech understanding dict
-            if "speech_understanding" in self.config:
-                src_su = self.config["speech_understanding"]
-                if "translation" in src_su and isinstance(src_su["translation"], dict):
-                    if "formal" in src_su["translation"]:
-                        payload["speech_understanding"]["request"]["translation"]["formal"] = src_su["translation"]["formal"]
+        # Handle Speech Understanding in the initial request
+        if "speech_understanding" in self.config:
+            su_cfg = self.config["speech_understanding"]
+            su_request = {}
             
-            # Add basic speaker label for utterance mapping
-            if "audio_intelligence" in self.config:
-                ai = self.config["audio_intelligence"]
-                if "speaker_labels" in ai: payload["speaker_labels"] = ai["speaker_labels"]
-                
-        # If Speech Understanding is strictly for identification / custom formatting vs purely translation override
-        elif "speech_understanding" in self.config and not is_translation:
-             # Just pass it straight through if we aren't enforcing Translation
-             su_data = self.config["speech_understanding"]
-             if su_data.get("request") and not "translation" in su_data.get("request", {}):
-                 payload["speech_understanding"] = self.config["speech_understanding"]
+            if "translation" in su_cfg:
+                trans = su_cfg["translation"].copy()
+                trans["match_original_utterance"] = True
+                su_request["translation"] = trans
+            
+            if "speaker_identification" in su_cfg:
+                su_request["speaker_identification"] = su_cfg["speaker_identification"]
+            
+            if "custom_formatting" in su_cfg:
+                su_request["custom_formatting"] = su_cfg["custom_formatting"]
+            
+            if su_request:
+                payload["speech_understanding"] = {"request": su_request}
 
         return payload
 
-    def start_transcription(self, audio_url, is_translation=False, target_language=None):
+    def start_transcription(self, audio_url):
         url = f"{self.base_url}/transcript"
         headers = {
             "Authorization": self.api_key,
             "Content-Type": "application/json"
         }
         
-        payload = self.build_transcript_payload(audio_url, is_translation, target_language)
+        payload = self.build_transcript_payload(audio_url)
 
         try:
             validate_transcribe_payload(payload)
@@ -701,7 +709,7 @@ class AssemblyAiProcessor:
         response = make_request_with_retries("POST", url, headers=headers, json=payload)
         if response and response.status_code == 200:
             return response.json()["id"]
-        logger.error(f"Failed to start transcription: {response.text}")
+        logger.error(f"Failed to start transcription: {response.text if response else 'No response'}")
         return None
 
     def poll_transcript(self, transcript_id, timeout_minutes=15):
@@ -721,6 +729,7 @@ class AssemblyAiProcessor:
             response = make_request_with_retries("GET", url, headers=headers)
             if response and response.status_code == 200:
                 data = response.json()
+                print(f"Transcript {transcript_id} response: {data}")
                 status = data.get("status")
                 
                 if status == "completed":
@@ -752,118 +761,52 @@ class AssemblyAiProcessor:
             return True
         return False
 
-
-    def process_speech_understanding(self, transcript_id, task_type, task_config, save_to_path=None):
-        """
-        Calls the LLM Gateway for post-processing tasks.
-        task_type: 'translation', 'speaker_identification', or 'custom_formatting'
-        task_config: The specific dictionary for that task
-        """
-        url = f"{self.llm_gateway_url}/understanding"
-        headers = {
-            "Authorization": self.api_key,
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "transcript_id": transcript_id,
-            "speech_understanding": {
-                "request": {
-                    task_type: task_config
-                }
-            }
-        }
-        
-        logger.info(f"Initiating Speech Understanding task '{task_type}' for transcript {transcript_id}...")
-        
-        if save_to_path:
-            response = make_request_with_retries("POST", url, headers=headers, json=payload, stream=True)
-            if response and response.status_code == 200:
-                with open(save_to_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                return True
-            logger.error(f"Speech Understanding task '{task_type}' failed to stream to {save_to_path}: {response.text if response else 'No response'}")
-            return False
-        else:
-            response = make_request_with_retries("POST", url, headers=headers, json=payload)
-            if response and response.status_code == 200:
-                return response.json()
-            logger.error(f"Speech Understanding task '{task_type}' failed: {response.text if response else 'No response'}")
-            return None
-
-    def split_multilingual_transcript_ijson(self, master_raw_path, translation_result_path, target_languages, metadata_dir, base_name):
-        """
-        Uses ijson to stream the multilingual response and create virtual transcripts for each target language.
-        """
-        logger.info(f"Splitting multilingual transcript for languages: {target_languages}")
-        
-        # We need the original master transcript metadata (duration, url, etc.)
-        # For simplicity in this logic, we load the non-utterance parts of the master once
-        with open(master_raw_path, 'r', encoding='utf-8') as f:
-            base_transcript = json.load(f)
-            # Remove utterances and text to avoid keeping them twice
-            base_transcript.pop('utterances', None)
-            base_transcript.pop('text', None)
-            base_transcript.pop('words', None)
+    def split_multilingual_transcript_native(self, transcript_data, target_languages, metadata_dir, base_name):
+        logger.info(f"Splitting native transcript for languages: {target_languages}")
+        base_transcript = transcript_data.copy()
+        base_transcript.pop('utterances', None)
+        base_transcript.pop('text', None)
+        base_transcript.pop('words', None)
+        base_transcript.pop('translated_texts', None)
 
         try:
-            # Reconstruct for each language
             for lang in target_languages:
                 lang_raw_name = f"{base_name}_{lang}_raw.json"
                 lang_raw_path = os.path.join(metadata_dir, lang_raw_name)
-                
-                # Start building the virtual transcript
                 virtual_transcript = base_transcript.copy()
+                virtual_transcript['language_code'] = lang
                 virtual_transcript['utterances'] = []
                 virtual_transcript['text'] = ""
                 
-                # Use ijson to stream utterances from the translation result
-                with open(translation_result_path, 'rb') as tf:
-                    # Extract the top-level translated text for this language if available
-                    # Actually, we can get it from 'translated_texts' object
-                    translated_texts_gen = ijson.kvitems(tf, 'translated_texts')
-                    for l_code, l_text in translated_texts_gen:
-                        if l_code == lang:
-                            virtual_transcript['text'] = l_text
-                            break
-                    
-                    # Reset pointer for utterances
-                    tf.seek(0)
-                    utterances_gen = ijson.items(tf, 'utterances.item')
-                    for utt in utterances_gen:
-                        # Create a copy of the utterance
-                        lang_utt = utt.copy()
-                        # Extract the translation for this language
-                        translations = utt.get('translated_texts', {})
-                        if lang in translations:
-                            lang_utt['text'] = translations[lang]
-                        
-                        # Remove other translations to keep the file clean
-                        lang_utt.pop('translated_texts', None)
-                        # Normally translation route doesn't provide word-level timestamps for target lang
-                        lang_utt.pop('words', None)
-                        
-                        virtual_transcript['utterances'].append(lang_utt)
+                all_translated = transcript_data.get('translated_texts', {})
+                if isinstance(all_translated, dict):
+                    virtual_transcript['text'] = all_translated.get(lang, "")
                 
-                # Finalize the virtual transcript
+                utterances = transcript_data.get('utterances', []) or []
+                for utt in utterances:
+                    lang_utt = utt.copy()
+                    lang_utt['original_text'] = utt.get('text', "")
+                    translations = utt.get('translated_texts', {})
+                    if lang in translations:
+                        lang_utt['text'] = translations[lang]
+                        lang_utt['language_code'] = lang
+                    lang_utt.pop('translated_texts', None)
+                    lang_utt.pop('words', None)
+                    virtual_transcript['utterances'].append(lang_utt)
+                
                 with open(lang_raw_path, 'w', encoding='utf-8') as f:
                     json.dump(virtual_transcript, f, ensure_ascii=False, indent=4)
-                
-                logger.debug(f"Reconstructed virtual transcript for {lang} saved to {lang_raw_path}")
-            
+                logger.debug(f"Created virtual transcript for {lang} at {lang_raw_path}")
             return True
         except Exception as e:
-            logger.error(f"Error splitting multilingual transcript: {e}")
+            logger.error(f"Error splitting native transcript: {e}")
             return False
-
-
 
 def main():
     parser = argparse.ArgumentParser(description="AssemblyAI Uploader")
     parser.add_argument("-m", "--mode", required=True, choices=VALID_MODES)
     parser.add_argument("-c", "--config-name", required=True, help="name of config")
-    parser.add_argument("-sp", "--source-path", required=True, help="path to source file")
+    parser.add_argument("-sp", "--source-path", help="path to source file")
     parser.add_argument("-cp", "--catalog-path", required=True, help="path to catalog file")
     parser.add_argument("-mp", "--metadata-file", help="path where property bag for file resides")
     parser.add_argument("-r", "--repo-guid", required=True, help="repo guid")
@@ -876,7 +819,6 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     
     args = parser.parse_args()
-
     setup_logging(args.log_level)
 
     if args.dry_run:
@@ -885,16 +827,16 @@ def main():
 
     cloud_config_path = get_cloud_config_path()
     if not os.path.exists(cloud_config_path):
-        fail(f"Cloud config not found: {cloud_config_path}")
+        fail(f"Cloud config not found: {cloud_config_path}", 1)
 
     cloud_config = ConfigParser()
     cloud_config.read(cloud_config_path)
     if args.config_name not in cloud_config:
-        fail(f"Config section not found: {args.config_name}")
+        fail(f"Config section not found: {args.config_name}",1)
 
     api_key = cloud_config[args.config_name].get("api_key")
     if not api_key:
-        fail("api_key not found in config")
+        fail("api_key not found in config",1)
 
     advanced_config = get_advanced_ai_config(args.config_name)
     processor = AssemblyAiProcessor(api_key, advanced_config)
@@ -908,196 +850,129 @@ def main():
     if args.mode in ["original", "proxy"]:
         audio_url = processor.upload_file(args.source_path)
         if not audio_url:
-            fail("Failed to upload audio to AssemblyAI proxy.")
+            fail("Failed to upload audio to AssemblyAI proxy.", 1)
 
-        logger.info("Starting master transcription job...")
-        master_job_id = processor.start_transcription(audio_url, is_translation=False)
+        logger.info("Starting transcription job...")
+        master_job_id = processor.start_transcription(audio_url)
         if not master_job_id:
-            fail("Failed to start master transcription job.")
+            fail("Failed to start master transcription job.", 1)
         
         job_tracker["default"] = {"id": master_job_id, "status": "queued", "target_language": "Default"}
-        
         with open(tracking_file_path, "w") as f:
             json.dump(job_tracker, f, indent=4)
-            
         logger.info(f"Tracking file saved: {tracking_file_path}")
 
-        # Polling the master job
-        logger.info(f"Polling master job {master_job_id}...")
-        status, data = processor.poll_transcript(master_job_id, timeout_minutes=15)
+    elif args.mode == "send_extracted_metadata":
+        if not os.path.exists(tracking_file_path):
+            fail(f"Tracking file not found: {tracking_file_path}", 1, asset_id=args.asset_id)
+        with open(tracking_file_path, "r") as f:
+            job_tracker = json.load(f)
+            print(f"Loaded job tracker: {job_tracker}")
         
+        master_info = job_tracker.get("default")
+        if not master_info:
+            fail("Master job is missing from tracker", 7, args.asset_id)
+        master_job_id = master_info["id"]
+
+    # Shared Logic: Poll and Process result if not already completed locally
+    master_info = job_tracker.get("default")
+    status = master_info.get("status")
+    data = None
+
+    if status != "completed":
+        logger.info(f"Master job {master_job_id} status is '{status}'. Polling/Checking...")
+        status, data = processor.poll_transcript(master_job_id, timeout_minutes=15)
         job_tracker["default"]["status"] = status
+        
         if status == "timeout" or status == "error":
+            with open(tracking_file_path, "w") as f:
+                json.dump(job_tracker, f, indent=4)
             fail(f"Master job {status}", code=7, asset_id=args.asset_id or master_job_id)
         
-        # After master is completed, we handle Speech Understanding tasks sequentially
         if status == "completed":
-            # Save the master raw data immediately
             raw_master_name = f"{base_name}_raw.json"
             raw_master_path = os.path.join(metadata_dir, raw_master_name)
+            
+            su_resp = data.get("speech_understanding", {}).get("response", {})
+            mapping = su_resp.get("speaker_identification", {}).get("mapping", {})
+            if mapping:
+                logger.info(f"Applying speaker identification mapping: {mapping}")
+                if "utterances" in data and data["utterances"]:
+                    for utt in data["utterances"]:
+                        orig_spk = utt.get("speaker")
+                        if orig_spk in mapping:
+                            utt["speaker"] = mapping[orig_spk]
+            
+            fmt_text = su_resp.get("custom_formatting", {}).get("formatted_text")
+            if fmt_text:
+                data["text"] = fmt_text
+
             with open(raw_master_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=4)
             
             job_tracker["default"]["raw_path"] = raw_master_path
             
+            target_languages = []
             if "speech_understanding" in advanced_config:
                 su_cfg = advanced_config["speech_understanding"]
+                target_languages = su_cfg.get("translation", {}).get("target_languages", [])
                 
-                # 1. Speaker Identification
-                if "speaker_identification" in su_cfg:
-                    result = processor.process_speech_understanding(
-                        master_job_id, 
-                        "speaker_identification", 
-                        su_cfg["speaker_identification"]
-                    )
-                    if result and "utterances" in result:
-                        data["utterances"] = result["utterances"]
-                        # Re-save master with identification
-                        with open(raw_master_path, "w", encoding="utf-8") as f:
-                            json.dump(data, f, ensure_ascii=False, indent=4)
+            for lang in target_languages:
+                job_tracker[lang] = {"id": f"native_{lang}_{master_job_id}", "status": "processing", "target_language": lang}
 
-                # 2. Custom Formatting
-                if "custom_formatting" in su_cfg:
-                    result = processor.process_speech_understanding(
-                        master_job_id, 
-                        "custom_formatting", 
-                        su_cfg["custom_formatting"]
-                    )
-                    if result:
-                        if "utterances" in result: data["utterances"] = result["utterances"]
-                        if "text" in result: data["text"] = result["text"]
-                        # Re-save master with formatting
-                        with open(raw_master_path, "w", encoding="utf-8") as f:
-                            json.dump(data, f, ensure_ascii=False, indent=4)
+            if target_languages:
+                if processor.split_multilingual_transcript_native(data, target_languages, metadata_dir, base_name):
+                    for lang in target_languages:
+                        job_tracker[lang].update({
+                            "status": "completed",
+                            "raw_path": os.path.join(metadata_dir, f"{base_name}_{lang}_raw.json")
+                        })
+                    logger.info("Native translations split successfully.")
+                else:
+                    for lang in target_languages: job_tracker[lang]["status"] = "error"
+                    fail("Native transcript splitting failed", 7, args.asset_id)
 
-                # 3. Batch Translation (Post-hoc)
-                translation_cfg = su_cfg.get("translation", {})
-                target_languages = translation_cfg.get("target_languages", [])
-                if target_languages:
-                    translation_result_path = os.path.join(metadata_dir, f"{base_name}_translation_batch.json")
-                    # Update config to match utterances for reconstruction
-                    translation_cfg["match_original_utterance"] = True
-                    
-                    ok = processor.process_speech_understanding(
-                        master_job_id,
-                        "translation",
-                        translation_cfg,
-                        save_to_path=translation_result_path
-                    )
-                    
-                    if ok:
-                        # Split using ijson
-                        if processor.split_multilingual_transcript_ijson(
-                            raw_master_path, 
-                            translation_result_path, 
-                            target_languages, 
-                            metadata_dir, 
-                            base_name
-                        ):
-                            # Populate job_tracker with the new virtual jobs
-                            for lang in target_languages:
-                                job_tracker[lang] = {
-                                    "id": f"virtual_{lang}_{master_job_id}",
-                                    "status": "completed",
-                                    "target_language": lang,
-                                    "raw_path": os.path.join(metadata_dir, f"{base_name}_{lang}_raw.json")
-                                }
-
-        with open(tracking_file_path, "w") as f:
-            # Clean tracker for saving
-            save_tracker = {k: {
-                "id": v["id"], 
-                "status": v["status"], 
-                "target_language": v["target_language"],
-                "raw_path": v.get("raw_path")
-            } for k, v in job_tracker.items()}
-            json.dump(save_tracker, f, indent=4)
-
-    elif args.mode == "send_extracted_metadata":
-        if not os.path.exists(tracking_file_path):
-            fail(f"Tracking file not found: {tracking_file_path}")
-            
-        with open(tracking_file_path, "r") as f:
-            job_tracker = json.load(f)
-            
-        # For this mode, we assume the files are already there or we need to wait for Default only?
-        # Actually, if we are in this mode, it means the previous run did the transcription.
-        # Check if master is completed
-        master_info = job_tracker.get("default")
-        if not master_info or master_info.get("status") != "completed":
-            # Poll one last time? 
-            if master_info:
-                data = processor.get_transcript(master_info["id"])
-                if data and data.get("status") == "completed":
-                    # We should probably run the whole post-processing flow here too if it crashed before
-                    # But for now, let's keep it simple: assume if it's called in this mode, jobs should be finished.
-                    pass
-            fail("Master job is still not completed or missing", code=7, asset_id=args.asset_id)
+            # Final tracker save for the processing run
+            with open(tracking_file_path, "w") as f:
+                save_tracker = {k: {
+                    "id": v["id"], 
+                    "status": v["status"], 
+                    "target_language": v["target_language"],
+                    "raw_path": v.get("raw_path")
+                } for k, v in job_tracker.items()}
+                json.dump(save_tracker, f, indent=4)
 
 
-    # If we made it here, all jobs are completed. We save raw and normal metadata
-    combined_raw_data = {}
-    
+    combined_raw_data = {"insights": {}, "multilanguage_insights": {}}
     for key, job_info in list(job_tracker.items()):
         raw_json_path = job_info.get("raw_path")
         if not raw_json_path or not os.path.exists(raw_json_path):
-            logger.warning(f"Raw JSON path missing for {key}: {raw_json_path}")
             continue
-            
         lang_code = job_info["target_language"]
         raw_base_name = os.path.basename(raw_json_path)
-        
         norm_base_name = raw_base_name.replace("_raw.json", "_norm.json")
         norm_json_path = os.path.join(metadata_dir, norm_base_name)
-        
         with open(raw_json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-            
-        combined_raw_data[key] = data
+        if key == "default": combined_raw_data["insights"] = data
+        else: combined_raw_data["multilanguage_insights"][key] = data
         
-        # Normalize
         if get_normalized_metadata(raw_json_path, norm_json_path, language=lang_code if key != "default" else None):
             norm_return_path = os.path.join(meta_right, str(args.repo_guid), catalog_path_clean, "ASSEMBLYAI", norm_base_name)
             raw_return_path = os.path.join(meta_right, str(args.repo_guid), catalog_path_clean, "ASSEMBLYAI", raw_base_name)
-            
-            # Send extracted metadata
-            send_extracted_metadata_catalog(
-                args.repo_guid,
-                catalog_path_clean,
-                raw_return_path,
-                norm_return_path,
-                language_code=lang_code if key != "default" else None
-            )
-
-            # Transform and send chunked enriched metadata to MongoDB via Node.js backend
+            send_extracted_metadata_catalog(args.repo_guid, catalog_path_clean, raw_return_path, norm_return_path, language_code=lang_code if key != "default" else None)
             if args.export_ai_metadata and args.export_ai_metadata.lower() == 'true':
-                logger.info("Transforming and sending AI enriched metadata chunk by chunk...")
                 enrich_prefix = args.enrich_prefix if args.enrich_prefix else "aud"
                 enriched_chunks_generator = transform_normlized_to_enriched(norm_json_path, enrich_prefix)
-                send_success = send_ai_enriched_metadata(
-                    {"provider": "ASSEMBLYAI"}, 
-                    args.repo_guid, 
-                    catalog_path_clean, 
-                    enriched_chunks_generator,
-                    language_code=lang_code if key != "default" else None
-                )
-                if send_success:
-                    logger.info("AI Enriched Metadata exported successfully.")
-                else:
-                    logger.error("Failed to export all AI Enriched Metadata chunks.")
-                    fail("Failed to export all AI Enriched Metadata chunks.", 7, args.asset_id)
+                send_ai_enriched_metadata({"provider": "ASSEMBLYAI"}, args.repo_guid, catalog_path_clean, enriched_chunks_generator, language_code=lang_code if key != "default" else None)
         else:
-            logger.warning(f"Failed to normalize {raw_json_path}")
             fail("Failed to normalize metadata", 7, args.asset_id)
 
-
-    # Combined result
     combined_raw_json_path = os.path.join(metadata_dir, f"{base_name}_combined_raw.json")
     with open(combined_raw_json_path, "w", encoding="utf-8") as f:
         json.dump(combined_raw_data, f, ensure_ascii=False, indent=4)
-        
     logger.info("AssemblyAI Processing completed successfully.")
     sys.exit(0)
-    
+
 if __name__ == "__main__":
     main()

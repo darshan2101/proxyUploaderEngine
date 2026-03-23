@@ -81,7 +81,9 @@ def normalize_transcript(data, target_language=None):
         # convert 0-1 scale to 0-100 scale for SDNA
         conf = float(u.get("confidence") or 1.0) * 100 
         
-        val = f"Speaker {speaker}: {text}"
+        lang_tag = f"[{u.get('language_code')}] " if u.get('language_code') else ""
+        spk_label = f"Speaker {speaker}" if str(speaker).isdigit() else str(speaker)
+        val = f"{lang_tag}{spk_label}: {text}"
         output.append({
             "value": val,
             "occurrences": [build_occurrence(u.get("start"), u.get("end"), conf)]
@@ -233,6 +235,10 @@ def normalize(assembly_json, language=None):
     Scaffolds out individual mapped groups back into the master output node 
     expected by the SDNA catalog ingestion queue.
     """
+    # Auto-detect language from file if not provided
+    if not language and isinstance(assembly_json, dict):
+        language = assembly_json.get("language_code")
+
     out = {}
     
     try:
@@ -310,8 +316,35 @@ def main():
     
     try:
         data = load_json(input_path)
-        normalized = normalize(data, language=args.language)
-        write_json(normalized, output_path)
+        
+        # Combined structure check (insights/multilanguage_insights)
+        default_data = data.get("insights")
+        multilingual_data = data.get("multilanguage_insights", {})
+
+        if default_data:
+            print(f"Processing combined format. Normalizing master...")
+            normalized = normalize(default_data, language=args.language)
+            write_json(normalized, output_path)
+
+            for lang_code, lang_data in multilingual_data.items():
+                print(f"Normalizing language: {lang_code}")
+                # For translations, we ensure we pass the context lang
+                lang_normalized = normalize(lang_data, language=lang_code)
+                # Output naming: base_es_norm.json
+                if "_norm.json" in output_path.name:
+                    new_name = output_path.name.replace("_norm.json", f"_{lang_code}_norm.json")
+                else:
+                    new_name = f"{output_path.stem}_{lang_code}_norm.json"
+                
+                lang_output_path = output_path.with_name(new_name)
+                write_json(lang_normalized, lang_output_path)
+        else:
+            # Single file normalization
+            normalized = normalize(data, language=args.language)
+            write_json(normalized, output_path)
+            
+        print("Normalization completed successfully.")
+
     except json.JSONDecodeError as e:
         print(f"Error: Invalid JSON - {e}", file=sys.stderr)
         sys.exit(1)
